@@ -36,8 +36,8 @@ Chain strategy: feature-branch-chain
 
 ## Phase 2: Prisma / Health / Logging
 
-- [ ] 2.1 Add `prisma/schema.prisma`, init migration, raw partial index `one_default_address_per_user`, and `prisma/seed.ts` for `producer-bootstrap`; honor ADR-003, ADR-008, R-2, R-4.
-- [ ] 2.2 Add `src/shared/utils/{prisma,logger}.ts`, `src/modules/health/*`, and wire `helmet → cors → compression → json → pino-http` in `src/app.ts`; add `tests/integration/health.test.ts` smoke per §21.
+- [x] 2.1 Add `prisma/schema.prisma`, init migration, raw partial index `one_default_address_per_user`, and `prisma/seed.ts` for `producer-bootstrap`; honor ADR-003, ADR-008, R-2, R-4.
+- [x] 2.2 Add `src/shared/utils/{prisma,logger}.ts`, `src/modules/health/*`, and wire `helmet → cors → compression → json → pino-http` in `src/app.ts`; add `tests/integration/health.test.ts` smoke per §21.
 
 ## Phase 3: Error / Auth / RBAC Foundation
 
