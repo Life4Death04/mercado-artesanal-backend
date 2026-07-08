@@ -52,5 +52,5 @@ Chain strategy: feature-branch-chain
 
 ## Phase 5: Addresses / Admin Bootstrap / Finalization
 
-- [ ] 5.1 Add `src/modules/addresses/*` for owner-scoped CRUD, soft-delete reads, default promotion/demotion transactions, and 404-no-leak behavior; trace `address-book`, ADR-003, R-2.
-- [ ] 5.2 Add `scripts/create-admin.ts`, `docs/admin-recovery.md`, README quickstart, and tests for address edge cases plus CLI guardrails from `admin-bootstrap` and ADR-006.
+- [x] 5.1 Add `src/modules/addresses/*` for owner-scoped CRUD, soft-delete reads, default promotion/demotion transactions, and 404-no-leak behavior; trace `address-book`, ADR-003, R-2.
+- [x] 5.2 Add `scripts/create-admin.ts`, `docs/admin-recovery.md`, README quickstart, and tests for address edge cases plus CLI guardrails from `admin-bootstrap` and ADR-006.

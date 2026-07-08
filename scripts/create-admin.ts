@@ -21,6 +21,7 @@
  *   design §18 — authoritative pseudocode
  *   ADR-006 — least-privilege admin creation
  */
+import "dotenv/config";
 import { parseArgs } from "node:util";
 
 import { z } from "zod";

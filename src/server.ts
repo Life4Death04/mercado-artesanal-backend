@@ -13,6 +13,7 @@
  *   - Prisma disconnect is non-blocking but ensures the connection pool is
  *     released cleanly before the process exits.
  */
+import "dotenv/config";
 import { env } from "@/shared/utils/env";
 import { logger } from "@/shared/utils/logger";
 import { prisma } from "@/shared/utils/prisma";
