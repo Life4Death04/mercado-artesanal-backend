@@ -13,10 +13,10 @@
  *   5. pino-http       — request logger + correlation ID (assigns req.id to every request)
  *   6. /health router  — public, no auth chain; cheap probes bypass everything downstream
  *   7. /api/v1 router  — private (each module router wires authenticate → loadUser → ... → handler)
- *                         STUB in PR#2 — wired in PR#4b
- *   8. notFoundHandler — reaches only unrouted paths
+ *                         Wired in PR#4: auth/sync, users/me, onboarding/consumer|producer
+ *   8. notFoundHandler — reaches only unrouted paths (PR#3: real RFC 7807 404)
  *   9. errorMiddleware — 4-arg Express error handler; MUST be the LAST middleware
- *                         STUB in PR#2 — real implementation in PR#3
+ *                         PR#3: real RFC 7807 serializer replacing the PR#2 stub
  *
  * @param opts.logger - Optional pino Logger instance injected by test harnesses.
  *   When omitted the app uses the module-level singleton (default runtime path).
@@ -33,7 +33,10 @@ import helmet from "helmet";
 import type { Logger } from "pino";
 import pinoHttp from "pino-http";
 
+import { apiRouter } from "@/modules/api.router";
 import { healthRouter } from "@/modules/health/routes/health.routes";
+import { errorMiddleware } from "@/shared/middleware/errorMiddleware";
+import { notFoundHandler } from "@/shared/middleware/notFoundHandler";
 import { logger as defaultLogger } from "@/shared/utils/logger";
 
 import { env } from "./shared/utils/env";
@@ -101,19 +104,14 @@ export function createApp({ logger = defaultLogger }: CreateAppOptions = {}): Ex
   // 6. Public health routes — bypass auth chain
   app.use("/health", healthRouter);
 
-  // 7. Private API routes — stub; wired in PR#4b
-  // app.use("/api/v1", apiRouter);
+  // 7. Private API routes — auth/sync, users/me, onboarding (wired in PR#4)
+  app.use("/api/v1", apiRouter);
 
-  // 8. 404 fallback — stub; replaced with real notFoundHandler in PR#3
-  app.use((_req: Request, res: Response) => {
-    res.status(404).json({ status: 404, message: "Not found" });
-  });
+  // 8. 404 fallback — catches all unrouted paths; forwards NotFoundError to errorMiddleware
+  app.use(notFoundHandler);
 
-  // 9. Error handler — stub; replaced with real RFC 7807 errorMiddleware in PR#3
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-    logger.error({ err }, "unhandled error");
-    res.status(500).json({ status: 500, message: "Internal server error" });
-  });
+  // 9. Error handler — RFC 7807 serializer; MUST be the LAST middleware (4-arg Express signature)
+  app.use(errorMiddleware);
 
   return app;
 }
