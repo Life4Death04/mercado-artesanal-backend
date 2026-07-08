@@ -17,6 +17,11 @@
  *   8. notFoundHandler — reaches only unrouted paths
  *   9. errorMiddleware — 4-arg Express error handler; MUST be the LAST middleware
  *                         STUB in PR#2 — real implementation in PR#3
+ *
+ * @param opts.logger - Optional pino Logger instance injected by test harnesses.
+ *   When omitted the app uses the module-level singleton (default runtime path).
+ *   This keeps the production code path completely unchanged — `createApp()`
+ *   with no arguments works exactly as before.
  */
 import crypto from "node:crypto";
 
@@ -25,14 +30,20 @@ import cors from "cors";
 import type { Express, NextFunction, Request, Response } from "express";
 import express from "express";
 import helmet from "helmet";
+import type { Logger } from "pino";
 import pinoHttp from "pino-http";
 
 import { healthRouter } from "@/modules/health/routes/health.routes";
-import { logger } from "@/shared/utils/logger";
+import { logger as defaultLogger } from "@/shared/utils/logger";
 
 import { env } from "./shared/utils/env";
 
-export function createApp(): Express {
+export interface CreateAppOptions {
+  /** Injected pino logger (test harnesses). Defaults to the singleton. */
+  logger?: Logger;
+}
+
+export function createApp({ logger = defaultLogger }: CreateAppOptions = {}): Express {
   const app = express();
 
   // 1. Security headers
