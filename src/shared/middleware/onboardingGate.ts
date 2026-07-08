@@ -67,8 +67,17 @@ export function onboardingGate(req: Request, _res: Response, next: NextFunction)
     return;
   }
 
+  // Use req.originalUrl (strip query string) for full-path comparison.
+  // When onboardingGate is used as per-route middleware inside a sub-router
+  // (e.g. mounted at /api/v1), req.path is relative to the mount point
+  // ("/auth/sync"), while the allow-list stores absolute paths
+  // ("/api/v1/auth/sync"). req.originalUrl contains the full path in real
+  // Express requests; fall back to req.path for unit tests that pass a plain
+  // object without originalUrl.
+  const fullPath = req.originalUrl ?? req.path;
+  const requestPath = fullPath.split("?")[0] ?? fullPath;
   const isAllowed = ONBOARDING_ALLOW_LIST.some(
-    (entry) => entry.method === req.method && entry.path === req.path,
+    (entry) => entry.method === req.method && entry.path === requestPath,
   );
 
   if (isAllowed) {

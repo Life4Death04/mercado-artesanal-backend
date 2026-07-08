@@ -46,9 +46,9 @@ Chain strategy: feature-branch-chain
 
 ## Phase 4: Auth Sync / User Read / Onboarding
 
-- [ ] 4.1 Add `src/shared/repositories/user.repository.ts` and `src/modules/{auth,users}/*` for `POST /api/v1/auth/sync` and `GET /api/v1/users/me`; preserve P-3 and `auth-jwt`/`user-profile` rules.
-- [ ] 4.2 Add `src/shared/validation/zod.ts` and `src/modules/onboarding/*` for consumer/producer transactions, category dedupe, NIF/postal validation, and `description.max(2000)`; cover `user-onboarding`, `producer-bootstrap`, R-4.
-- [ ] 4.3 Wire `/api/v1` routes and onboarding allow-list in `src/app.ts`; add Supertest cases for first-sync, re-sync, pending/me, consumer success, producer success, unknown slug, duplicate NIF, and ROLE_ALREADY_SET.
+- [x] 4.1 Add `src/shared/repositories/user.repository.ts` and `src/modules/{auth,users}/*` for `POST /api/v1/auth/sync` and `GET /api/v1/users/me`; preserve P-3 and `auth-jwt`/`user-profile` rules.
+- [x] 4.2 Add `src/shared/validation/zod.ts` and `src/modules/onboarding/*` for consumer/producer transactions, category dedupe, NIF/postal validation, and `description.max(2000)`; cover `user-onboarding`, `producer-bootstrap`, R-4.
+- [x] 4.3 Wire `/api/v1` routes and onboarding allow-list in `src/app.ts`; add Supertest cases for first-sync, re-sync, pending/me, consumer success, producer success, unknown slug, duplicate NIF, and ROLE_ALREADY_SET.
 
 ## Phase 5: Addresses / Admin Bootstrap / Finalization
 

@@ -13,7 +13,7 @@
  *   5. pino-http       — request logger + correlation ID (assigns req.id to every request)
  *   6. /health router  — public, no auth chain; cheap probes bypass everything downstream
  *   7. /api/v1 router  — private (each module router wires authenticate → loadUser → ... → handler)
- *                         STUB — wired in PR#4b
+ *                         Wired in PR#4: auth/sync, users/me, onboarding/consumer|producer
  *   8. notFoundHandler — reaches only unrouted paths (PR#3: real RFC 7807 404)
  *   9. errorMiddleware — 4-arg Express error handler; MUST be the LAST middleware
  *                         PR#3: real RFC 7807 serializer replacing the PR#2 stub
@@ -33,6 +33,7 @@ import helmet from "helmet";
 import type { Logger } from "pino";
 import pinoHttp from "pino-http";
 
+import { apiRouter } from "@/modules/api.router";
 import { healthRouter } from "@/modules/health/routes/health.routes";
 import { errorMiddleware } from "@/shared/middleware/errorMiddleware";
 import { notFoundHandler } from "@/shared/middleware/notFoundHandler";
@@ -103,8 +104,8 @@ export function createApp({ logger = defaultLogger }: CreateAppOptions = {}): Ex
   // 6. Public health routes — bypass auth chain
   app.use("/health", healthRouter);
 
-  // 7. Private API routes — stub; wired in PR#4b
-  // app.use("/api/v1", apiRouter);
+  // 7. Private API routes — auth/sync, users/me, onboarding (wired in PR#4)
+  app.use("/api/v1", apiRouter);
 
   // 8. 404 fallback — catches all unrouted paths; forwards NotFoundError to errorMiddleware
   app.use(notFoundHandler);
