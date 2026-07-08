@@ -9,14 +9,14 @@
  * (/health) remains completely unauthenticated.
  *
  * Module routers mounted here:
- *   authRouter      — POST /auth/sync
- *   usersRouter     — GET /users/me
+ *   authRouter       — POST /auth/sync
+ *   usersRouter      — GET /users/me
  *   onboardingRouter — POST /users/me/onboarding/consumer|producer
- *
- * Future modules (addresses, admin) will be added here in later PRs.
+ *   addressesRouter  — GET/POST/PATCH/DELETE /users/me/addresses[/:id]
  */
 import { Router } from "express";
 
+import { addressesRouter } from "./addresses/routes/addresses.routes";
 import { authRouter } from "./auth/routes/auth.routes";
 import { onboardingRouter } from "./onboarding/routes/onboarding.routes";
 import { usersRouter } from "./users/routes/users.routes";
@@ -26,3 +26,4 @@ export const apiRouter: Router = Router();
 apiRouter.use(authRouter);
 apiRouter.use(usersRouter);
 apiRouter.use(onboardingRouter);
+apiRouter.use(addressesRouter);
