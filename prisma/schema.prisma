@@ -1,0 +1,114 @@
+// prisma/schema.prisma
+// Authoritative schema for Cycle 1 — do NOT edit by hand.
+// Any change requires a new migration via `prisma migrate dev`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  PENDING_ROLE
+  CONSUMER
+  PRODUCER
+  ADMIN
+}
+
+model User {
+  id            String    @id @default(cuid())
+  auth0Sub      String    @unique @map("auth0_sub")
+  email         String    @unique
+  emailVerified Boolean   @default(false) @map("email_verified")
+  firstName     String?   @map("first_name")
+  lastName      String?   @map("last_name")
+  name          String?
+  avatar        String?
+  role          Role      @default(PENDING_ROLE)
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  producer  Producer?
+  addresses Address[]
+
+  @@index([auth0Sub])
+  @@map("users")
+}
+
+model Producer {
+  id                String    @id @default(cuid())
+  userId            String    @unique @map("user_id")
+  businessName      String    @map("business_name")
+  nif               String    @unique
+  description       String    @db.VarChar(2000)
+  addressLine1      String    @map("address_line1")
+  addressLine2      String?   @map("address_line2")
+  addressCity       String    @map("address_city")
+  addressPostalCode String    @map("address_postal_code")
+  addressProvince   String    @map("address_province")
+  addressCountry    String    @default("ES") @map("address_country")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  deletedAt         DateTime? @map("deleted_at")
+
+  user       User                        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  categories ProducerCategoryOnProducer[]
+
+  @@index([userId])
+  @@map("producers")
+}
+
+model ProducerCategory {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  producers ProducerCategoryOnProducer[]
+
+  @@map("producer_categories")
+}
+
+model ProducerCategoryOnProducer {
+  producerId String   @map("producer_id")
+  categoryId String   @map("category_id")
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  producer Producer         @relation(fields: [producerId], references: [id], onDelete: Cascade)
+  category ProducerCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([producerId, categoryId])
+  @@index([categoryId])
+  @@map("producer_categories_on_producers")
+}
+
+model Address {
+  id         String    @id @default(cuid())
+  userId     String    @map("user_id")
+  line1      String
+  line2      String?
+  city       String
+  postalCode String    @map("postal_code")
+  province   String
+  country    String    @default("ES")
+  isDefault  Boolean   @default(false) @map("is_default")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId])
+  @@index([userId, deletedAt])
+  // R-2: Partial unique index enforces "at most one active default address per user"
+  // at the DB level. Prisma cannot express a partial unique index with a WHERE clause
+  // in the schema block, so it is created via raw SQL in a follow-up migration:
+  //   CREATE UNIQUE INDEX one_default_address_per_user
+  //     ON addresses (user_id)
+  //     WHERE is_default = true AND deleted_at IS NULL;
+  @@map("addresses")
+}
