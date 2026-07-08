@@ -407,4 +407,105 @@ describe("addressService.softDeleteWithPromotion", () => {
 
     await addressService.softDeleteWithPromotion("user_001", "addr_001");
   });
+
+  // --------------------------------------------------------------------------
+  // Finding 2 — newest-among-multiple-siblings promotion (O-1 locked)
+  // Spec: address-book §"Delete default with others auto-promotes the newest"
+  //       openspec/specs/address-book/spec.md:142-148
+  // --------------------------------------------------------------------------
+
+  it("promotes the NEWEST sibling (highest createdAt) when multiple non-defaults remain after default deletion", async () => {
+    // A (default, day 1 — oldest), B (day 2), C (day 3 — newest)
+    // Deleting A must promote C, not B.
+    const defaultA = makeAddress({ id: "addr_A", userId: "user_001", isDefault: true, createdAt: new Date("2026-01-01T00:00:00Z") });
+    const olderB = makeAddress({ id: "addr_B", userId: "user_001", isDefault: false, createdAt: new Date("2026-01-02T00:00:00Z") });
+    const newestC = makeAddress({ id: "addr_C", userId: "user_001", isDefault: false, createdAt: new Date("2026-01-03T00:00:00Z") });
+
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const mockUpdate = vi.fn().mockResolvedValue({});
+        const fakeTx = {
+          address: {
+            findFirst: vi
+              .fn()
+              .mockResolvedValueOnce(defaultA)  // target lookup → A (default)
+              .mockResolvedValueOnce(newestC),  // sibling lookup ordered by createdAt desc → C (newest)
+            update: mockUpdate,
+          },
+        };
+        const res = await fn(fakeTx as unknown as typeof prisma);
+
+        // Two update calls: 1) soft-delete A, 2) promote C
+        expect(mockUpdate).toHaveBeenCalledTimes(2);
+
+        // Second update MUST be the promotion of C (the newest sibling)
+        const promotionCall = mockUpdate.mock.calls[1]?.[0] as {
+          where: { id: string };
+          data: { isDefault: boolean };
+        };
+        expect(promotionCall?.where?.id).toBe("addr_C");
+        expect(promotionCall?.data?.isDefault).toBe(true);
+
+        // B is never touched — no update call with addr_B
+        const allCallIds = mockUpdate.mock.calls.map(
+          (c) => (c[0] as { where?: { id?: string } })?.where?.id,
+        );
+        expect(allCallIds).not.toContain("addr_B");
+
+        void olderB; // acknowledged: B must remain non-default
+        return res;
+      },
+    );
+
+    await addressService.softDeleteWithPromotion("user_001", "addr_A");
+  });
+
+  // --------------------------------------------------------------------------
+  // Finding 3 — delete non-default leaves current default untouched
+  // Spec: address-book §"Delete a non-default address leaves default untouched"
+  //       openspec/specs/address-book/spec.md:150-155
+  // --------------------------------------------------------------------------
+
+  it("does NOT touch the existing default when a non-default address is deleted", async () => {
+    // A (default), B (non-default) — delete B, A must remain unchanged.
+    const nonDefaultB = makeAddress({ id: "addr_B", userId: "user_001", isDefault: false });
+
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const mockUpdate = vi.fn().mockResolvedValue({ ...nonDefaultB, deletedAt: new Date() });
+        const fakeTx = {
+          address: {
+            findFirst: vi
+              .fn()
+              .mockResolvedValueOnce(nonDefaultB), // target lookup → B (non-default)
+            // Note: the second findFirst (sibling search) is never reached
+            // because B.isDefault is false, so the promotion branch is skipped.
+            update: mockUpdate,
+          },
+        };
+        const res = await fn(fakeTx as unknown as typeof prisma);
+
+        // Only ONE update: soft-delete B. No promotion call occurs.
+        expect(mockUpdate).toHaveBeenCalledTimes(1);
+
+        // The single update MUST target B with soft-delete data
+        const softDeleteCall = mockUpdate.mock.calls[0]?.[0] as {
+          where: { id: string };
+          data: { isDefault: boolean; deletedAt?: unknown };
+        };
+        expect(softDeleteCall?.where?.id).toBe("addr_B");
+        expect(softDeleteCall?.data?.isDefault).toBe(false);
+
+        // No update ever targets addr_A — the default is untouched
+        const allCallIds = mockUpdate.mock.calls.map(
+          (c) => (c[0] as { where?: { id?: string } })?.where?.id,
+        );
+        expect(allCallIds).not.toContain("addr_A");
+
+        return res;
+      },
+    );
+
+    await addressService.softDeleteWithPromotion("user_001", "addr_B");
+  });
 });

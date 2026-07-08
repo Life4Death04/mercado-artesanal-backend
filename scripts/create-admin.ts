@@ -41,16 +41,38 @@ const ArgsSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
-// main
+// Deps injection interface — allows unit-testing without a real DB
 // ---------------------------------------------------------------------------
 
-async function main(): Promise<void> {
+export interface CreateAdminDeps {
+  countAdmins: () => Promise<number>;
+  createUser: (data: {
+    email: string;
+    auth0Sub: string;
+    firstName: string;
+    lastName: string;
+    emailVerified: boolean;
+    role: "ADMIN";
+  }) => Promise<{ id: string }>;
+  stderr: (msg: string) => void;
+  stdout: (msg: string) => void;
+  exit: (code: number) => never;
+}
+
+// ---------------------------------------------------------------------------
+// Core logic — injectable for testing
+// ---------------------------------------------------------------------------
+
+export async function runCreateAdmin(
+  argv: string[],
+  deps: CreateAdminDeps,
+): Promise<void> {
   // Step 1: Parse and validate CLI arguments.
   // Zod runs BEFORE the prisma singleton is accessed (spec ordering).
   let rawValues: Record<string, string | boolean | undefined>;
   try {
     const parsed = parseArgs({
-      args: process.argv.slice(2),
+      args: argv,
       options: {
         email: { type: "string" },
         "auth0-sub": { type: "string" },
@@ -61,53 +83,66 @@ async function main(): Promise<void> {
     });
     rawValues = parsed.values;
   } catch (parseErr) {
-    process.stderr.write(`Error parsing arguments: ${String(parseErr)}\n`);
-    process.stderr.write(
+    deps.stderr(`Error parsing arguments: ${String(parseErr)}\n`);
+    deps.stderr(
       "Usage: npm run create-admin -- --email <email> --auth0-sub <sub> [--first-name <name>] [--last-name <name>]\n",
     );
-    process.exit(1);
+    deps.exit(1);
   }
 
   const validation = ArgsSchema.safeParse(rawValues);
   if (!validation.success) {
-    process.stderr.write(
+    deps.stderr(
       "Usage: npm run create-admin -- --email <email> --auth0-sub <sub> [--first-name <name>] [--last-name <name>]\n",
     );
     // Print each field error so the operator knows exactly what is wrong.
     for (const issue of validation.error.issues) {
-      process.stderr.write(`  ${issue.path.join(".") || "root"}: ${issue.message}\n`);
+      deps.stderr(`  ${issue.path.join(".") || "root"}: ${issue.message}\n`);
     }
-    process.exit(1);
+    deps.exit(1);
   }
 
   const args = validation.data;
 
   // Step 2: Guard — reject if an active admin already exists.
-  const existing = await prisma.user.count({ where: { role: "ADMIN", deletedAt: null } });
+  const existing = await deps.countAdmins();
   if (existing > 0) {
-    process.stderr.write(
+    deps.stderr(
       "An active admin already exists. Refer to docs/admin-recovery.md for recovery procedures.\n",
     );
-    process.exit(2);
+    deps.exit(2);
   }
 
   // Step 3: Create the admin user.
-  const user = await prisma.user.create({
-    data: {
-      email: args.email,
-      auth0Sub: args["auth0-sub"],
-      firstName: args["first-name"],
-      lastName: args["last-name"],
-      emailVerified: false,
-      role: "ADMIN",
-    },
+  const user = await deps.createUser({
+    email: args.email,
+    auth0Sub: args["auth0-sub"],
+    firstName: args["first-name"],
+    lastName: args["last-name"],
+    emailVerified: false,
+    role: "ADMIN",
   });
 
-  process.stdout.write(`Admin created: id=${user.id}\n`);
-  process.exit(0);
+  deps.stdout(`Admin created: id=${user.id}\n`);
+  deps.exit(0);
 }
 
-main().catch((err: unknown) => {
-  process.stderr.write(`Unexpected error: ${String(err)}\n`);
-  process.exit(3);
-});
+// ---------------------------------------------------------------------------
+// CLI entry point — only runs when executed directly (not when imported by tests)
+// ---------------------------------------------------------------------------
+
+// Guard: skip auto-run when this module is imported (e.g. by unit tests).
+// In CJS output (module: node16 + .ts extension), `require.main === module`
+// is true only when the file is the Node.js entry point, not when imported.
+if (require.main === module) {
+  runCreateAdmin(process.argv.slice(2), {
+    countAdmins: () => prisma.user.count({ where: { role: "ADMIN", deletedAt: null } }),
+    createUser: (data) => prisma.user.create({ data }),
+    stderr: (msg) => process.stderr.write(msg),
+    stdout: (msg) => process.stdout.write(msg),
+    exit: (code) => process.exit(code),
+  }).catch((err: unknown) => {
+    process.stderr.write(`Unexpected error: ${String(err)}\n`);
+    process.exit(3);
+  });
+}

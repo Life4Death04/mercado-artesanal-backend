@@ -234,6 +234,62 @@ describe("GET /api/v1/users/me/addresses — CONSUMER happy path", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
   });
+
+  // --------------------------------------------------------------------------
+  // Finding 1 — address list ordering: default first, then newest
+  // Spec: address-book §"Default first, then newest"
+  //       openspec/specs/address-book/spec.md:53-59
+  // --------------------------------------------------------------------------
+
+  it("[A1c] returns 200 with addresses ordered: default first, then non-defaults by createdAt DESC", async () => {
+    const sub = "auth0|consumer003";
+    const user = makeUser({ id: "cuid_user_003", auth0Sub: sub });
+
+    // Scenario per spec: default is the OLDEST address; non-defaults are newer.
+    // After ordering (isDefault DESC, createdAt DESC):
+    //   [0] = defaultOld  (isDefault=true — promoted to front regardless of age)
+    //   [1] = nonDefaultC (isDefault=false, newest)
+    //   [2] = nonDefaultB (isDefault=false, older)
+    const defaultOld = makeAddress({
+      id: "addr_default",
+      userId: user.id,
+      isDefault: true,
+      createdAt: new Date("2026-01-01T00:00:00Z"), // oldest
+    });
+    const nonDefaultB = makeAddress({
+      id: "addr_b",
+      userId: user.id,
+      isDefault: false,
+      createdAt: new Date("2026-01-02T00:00:00Z"),
+    });
+    const nonDefaultC = makeAddress({
+      id: "addr_c",
+      userId: user.id,
+      isDefault: false,
+      createdAt: new Date("2026-01-03T00:00:00Z"), // newest non-default
+    });
+
+    mockLoadUser(user);
+    // The service passes orderBy: [{ isDefault: "desc" }, { createdAt: "desc" }] to Prisma.
+    // The mock returns the already-sorted array that Prisma would produce with that orderBy.
+    mockedAddress.findMany.mockResolvedValueOnce([defaultOld, nonDefaultC, nonDefaultB]);
+
+    const res = await request
+      .get("/api/v1/users/me/addresses")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(3);
+
+    // element [0] MUST be the default (spec line 58)
+    expect(res.body[0].id).toBe("addr_default");
+    expect(res.body[0].isDefault).toBe(true);
+
+    // elements [1] and [2] MUST be sorted by createdAt descending (spec line 59)
+    const d1 = new Date(res.body[1].createdAt as string).getTime();
+    const d2 = new Date(res.body[2].createdAt as string).getTime();
+    expect(d1).toBeGreaterThan(d2);
+  });
 });
 
 // ---------------------------------------------------------------------------
