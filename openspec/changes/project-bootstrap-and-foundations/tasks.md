@@ -41,8 +41,8 @@ Chain strategy: feature-branch-chain
 
 ## Phase 3: Error / Auth / RBAC Foundation
 
-- [ ] 3.1 Create `src/shared/errors/{AppError,errors}.ts` and `src/shared/middleware/{errorMiddleware,notFoundHandler}.ts` for `error-handling`; include Auth0 remap branch from R-5 / ADR-004.
-- [ ] 3.2 Create `src/shared/middleware/{authenticate,loadUser,onboardingGate,requireRole}.ts` plus `src/shared/types/express.d.ts`; add Vitest unit tests for serializer, allow-list, and role checks per §21.
+- [x] 3.1 Create `src/shared/errors/{AppError,errors}.ts` and `src/shared/middleware/{errorMiddleware,notFoundHandler}.ts` for `error-handling`; include Auth0 remap branch from R-5 / ADR-004.
+- [x] 3.2 Create `src/shared/middleware/{authenticate,loadUser,onboardingGate,requireRole}.ts` plus `src/shared/types/express.d.ts`; add Vitest unit tests for serializer, allow-list, and role checks per §21.
 
 ## Phase 4: Auth Sync / User Read / Onboarding
 
