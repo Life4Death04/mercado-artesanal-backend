@@ -156,13 +156,21 @@ export async function completeConsumerOnboarding(
 }
 
 /**
- * Flip the user's role to PRODUCER after the Producer row has been created.
+ * Update firstName + lastName and flip the user's role to PRODUCER after the Producer row has been created.
  * MUST be called inside the same $transaction as Producer creation.
  */
-export async function completeProducerOnboarding(id: string, tx?: PrismaTx): Promise<User> {
+export async function completeProducerOnboarding(
+  id: string,
+  data: { firstName: string; lastName: string },
+  tx?: PrismaTx,
+): Promise<User> {
   const client = tx ?? prisma;
   return client.user.update({
     where: { id },
-    data: { role: "PRODUCER" },
+    data: {
+      firstName: data.firstName,
+      lastName: data.lastName,
+      role: "PRODUCER",
+    },
   });
 }

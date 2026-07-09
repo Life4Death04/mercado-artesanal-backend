@@ -17,7 +17,25 @@
  */
 import type { NextFunction, Request, Response } from "express";
 
+import { env } from "@/shared/utils/env";
+
 import * as authService from "../services/auth.service";
+
+const auth0ClaimNamespace = env.AUTH0_AUDIENCE.replace(/\/$/, "");
+
+function stringClaim(payload: Record<string, unknown>, key: string): string | undefined {
+  const value = payload[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function booleanClaim(payload: Record<string, unknown>, key: string): boolean | undefined {
+  const value = payload[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function namespacedClaimKey(claim: string): string {
+  return `${auth0ClaimNamespace}/${claim}`;
+}
 
 /**
  * POST /api/v1/auth/sync
@@ -41,10 +59,17 @@ export async function sync(req: Request, res: Response, next: NextFunction): Pro
       throw new Error("JWT sub claim is missing after authentication");
     }
 
+    const email =
+      stringClaim(payload, "email") ?? stringClaim(payload, namespacedClaimKey("email"));
+    const emailVerified =
+      booleanClaim(payload, "email_verified") ??
+      booleanClaim(payload, namespacedClaimKey("email_verified")) ??
+      false;
+
     const claims = {
       sub: payload.sub,
-      email: typeof payload["email"] === "string" ? payload["email"] : undefined,
-      emailVerified: payload["email_verified"] === true,
+      email,
+      emailVerified,
     };
 
     const user = await authService.syncFromClaims(claims);

@@ -200,6 +200,32 @@ describe("POST /api/v1/auth/sync — first sync creates PENDING user", () => {
     });
   });
 
+  it("accepts Auth0 namespaced email claims for custom API access tokens", async () => {
+    const sub = "auth0|new-namespaced";
+    const email = "namespaced@example.com";
+    const createdUser = makeUser({ auth0Sub: sub, email, emailVerified: true });
+
+    mockLoadUser(null);
+    mockedUserRepo.findByAuth0Sub.mockResolvedValueOnce(null);
+    mockedUserRepo.create.mockResolvedValueOnce(createdUser);
+
+    const res = await request.post("/api/v1/auth/sync").set(
+      "X-Test-Auth",
+      authHeader({
+        sub,
+        "https://api.test.example/email": email,
+        "https://api.test.example/email_verified": true,
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockedUserRepo.create).toHaveBeenCalledWith({
+      auth0Sub: sub,
+      email,
+      emailVerified: true,
+    });
+  });
+
   it("returns 401 when no Authorization header is provided", async () => {
     const res = await request.post("/api/v1/auth/sync");
     expect(res.status).toBe(401);
@@ -371,7 +397,13 @@ describe("POST /api/v1/users/me/onboarding/producer — success", () => {
   it("returns 201 with role=PRODUCER, producer embedded, and category slugs", async () => {
     const sub = "auth0|producer001";
     const pendingUser = makeUser({ id: "cuid_p001", auth0Sub: sub });
-    const producerUser = makeUser({ id: "cuid_p001", auth0Sub: sub, role: "PRODUCER" });
+    const producerUser = makeUser({
+      id: "cuid_p001",
+      auth0Sub: sub,
+      role: "PRODUCER",
+      firstName: "Luis",
+      lastName: "Norte",
+    });
 
     const fakeCategories = [
       { id: "cat_queso", slug: "queso", name: "Queso", createdAt: new Date() },
@@ -437,7 +469,7 @@ describe("POST /api/v1/users/me/onboarding/producer — success", () => {
       void tx;
       return pendingUser;
     });
-    mockedUserRepo.completeProducerOnboarding.mockImplementationOnce(async (_id, tx) => {
+    mockedUserRepo.completeProducerOnboarding.mockImplementationOnce(async (_id, _data, tx) => {
       void tx;
       return producerUser;
     });
@@ -453,6 +485,8 @@ describe("POST /api/v1/users/me/onboarding/producer — success", () => {
       .post("/api/v1/users/me/onboarding/producer")
       .set("X-Test-Auth", authHeader({ sub }))
       .send({
+        firstName: "Luis",
+        lastName: "Norte",
         businessName: "Artesanos del Norte",
         nif: "B12345678",
         description: "Fresh artisan cheeses and honey.",
@@ -466,7 +500,12 @@ describe("POST /api/v1/users/me/onboarding/producer — success", () => {
       });
 
     expect(res.status).toBe(201);
-    expect(res.body).toMatchObject({ role: "PRODUCER", onboardingCompleted: true });
+    expect(res.body).toMatchObject({
+      role: "PRODUCER",
+      onboardingCompleted: true,
+      firstName: "Luis",
+      lastName: "Norte",
+    });
     expect(res.body.producer).toBeDefined();
     expect(res.body.producer.categorySlugs).toHaveLength(2);
     expect(res.body.producer.categorySlugs).toContain("queso");
@@ -476,7 +515,13 @@ describe("POST /api/v1/users/me/onboarding/producer — success", () => {
   it("description up to 2000 chars is accepted", async () => {
     const sub = "auth0|producer002";
     const pendingUser = makeUser({ id: "cuid_p002", auth0Sub: sub });
-    const producerUser = makeUser({ id: "cuid_p002", auth0Sub: sub, role: "PRODUCER" });
+    const producerUser = makeUser({
+      id: "cuid_p002",
+      auth0Sub: sub,
+      role: "PRODUCER",
+      firstName: "Long",
+      lastName: "Description",
+    });
     const longDescription = "A".repeat(2000);
 
     const fakeCategories = [
@@ -528,7 +573,7 @@ describe("POST /api/v1/users/me/onboarding/producer — success", () => {
       void tx;
       return pendingUser;
     });
-    mockedUserRepo.completeProducerOnboarding.mockImplementationOnce(async (_id, tx) => {
+    mockedUserRepo.completeProducerOnboarding.mockImplementationOnce(async (_id, _data, tx) => {
       void tx;
       return producerUser;
     });
@@ -542,6 +587,8 @@ describe("POST /api/v1/users/me/onboarding/producer — success", () => {
       .post("/api/v1/users/me/onboarding/producer")
       .set("X-Test-Auth", authHeader({ sub }))
       .send({
+        firstName: "Long",
+        lastName: "Description",
         businessName: "BizLong",
         nif: "A98765432",
         description: longDescription,
@@ -561,6 +608,8 @@ describe("POST /api/v1/users/me/onboarding/producer — success", () => {
       .post("/api/v1/users/me/onboarding/producer")
       .set("X-Test-Auth", authHeader({ sub }))
       .send({
+        firstName: "Bad",
+        lastName: "Description",
         businessName: "Biz",
         nif: "A98765432",
         description: "X".repeat(2001),
@@ -612,6 +661,8 @@ describe("POST /api/v1/users/me/onboarding/producer — unknown category slug", 
       .post("/api/v1/users/me/onboarding/producer")
       .set("X-Test-Auth", authHeader({ sub }))
       .send({
+        firstName: "Unknown",
+        lastName: "Category",
         businessName: "Test Biz",
         nif: "B12345678",
         description: "A desc",
@@ -665,6 +716,8 @@ describe("POST /api/v1/users/me/onboarding/producer — duplicate NIF", () => {
       .post("/api/v1/users/me/onboarding/producer")
       .set("X-Test-Auth", authHeader({ sub }))
       .send({
+        firstName: "Duplicate",
+        lastName: "Nif",
         businessName: "Dupe Biz",
         nif: "B12345678",
         description: "A desc",
@@ -725,6 +778,8 @@ describe("POST /api/v1/users/me/onboarding — retry after onboarded", () => {
       .post("/api/v1/users/me/onboarding/producer")
       .set("X-Test-Auth", authHeader({ sub }))
       .send({
+        firstName: "Already",
+        lastName: "Done",
         businessName: "Already Done",
         nif: "B12345678",
         description: "A desc",
