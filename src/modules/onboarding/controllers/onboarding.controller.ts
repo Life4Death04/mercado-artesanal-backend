@@ -63,6 +63,8 @@ const AddressSchema = z
  */
 const ProducerOnboardingSchema = z
   .object({
+    firstName: nonEmptyString,
+    lastName: nonEmptyString,
     businessName: nonEmptyString,
     nif: spanishNifSchema,
     description: nonEmptyString.max(2000, "Description must not exceed 2000 characters"),

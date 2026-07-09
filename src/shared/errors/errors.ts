@@ -107,3 +107,14 @@ export class InvalidDefaultTransitionError extends AppError {
   readonly status = 422;
   readonly title = "Invalid default transition";
 }
+
+// ---------------------------------------------------------------------------
+// 409 — DB-level partial unique index violation: two concurrent writes raced
+//       to set isDefault=true for the same user. Client may retry.
+// ---------------------------------------------------------------------------
+
+export class AddressDefaultConflictError extends AppError {
+  readonly code = "ADDRESS_DEFAULT_CONFLICT" as const;
+  readonly status = 409;
+  readonly title = "Address default conflict";
+}

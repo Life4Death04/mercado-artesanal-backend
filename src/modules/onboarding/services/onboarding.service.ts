@@ -51,6 +51,8 @@ export interface ProducerAddress {
 }
 
 export interface ProducerOnboardingInput {
+  firstName: string;
+  lastName: string;
   businessName: string;
   nif: string;
   description: string;
@@ -163,7 +165,11 @@ export async function completeProducer(
     });
 
     // 5. Flip role → PRODUCER and return updated user.
-    const updatedUser = await userRepo.completeProducerOnboarding(userId, tx);
+    const updatedUser = await userRepo.completeProducerOnboarding(
+      userId,
+      { firstName: input.firstName, lastName: input.lastName },
+      tx,
+    );
 
     // Attach producer to the return value (consumers of this service need the
     // producer shape for the 201 response assembly).

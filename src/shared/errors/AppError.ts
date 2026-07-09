@@ -25,6 +25,7 @@ export type ErrorCode =
   | "VALIDATION_FAILED"
   | "UNKNOWN_CATEGORY"
   | "INVALID_DEFAULT_TRANSITION"
+  | "ADDRESS_DEFAULT_CONFLICT"
   | "INTERNAL_ERROR";
 
 export interface ProblemDetails {
