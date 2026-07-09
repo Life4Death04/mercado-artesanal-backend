@@ -42,3 +42,7 @@ prisma/migrations/.lock
 
 # Misc
 *.tsbuildinfo
+
+# SDD artifacts (local design docs, not source)
+.atl/
+openspec/
