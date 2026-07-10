@@ -5,15 +5,17 @@
  * feature modules. Keeps validation logic DRY and in one auditable location.
  *
  * Exported schemas / helpers:
- *   - spanishNifSchema   — validates Spanish NIF/CIF simplified format ^[A-Z0-9]{9}$
+ *   - spanishNifSchema        — validates Spanish NIF/CIF simplified format ^[A-Z0-9]{9}$
  *   - spanishPostalCodeSchema — validates Spanish 5-digit postal code ^\d{5}$
- *   - nonEmptyString     — string with min(1) after trim
- *   - validateBody       — helper to validate req.body against a Zod schema and
- *                          throw ValidationFailedError on failure
+ *   - nonEmptyString          — string with min(1) after trim
+ *   - validateBody            — validate req.body, throw ValidationFailedError on failure
+ *   - strictObject()          — Cycle 2: z.object(shape).strict() — rejects unknown keys
+ *   - installGlobalErrorMap() — Cycle 2: install Zod global errorMap for unrecognized_keys
  *
  * Spec references:
  *   producer-bootstrap §"NIF format validated at input"
  *   user-onboarding §"Invalid postal code rejected", §"Invalid NIF format rejected"
+ *   error-handling §"Zod .strict() policy for unknown keys" (Cycle 2)
  */
 import { z } from "zod";
 
@@ -83,4 +85,70 @@ export function validateBody<T>(schema: z.ZodType<T>, data: unknown): T {
   }
 
   return result.data;
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 2 — Strict DTO policy
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a Zod object schema with `.strict()` enforced.
+ *
+ * All Cycle 2 request DTOs (body, query, params) MUST use this helper
+ * instead of bare `z.object()` to reject unknown keys with VALIDATION_FAILED (422).
+ *
+ * Policy: security-by-default against mass-assignment (e.g., forbidden fields
+ * like `trackingNumber`, `nif`, `isAdmin`). Auditable and uniform.
+ *
+ * Usage:
+ *   const PatchSubOrderBody = strictObject({ status: z.enum([...]) });
+ *
+ * Spec reference:
+ *   error-handling §"Zod .strict() policy for unknown keys"
+ *   Architecture Decision #1 — Permanent from Cycle 2.
+ */
+export function strictObject<T extends z.ZodRawShape>(
+  shape: T,
+): z.ZodObject<T, "strict"> {
+  return z.object(shape).strict();
+}
+
+/**
+ * Installs the global Zod errorMap that maps `unrecognized_keys` issues to
+ * the stable message format: `"Field '<name>' is not allowed"`.
+ *
+ * Emits one message per unrecognized key: only the first key is surfaced in
+ * the message. Zod groups all unrecognized keys into a single ZodIssue
+ * (issue.keys[]), so this errorMap uses issue.keys[0] to keep the error
+ * surface predictable and spec-aligned. Callers that need to enumerate all
+ * offending keys should inspect issue.keys directly before the errorMap is
+ * applied (e.g., in a custom validation pipeline).
+ *
+ * Per spec: error-handling §"Zod .strict() policy for unknown keys" — one
+ * stable, human-readable message per issue is the required contract.
+ *
+ * Call this ONCE at application bootstrap (src/app.ts or server.ts) BEFORE
+ * any request reaches the validation layer. In tests, it is called in
+ * tests/setup.ts so every test file shares the same error surface.
+ *
+ * Idempotent: safe to call multiple times (subsequent calls overwrite with
+ * an identical handler, so behavior does not change).
+ *
+ * Spec reference:
+ *   error-handling §"Zod .strict() policy for unknown keys"
+ *   error-handling scenario "Unknown key rejected uniformly"
+ */
+export function installGlobalErrorMap(): void {
+  z.setErrorMap((issue, ctx) => {
+    if (issue.code === z.ZodIssueCode.unrecognized_keys) {
+      const keys = issue.keys ?? [];
+      return {
+        message:
+          keys.length > 0
+            ? `Field '${keys[0]}' is not allowed`
+            : "Unrecognized key(s) in object",
+      };
+    }
+    return { message: ctx.defaultError };
+  });
 }

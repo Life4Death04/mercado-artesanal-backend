@@ -38,8 +38,22 @@ import { healthRouter } from "@/modules/health/routes/health.routes";
 import { errorMiddleware } from "@/shared/middleware/errorMiddleware";
 import { notFoundHandler } from "@/shared/middleware/notFoundHandler";
 import { logger as defaultLogger } from "@/shared/utils/logger";
+import { installGlobalErrorMap } from "@/shared/validation/zod";
 
 import { env } from "./shared/utils/env";
+
+// ---------------------------------------------------------------------------
+// Cycle 2 permanent policy: install the global Zod error map once at boot.
+//
+// Maps `unrecognized_keys` issues to "Field '<name>' is not allowed" so that
+// every strictObject() DTO rejection produces a uniform, auditable message.
+// Called here — BEFORE any router is mounted — so the errorMap is in place
+// before the first request can reach a validation layer.
+//
+// Spec reference: error-handling §"Zod .strict() policy for unknown keys"
+// Architecture Decision #1 — Permanent from Cycle 2.
+// ---------------------------------------------------------------------------
+installGlobalErrorMap();
 
 export interface CreateAppOptions {
   /** Injected pino logger (test harnesses). Defaults to the singleton. */
