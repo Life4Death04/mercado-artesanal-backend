@@ -1,5 +1,5 @@
 // prisma/schema.prisma
-// Authoritative schema for Cycle 1 — do NOT edit by hand.
+// Authoritative schema — Cycle 2 (producer-environment), after Slice 1b schema-orders.
 // Any change requires a new migration via `prisma migrate dev`.
 
 generator client {
@@ -10,6 +10,10 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+// ---------------------------------------------------------------------------
+// Cycle 1 — Core models (User, Producer, ProducerCategory, Address)
+// ---------------------------------------------------------------------------
 
 enum Role {
   PENDING_ROLE
@@ -55,8 +59,12 @@ model Producer {
   updatedAt         DateTime  @updatedAt @map("updated_at")
   deletedAt         DateTime? @map("deleted_at")
 
-  user       User                        @relation(fields: [userId], references: [id], onDelete: Restrict)
-  categories ProducerCategoryOnProducer[]
+  user          User                         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  categories    ProducerCategoryOnProducer[]
+  // Cycle 2 relations
+  products      Product[]
+  deliveryModes DeliveryMode[]
+  subOrders     SubOrder[]
 
   @@index([userId])
   @@map("producers")
@@ -111,4 +119,250 @@ model Address {
   //     ON addresses (user_id)
   //     WHERE is_default = true AND deleted_at IS NULL;
   @@map("addresses")
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 2 — Enums (schema-core)
+// ---------------------------------------------------------------------------
+
+/// Reactive moderation status for Product. OK is the initial state on create.
+/// REPORTED signals a consumer flag; REMOVED indicates admin action (Cycle 3+).
+enum ModerationStatus {
+  OK
+  REPORTED
+  REMOVED
+}
+
+/// Delivery mode types supported in Cycle 2.
+/// PICKUP: buyer collects at producer's location.
+/// SHIPPING_FLAT_RATE: producer ships at a fixed cost.
+/// Enum widening (e.g., COURIER) requires a new SDD cycle amending delivery-modes spec.
+enum DeliveryModeType {
+  PICKUP
+  SHIPPING_FLAT_RATE
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 2 — Enums (schema-orders)
+// ---------------------------------------------------------------------------
+
+/// Status of a consumer-facing aggregate Order.
+/// Cycle 3 checkout writes this; Cycle 2 lands the schema only.
+enum OrderStatus {
+  PENDING
+  PARTIAL
+  FULFILLED
+  CANCELLED
+}
+
+/// Status of a producer-scoped SubOrder.
+/// State machine (producer PATCH): pending→preparing→sent→delivered; pending/preparing→cancelled.
+/// delivered and cancelled are terminal — no further transitions allowed.
+enum SubOrderStatus {
+  pending
+  preparing
+  sent
+  delivered
+  cancelled
+}
+
+/// Payment lifecycle status. STUB in Cycle 2 — Stripe fills providerRef in Cycle 3.
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 2 — Schema-core models
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// NAMING CLARIFICATION: Category vs ProducerCategory
+//
+// ProducerCategory (Cycle 1, table: producer_categories)
+//   Classifies the PRODUCER'S BUSINESS TYPE (e.g., "Quesos y lácteos").
+//   Used in the producer on-boarding form. Many-to-many with Producer.
+//
+// Category (Cycle 2, table: categories)
+//   Classifies individual PRODUCTS in the public catalog (e.g., "Aceites", "Vinos").
+//   Used as a FK on Product. Public read endpoints land in Cycle 2.
+//   Admin write endpoints belong to a future admin-environment cycle.
+//
+// Both models coexist with no collision. A Product.categoryId MUST reference
+// Category, never ProducerCategory. When both are imported in the same file,
+// use aliased imports to avoid ambiguity.
+// ---------------------------------------------------------------------------
+
+/// Product taxonomy category. READ-ONLY in Cycle 2 — no write endpoints ship.
+/// See naming clarification block above for coexistence with ProducerCategory.
+model Category {
+  id          String   @id @default(cuid()) @map("id")
+  slug        String   @unique @map("slug")
+  name        String   @map("name")
+  description String?  @map("description")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  products Product[]
+
+  @@map("categories")
+}
+
+/// Producer catalog item. Published-on-create (isActive = true, moderationStatus = OK).
+/// No DRAFT state in Cycle 2. Soft-deleted via deletedAt; service layer MUST filter
+/// deletedAt IS NULL on all producer-scoped reads.
+/// Reactive-moderation fields (reportedAt, moderationStatus, reportReason) land now
+/// for Cycle 3+ consumer and admin surfaces to act on.
+model Product {
+  id                String           @id @default(cuid())
+  producerId        String           @map("producer_id")
+  categoryId        String           @map("category_id")
+  name              String
+  description       String
+  price             Decimal          @db.Decimal(10, 2)
+  stock             Int              @default(0)
+  lowStockThreshold Int              @default(5) @map("low_stock_threshold")
+  isActive          Boolean          @default(true) @map("is_active")
+  ingredients       String?
+  allergens         String[]
+  weight            Int?
+  presentation      String?
+  reportedAt        DateTime?        @map("reported_at")
+  moderationStatus  ModerationStatus @default(OK) @map("moderation_status")
+  reportReason      String?          @map("report_reason")
+  deletedAt         DateTime?        @map("deleted_at")
+  createdAt         DateTime         @default(now()) @map("created_at")
+  updatedAt         DateTime         @updatedAt @map("updated_at")
+
+  producer   Producer       @relation(fields: [producerId], references: [id], onDelete: Restrict)
+  category   Category       @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  images     ProductImage[]
+  orderLines OrderLine[]
+
+  @@index([producerId, isActive])
+  @@index([categoryId, isActive])
+  @@index([producerId, stock])
+  @@map("products")
+}
+
+/// Confirmed S3 upload record for a product. Inserted by the confirm endpoint only;
+/// the presign endpoint MUST NOT create rows. Position is unique per product —
+/// a duplicate (productId, position) rejects with IMAGE_UPLOAD_INVALID (400).
+model ProductImage {
+  id        String   @id @default(cuid())
+  productId String   @map("product_id")
+  s3Key     String   @map("s3_key")
+  mimeType  String   @map("mime_type")
+  position  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, position])
+  @@map("product_images")
+}
+
+/// Producer delivery configuration. PICKUP and SHIPPING_FLAT_RATE only in Cycle 2.
+/// Cycle 3 checkout reads active rows and snapshots cost into SubOrder.shippingCostSnapshot.
+/// Hard delete allowed only when no non-terminal SubOrder references this row;
+/// otherwise PATCH { isActive: false } MUST be used (delete guard = 409).
+model DeliveryMode {
+  id             String           @id @default(cuid())
+  producerId     String           @map("producer_id")
+  type           DeliveryModeType
+  cost           Decimal          @db.Decimal(10, 2)
+  coverageZone   String?          @map("coverage_zone")
+  pickupLocation String?          @map("pickup_location")
+  isActive       Boolean          @default(true) @map("is_active")
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+
+  producer  Producer   @relation(fields: [producerId], references: [id], onDelete: Restrict)
+  subOrders SubOrder[]
+
+  @@index([producerId, isActive])
+  @@map("delivery_modes")
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 2 — Schema-orders models
+// ---------------------------------------------------------------------------
+
+/// Payment record. STUB in Cycle 2 — providerRef is nullable and will be filled
+/// by Cycle 3 Stripe integration (zero additional migration required).
+/// Fields match Stripe PaymentIntent shape: providerRef ↔ PI id, amount, currency.
+model Payment {
+  id          String        @id @default(cuid())
+  status      PaymentStatus @default(PENDING)
+  amount      Decimal       @db.Decimal(10, 2)
+  currency    String        @default("EUR")
+  providerRef String?       @map("provider_ref")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  order Order?
+
+  @@map("payments")
+}
+
+/// Aggregate consumer order. One Order → N SubOrders (one per producer).
+/// paymentId is unique: one payment per order (Cycle 3 checkout creates both atomically).
+/// Cycle 3 writes all Order rows; Cycle 2 lands the schema only.
+model Order {
+  id          String      @id @default(cuid())
+  userId      String      @map("user_id")
+  paymentId   String      @unique @map("payment_id")
+  totalAmount Decimal     @map("total_amount") @db.Decimal(10, 2)
+  status      OrderStatus @default(PENDING)
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+
+  payment   Payment    @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  subOrders SubOrder[]
+
+  @@map("orders")
+}
+
+/// Producer-scoped slice of a consumer Order. One SubOrder per producer per Order.
+/// trackingNumber MUST remain null in Cycle 2 — settable only after COURIER mode ships (RF-21).
+/// shippingCostSnapshot is written by Cycle 3 checkout from DeliveryMode.cost at order time.
+/// Idempotent PATCH: if current.status === target, return current with no UPDATE issued.
+model SubOrder {
+  id                   String         @id @default(cuid())
+  orderId              String         @map("order_id")
+  producerId           String         @map("producer_id")
+  deliveryModeId       String         @map("delivery_mode_id")
+  status               SubOrderStatus @default(pending)
+  shippingCostSnapshot Decimal        @map("shipping_cost_snapshot") @db.Decimal(10, 2)
+  trackingNumber       String?        @map("tracking_number")
+  createdAt            DateTime       @default(now()) @map("created_at")
+  updatedAt            DateTime       @updatedAt @map("updated_at")
+
+  order        Order        @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  producer     Producer     @relation(fields: [producerId], references: [id], onDelete: Restrict)
+  deliveryMode DeliveryMode @relation(fields: [deliveryModeId], references: [id], onDelete: Restrict)
+  orderLines   OrderLine[]
+
+  @@index([producerId, status])
+  @@index([orderId])
+  @@map("sub_orders")
+}
+
+/// Immutable order line — historical price snapshot at the time of purchase.
+/// unitPriceSnapshot MUST NOT be updated after insert. quantity MUST be > 0.
+/// Cycle 3 checkout creates these rows inside the order creation transaction.
+model OrderLine {
+  id                String  @id @default(cuid())
+  subOrderId        String  @map("sub_order_id")
+  productId         String  @map("product_id")
+  quantity          Int
+  unitPriceSnapshot Decimal @map("unit_price_snapshot") @db.Decimal(10, 2)
+
+  subOrder SubOrder @relation(fields: [subOrderId], references: [id], onDelete: Restrict)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@map("order_lines")
 }
