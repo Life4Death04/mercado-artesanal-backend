@@ -16,6 +16,7 @@
  */
 
 export type ErrorCode =
+  // Cycle 1
   | "UNAUTHORIZED"
   | "FORBIDDEN"
   | "ONBOARDING_REQUIRED"
@@ -26,7 +27,16 @@ export type ErrorCode =
   | "UNKNOWN_CATEGORY"
   | "INVALID_DEFAULT_TRANSITION"
   | "ADDRESS_DEFAULT_CONFLICT"
-  | "INTERNAL_ERROR";
+  | "INTERNAL_ERROR"
+  // Cycle 2 additions
+  | "PRODUCT_NOT_FOUND"
+  | "INSUFFICIENT_STOCK"
+  | "PRODUCT_HAS_ACTIVE_ORDERS"
+  | "PRODUCER_HAS_ACTIVE_ORDERS"
+  | "INVALID_ORDER_TRANSITION"
+  | "DELIVERY_MODE_NOT_FOUND"
+  | "IMAGE_UPLOAD_INVALID"
+  | "CATEGORY_NOT_FOUND";
 
 export interface ProblemDetails {
   type: string;

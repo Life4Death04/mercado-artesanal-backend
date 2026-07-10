@@ -38,9 +38,9 @@ vi.mock("@aws-sdk/s3-request-presigner", () => {
 
 // ---------------------------------------------------------------------------
 // 2. Install the global Zod error map so error messages are consistent in
-//    every test file. The function is imported lazily to avoid circular deps
-//    between setup and the validation module.
+//    every test file. Static import — no circular dependency exists between
+//    the setup file and the validation module.
 // ---------------------------------------------------------------------------
-import("@/shared/validation/zod").then(({ installGlobalErrorMap }) => {
-  installGlobalErrorMap();
-});
+import { installGlobalErrorMap } from "@/shared/validation/zod";
+
+installGlobalErrorMap();
