@@ -244,7 +244,7 @@ describe("inventoryService.findLowStock — filtering and ordering", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].id).toBe("product_at");
+    expect(result[0]!.id).toBe("product_at");
 
     // Verify the query includes the correct WHERE filters
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
