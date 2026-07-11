@@ -24,7 +24,7 @@
  *                     §"Report on removed product rejected"
  *   design — Decision #8 (producerId from req.user), Decision #3 (idempotent no-op)
  */
-import type { ModerationStatus, Product } from "@prisma/client";
+import type { ModerationStatus, Product, SubOrderStatus } from "@prisma/client";
 
 import {
   CategoryNotFoundError,
@@ -71,7 +71,6 @@ export interface UpdateProductInput {
  * Non-terminal SubOrder statuses that block product deactivation/delete.
  * Spec: product-catalog §"Soft-delete guard against active order lines".
  */
-import type { SubOrderStatus } from "@prisma/client";
 const NON_TERMINAL_SUB_ORDER_STATUSES: SubOrderStatus[] = ["pending", "preparing", "sent"];
 
 // ---------------------------------------------------------------------------

@@ -2,10 +2,22 @@
  * Products DTOs — Zod schemas for request body validation.
  *
  * All Cycle 2 DTOs use `strictObject()` from shared validation to enforce
- * the strict DTO policy (rejects unknown keys with VALIDATION_FAILED 422).
+ * the strict DTO policy. `strictObject(shape)` calls `z.object(shape).strict()`
+ * internally, so unknown keys are rejected with VALIDATION_FAILED (422) and the
+ * global errorMap message "Field '<name>' is not allowed" (installGlobalErrorMap).
+ *
+ * REFACTOR note: `.strict()` is already enforced via `strictObject()` — no additional
+ * per-DTO `.strict()` calls are needed. The REFACTOR phase verified this and found
+ * no delta was required.
+ *
+ * Forbidden fields guarded by strict policy examples:
+ *   CreateProduct — `moderationStatus`, `producerId`, `deletedAt` (mass-assignment prevention)
+ *   UpdateProduct — `moderationStatus`, `reportedAt`, `reportReason` (moderation is internal)
+ *   ReportProduct — `moderationStatus` (only `reason` is accepted)
  *
  * Spec references:
  *   product-catalog §"Product entity" — field types and constraints
+ *   product-taxonomy scenario "Create product with unknown categoryId rejected" — enforced in service
  *   error-handling §"Zod .strict() policy for unknown keys" (Cycle 2)
  *   design — Architecture Decision #1 (strictObject project-wide)
  */
