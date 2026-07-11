@@ -57,6 +57,12 @@ export async function findAll(): Promise<Category[]> {
  * Both cases map to the same error to avoid information leakage about
  * inactive entries (spec: product-taxonomy §"Lookup by unknown slug returns 404").
  *
+ * Design note: `findFirst` (not `findUnique`) is intentional — the compound
+ * filter `{ slug, isActive: true }` is not the unique index key (slug alone is).
+ * Using `findFirst` with both conditions lets Prisma apply the unique index on
+ * slug and filter isActive in the same query, returning null for inactive slugs
+ * without a second round-trip.
+ *
  * Spec: product-taxonomy §"Public category read endpoints", §"Lookup by unknown slug returns 404"
  */
 export async function findBySlug(slug: string): Promise<Category> {
