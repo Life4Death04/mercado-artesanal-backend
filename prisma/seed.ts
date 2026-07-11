@@ -1,6 +1,6 @@
 /**
  * Seed: ProducerCategory catalog (O-2 LOCKED — 15 slugs, never add/remove without spec update)
- *       Category catalog (Cycle 2 — product taxonomy, 8 canonical slugs)
+ *       Category catalog (Cycle 2 — product taxonomy, 9 canonical slugs)
  *
  * Idempotent: uses upsert keyed on slug so re-runs never duplicate rows.
  * Run via: npm run db:seed  (or `prisma db seed` with the config below wired in package.json)
@@ -52,9 +52,11 @@ const PRODUCER_CATEGORIES: Array<{ slug: string; name: string }> = [
 /**
  * Product category seed — Cycle 2 (product-taxonomy).
  *
- * 8 representative slugs for the public product catalog.
+ * 9 representative slugs for the public product catalog.
  * Spec product-taxonomy §"Category entity" does not specify a canonical list;
  * this set is a SUGGESTION — confirm before production launch.
+ * Includes "queso" to prove coexistence with ProducerCategory.slug="queso"
+ * (O-2 LOCKED) — both slugs live in separate tables without collision.
  *
  * All rows default to isActive=true (spec default).
  */
@@ -64,6 +66,7 @@ const PRODUCT_CATEGORIES: Array<{ slug: string; name: string; description: strin
   { slug: "embutidos-y-charcuteria", name: "Embutidos y charcutería", description: "Embutidos artesanales y productos cárnicos curados" },
   { slug: "lacteos-y-quesos", name: "Lácteos y quesos", description: "Quesos artesanales, mantequillas y otros lácteos" },
   { slug: "mieles-y-mermeladas", name: "Mieles y mermeladas", description: "Mieles, mermeladas y productos apícolas" },
+  { slug: "queso", name: "Queso", description: "Quesos artesanales y curados" },
   { slug: "panaderia", name: "Panadería", description: "Pan artesanal, bollería y repostería tradicional" },
   { slug: "vinos-y-bebidas", name: "Vinos y bebidas", description: "Vinos, cervezas artesanales y licores" },
   { slug: "especias-y-condimentos", name: "Especias y condimentos", description: "Especias, hierbas aromáticas y salsas artesanales" },

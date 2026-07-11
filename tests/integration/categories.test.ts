@@ -244,30 +244,49 @@ describe("Coexistence — Category vs ProducerCategory", () => {
   });
 
   it("[CT6] Category and ProducerCategory can hold the same slug in separate tables", async () => {
-    // GIVEN: ProducerCategory with slug "queso" (Cycle 1) — exists in producer_categories
-    const producerCategory = { id: "pc_001", slug: "queso", name: "Queso" };
-    mockedProducerCategory.findFirst.mockResolvedValue(producerCategory);
+    // GIVEN: ProducerCategory with slug "queso" (Cycle 1, O-2 LOCKED) —
+    //   lives in producer_categories table (separate from categories table).
+    const producerCategoryRow = { id: "pc_queso", slug: "queso", name: "Queso" };
+    mockedProducerCategory.findFirst.mockResolvedValue(producerCategoryRow);
 
-    // AND: Category with slug "queso" (Cycle 2) — exists in categories
-    const productCategory = makeCategory({ slug: "queso", name: "Queso artesanal" });
-    mockedCategory.findFirst.mockResolvedValue(productCategory);
+    // AND: Category with slug "queso" (Cycle 2 — seeded in prisma/seed.ts) —
+    //   lives in categories table.
+    const productCategoryRow = makeCategory({
+      id: "cat_queso",
+      slug: "queso",
+      name: "Queso",
+      description: "Quesos artesanales y curados",
+      isActive: true,
+    });
+    mockedCategory.findFirst.mockResolvedValue(productCategoryRow);
 
-    // WHEN: we query both tables independently
+    // WHEN: a client calls GET /api/v1/categories/queso through the real Express app
+    const app = createApp();
+    const res = await supertest(app)
+      .get("/api/v1/categories/queso")
+      .expect(200);
+
+    // THEN: the response body comes from the Category table (not ProducerCategory)
+    expect(res.body.id).toBe("cat_queso");
+    expect(res.body.slug).toBe("queso");
+    expect(res.body.name).toBe("Queso");
+
+    // AND: the service called prisma.category.findFirst for the Category table
+    expect(mockedCategory.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ slug: "queso", isActive: true }),
+      }),
+    );
+
+    // AND: ProducerCategory with slug "queso" still exists as a distinct entity
+    //   in producer_categories — independent query to prove coexistence.
     const foundProducerCategory = await mockedProducerCategory.findFirst({
       where: { slug: "queso" },
     });
-    const foundProductCategory = await mockedCategory.findFirst({
-      where: { slug: "queso" },
-    });
-
-    // THEN: both rows exist and are in separate tables (no collision)
     expect(foundProducerCategory).not.toBeNull();
-    expect(foundProducerCategory.slug).toBe("queso");
+    expect(foundProducerCategory!.slug).toBe("queso");
 
-    expect(foundProductCategory).not.toBeNull();
-    expect(foundProductCategory.slug).toBe("queso");
-
-    // AND: they are distinct objects with different IDs (separate tables)
-    expect(foundProducerCategory.id).not.toBe(foundProductCategory.id);
+    // AND: the two rows have distinct IDs — they live in separate tables, no collision
+    expect(foundProducerCategory!.id).not.toBe(res.body.id);
   });
 });
