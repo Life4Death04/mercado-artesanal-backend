@@ -14,10 +14,25 @@
  *     cross-producer access returns ProductNotFoundError (404) — no-leak pattern.
  *   - presign: does NOT insert any DB row. Only produces a presigned PUT URL + s3Key.
  *   - confirm: runs inside $transaction: HEAD-check S3 → insert ProductImage.
- *   - confirm: HEAD 404 maps to ImageUploadInvalidError (400) per Decision #2.
- *     The s3Key MUST NOT appear in the error detail (PII-safety invariant).
+ *   - confirm: HEAD 404/NoSuchKey maps to ImageUploadInvalidError (400) — Decision #2.
  *   - confirm: Prisma P2002 on (productId, position) maps to ImageUploadInvalidError (400).
- *     Column names and s3Key MUST NOT appear in the error detail.
+ *
+ * ─── PII-SAFETY AUDIT ──────────────────────────────────────────────────────
+ *
+ *   The s3Key MUST NEVER appear in any thrown error's `detail` field.
+ *   Spec: error-handling §"ImageUploadInvalidError never echoes the s3Key"
+ *
+ *   Audit checklist (enforced in every ImageUploadInvalidError throw below):
+ *     ✗ Do not interpolate `input.s3Key` into the error message.
+ *     ✗ Do not include the raw SDK error message (may contain the key path).
+ *     ✗ Do not include column names from P2002.meta.target.
+ *     ✓ Use generic, human-readable messages only.
+ *
+ * ─── VALIDATION SPLIT ──────────────────────────────────────────────────────
+ *
+ *   mimeType and contentLength (for presign) are validated in the SERVICE
+ *   (not in the Zod DTO) to produce IMAGE_UPLOAD_INVALID (400), not
+ *   VALIDATION_FAILED (422). The DTO enforces structural shape only.
  *
  * S3 wrapper: REUSES src/shared/s3/s3-client.ts (Slice 2 infra).
  * No new S3 wrapper is created per design.
@@ -26,7 +41,7 @@
  *   product-images §"Presign endpoint contract", §"Confirm endpoint contract",
  *                  §"ProductImage entity", §"Test hygiene — mock the SDK"
  *   error-handling §"ImageUploadInvalidError never echoes the s3Key"
- *   design §"S3 image flow", Decision #2 (HEAD 404 → 400)
+ *   design §"S3 image flow", Decision #2 (HEAD 404 → 400, not 404)
  *   design ADR-003 (no repositories/ layer)
  */
 import { randomUUID } from "crypto";
@@ -78,6 +93,40 @@ const PRESIGN_TTL_SECS = 300;
 const S3_BUCKET = process.env["AWS_BUCKET_NAME"] ?? "mercado-artesanal-images";
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Determines whether an error from the S3 SDK represents a 404 / object-not-found
+ * condition. The AWS SDK v3 may surface this as:
+ *   - `err.name === 'NotFound'` (HeadObjectCommand on a missing key)
+ *   - `err.name === 'NoSuchKey'` (some SDK versions / LocalStack)
+ *   - `err.$metadata.httpStatusCode === 404`
+ *
+ * REFACTOR: Extracted from the inline `catch` block in `confirm()` to make the
+ * detection logic testable and auditable in one place.
+ *
+ * Design Decision #2: callers map this condition to ImageUploadInvalidError (400),
+ * never to a 404 response.
+ */
+function isS3ObjectNotFound(err: unknown): boolean {
+  if (!(err instanceof Error)) {
+    // Non-Error object with $metadata (some SDK shapes)
+    return (
+      typeof err === "object" &&
+      err !== null &&
+      "$metadata" in err &&
+      (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404
+    );
+  }
+  return (
+    err.name === "NotFound" ||
+    err.name === "NoSuchKey" ||
+    (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404
+  );
+}
+
+// ---------------------------------------------------------------------------
 // presign
 // ---------------------------------------------------------------------------
 
@@ -85,21 +134,18 @@ const S3_BUCKET = process.env["AWS_BUCKET_NAME"] ?? "mercado-artesanal-images";
  * Generate a presigned PUT URL for direct client-to-S3 upload.
  *
  * Steps:
- *   1. Validate mimeType (allow-list) — throws IMAGE_UPLOAD_INVALID before owner check
- *      to fail-fast on obviously invalid input.
+ *   1. Validate mimeType against allow-list — throws IMAGE_UPLOAD_INVALID (400)
+ *      BEFORE any owner check or S3 call. Spec: "Invalid mimeType rejected before presign".
  *   2. Validate contentLength (≤ 5 MB) — same fast-fail before owner check.
  *   3. Owner check: product must exist and belong to producerId.
  *      Cross-producer: ProductNotFoundError (404) — no-leak.
- *   4. Generate an opaque s3Key (no mimeType in the key — opaque by design).
+ *   4. Generate an opaque s3Key (UUID-based — no mimeType, no extension, no s3Key in errors).
  *   5. Call getPresignedUrl (TTL 300 s).
  *   6. Return { uploadUrl, s3Key, expiresIn: 300 }.
  *   7. NEVER insert any DB row.
  *
- * Note on validation order: spec §"Invalid mimeType rejected before presign" requires
- * the S3 SDK to NOT be called when mime is invalid. We validate mime/size first
- * (steps 1–2), then do the owner check (step 3), then call S3 (step 5).
- * The owner check precedes the S3 call so no presigned URL is issued for
- * cross-producer requests either.
+ * PII-safety: the s3Key generated in step 4 is opaque (UUID) and is NOT included
+ * in any thrown error. Callers receive the key in the success response only.
  *
  * Spec: product-images §"Presign endpoint contract"
  * Design: §"S3 image flow"
@@ -109,21 +155,24 @@ export async function presign(
   productId: string,
   input: PresignInput,
 ): Promise<PresignResult> {
-  // Step 1: validate mimeType — must be in the allow-list
+  // Step 1: validate mimeType against allow-list.
+  // Throws IMAGE_UPLOAD_INVALID (400) — NOT the Zod VALIDATION_FAILED (422).
+  // S3 SDK must NEVER be called with an unsupported MIME type.
   if (!(ALLOWED_MIME_TYPES as readonly string[]).includes(input.mimeType)) {
     throw new ImageUploadInvalidError(
       `Unsupported MIME type. Allowed: ${ALLOWED_MIME_TYPES.join(", ")}`,
     );
   }
 
-  // Step 2: validate contentLength — must not exceed 5 MB
+  // Step 2: validate contentLength — must not exceed 5 MB.
+  // Throws IMAGE_UPLOAD_INVALID (400); S3 SDK must NOT be called.
   if (input.contentLength > MAX_CONTENT_LENGTH) {
     throw new ImageUploadInvalidError(
       `Content too large. Maximum allowed size is ${MAX_CONTENT_LENGTH} bytes (5 MB)`,
     );
   }
 
-  // Step 3: owner check — product must exist and belong to producerId (no-leak)
+  // Step 3: owner check — product must exist and belong to producerId (no-leak).
   const product = await prisma.product.findFirst({
     where: { id: productId, producerId, deletedAt: null },
     select: { id: true },
@@ -132,10 +181,12 @@ export async function presign(
     throw new ProductNotFoundError("Product not found");
   }
 
-  // Step 4: generate an opaque s3Key (UUID-based, no mimeType extension leakage)
+  // Step 4: generate an opaque s3Key — UUID-based, no extension, no PII.
+  // The key structure encodes producer + product context for S3 organisation
+  // but does NOT include the mimeType to keep it opaque and PII-safe.
   const s3Key = `producers/${producerId}/products/${productId}/img/${randomUUID()}`;
 
-  // Step 5: generate presigned PUT URL (TTL 300 s per spec)
+  // Step 5: generate presigned PUT URL (TTL 300 s per spec).
   const uploadUrl = await getPresignedUrl(
     {
       Bucket: S3_BUCKET,
@@ -146,7 +197,7 @@ export async function presign(
     PRESIGN_TTL_SECS,
   );
 
-  // Step 6: return shape — no DB insert
+  // Step 6: return shape — no DB insert ever.
   return { uploadUrl, s3Key, expiresIn: PRESIGN_TTL_SECS };
 }
 
@@ -158,19 +209,33 @@ export async function presign(
  * Confirm a completed S3 upload: verify the object exists and insert ProductImage.
  *
  * Steps (inside $transaction for atomicity):
- *   1. Owner check: product must exist and belong to producerId.
+ *   1. Validate mimeType — IMAGE_UPLOAD_INVALID (400) if not in allow-list.
+ *   2. Owner check: product must exist and belong to producerId.
  *      Cross-producer: ProductNotFoundError (404) — no-leak.
- *   2. S3 HEAD: verify the uploaded object exists in S3.
- *      - NotFound (HTTP 404 or name === 'NotFound') → ImageUploadInvalidError (400).
- *      - The s3Key MUST NOT appear in the error detail (PII-safety per spec).
- *   3. Insert ProductImage row.
+ *   3. S3 HEAD: verify the uploaded object exists in S3.
+ *      - isS3ObjectNotFound(err) → ImageUploadInvalidError (400).
+ *      - The s3Key MUST NOT appear in the error detail.
+ *   4. Insert ProductImage row.
  *      - Prisma P2002 on @@unique([productId, position]) → ImageUploadInvalidError (400).
- *      - Column names and s3Key MUST NOT appear in the error detail.
- *   4. Return the new ProductImage.
+ *      - Column names (product_id, position) and s3Key MUST NOT appear in the detail.
+ *   5. Return the new ProductImage.
  *
- * Design Decision #2: S3 HEAD 404 → IMAGE_UPLOAD_INVALID (400), NOT 404.
- * Rationale: the Product resource exists; the client failed the upload precondition.
- * A 404 would mislead the frontend into "product deleted" UX paths.
+ * ─── Design Decision #2 ────────────────────────────────────────────────────
+ *
+ *   S3 HEAD 404 → IMAGE_UPLOAD_INVALID (400), NOT 404.
+ *   Rationale: the Product resource exists; the client failed the upload
+ *   precondition. A 404 response would mislead the frontend into a
+ *   "product deleted" UX path.
+ *
+ *   Spec: product-images §"Confirm without prior S3 object rejected"
+ *   Design: Decision #2 — mapping lives HERE (service), not in the controller.
+ *
+ * ─── PII-safety contract ───────────────────────────────────────────────────
+ *
+ *   Both error paths (HEAD 404 and P2002) use generic messages that do NOT
+ *   include: the s3Key, column names from P2002.meta.target, SDK error messages,
+ *   or any user-supplied data. This is enforced by the audit checklist at the
+ *   top of this file.
  *
  * Spec: product-images §"Confirm endpoint contract",
  *       error-handling §"ImageUploadInvalidError never echoes the s3Key"
@@ -181,8 +246,8 @@ export async function confirm(
   productId: string,
   input: ConfirmInput,
 ): Promise<ProductImage> {
-  // Validate mimeType against allow-list (same business-rule as presign).
-  // This produces IMAGE_UPLOAD_INVALID (400), not VALIDATION_FAILED (422).
+  // Step 1: validate mimeType against allow-list (same business-rule as presign).
+  // Runs OUTSIDE the transaction so we fail-fast before any DB or S3 call.
   if (!(ALLOWED_MIME_TYPES as readonly string[]).includes(input.mimeType)) {
     throw new ImageUploadInvalidError(
       `Unsupported MIME type. Allowed: ${ALLOWED_MIME_TYPES.join(", ")}`,
@@ -190,7 +255,7 @@ export async function confirm(
   }
 
   return prisma.$transaction(async (tx) => {
-    // Step 1: owner check (same no-leak pattern as products.service)
+    // Step 2: owner check (same no-leak pattern as products.service).
     const product = await tx.product.findFirst({
       where: { id: productId, producerId, deletedAt: null },
       select: { id: true },
@@ -199,25 +264,19 @@ export async function confirm(
       throw new ProductNotFoundError("Product not found");
     }
 
-    // Step 2: S3 HEAD — verify the uploaded object exists
-    // Per Decision #2: NotFound → IMAGE_UPLOAD_INVALID (400), never 404.
-    // The s3Key MUST NOT appear in the thrown error's detail.
+    // Step 3: S3 HEAD — verify the uploaded object exists in S3.
+    //
+    // isS3ObjectNotFound() covers all S3 SDK v3 NotFound variants:
+    //   - err.name === 'NotFound'    (HeadObjectCommand, standard SDK)
+    //   - err.name === 'NoSuchKey'   (some SDK versions / LocalStack)
+    //   - err.$metadata.httpStatusCode === 404 (raw HTTP fallback)
+    //
+    // PII-SAFETY: The generic message below does NOT include `input.s3Key`.
+    // The raw SDK error message (which may contain the key path) is discarded.
     try {
       await headObject({ Bucket: S3_BUCKET, Key: input.s3Key });
     } catch (err) {
-      const isNotFound =
-        (err instanceof Error &&
-          (err.name === "NotFound" ||
-            err.name === "NoSuchKey" ||
-            (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode ===
-              404)) ||
-        (typeof err === "object" &&
-          err !== null &&
-          "$metadata" in err &&
-          (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404);
-
-      if (isNotFound) {
-        // PII-safety: must NOT include the s3Key in the error detail
+      if (isS3ObjectNotFound(err)) {
         throw new ImageUploadInvalidError(
           "The uploaded object could not be found in storage. Please upload the file before confirming.",
         );
@@ -225,9 +284,14 @@ export async function confirm(
       throw err;
     }
 
-    // Step 3: insert ProductImage row
-    // Prisma P2002 on @@unique([productId, position]) → ImageUploadInvalidError (400).
-    // Column names and s3Key MUST NOT appear in the error detail.
+    // Step 4: insert ProductImage row.
+    //
+    // Prisma P2002 on @@unique([productId, position]) → IMAGE_UPLOAD_INVALID (400).
+    //
+    // PII-SAFETY: The generic message below does NOT include:
+    //   - `input.s3Key`        (PII-safety per spec)
+    //   - column names         (P2002.meta.target contains ["product_id", "position"])
+    //   - the Prisma error message (may contain table/column info)
     try {
       return await tx.productImage.create({
         data: {
@@ -244,8 +308,6 @@ export async function confirm(
         (err as { code: string }).code === "P2002";
 
       if (isUniqueViolation) {
-        // PII-safety: must NOT include column names or s3Key in the detail.
-        // Deliberately avoids "position" (column name) and s3Key.
         throw new ImageUploadInvalidError(
           "An image already exists at this index for the product. Use a different index.",
         );
