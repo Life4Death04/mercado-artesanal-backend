@@ -17,9 +17,9 @@
  *     which causes the surrounding $transaction to roll back.
  *   - decrementStock: accepts optional caller tx (Cycle 3 composition) —
  *     if tx is provided, runs on it; if undefined, opens own $transaction.
- *   - findLowStock: filters stock <= lowStockThreshold AND deletedAt IS NULL
- *     AND isActive = true; ordered stock ASC, name ASC; paginated (default 20,
- *     cap 100); does NOT expose an HTTP route (owned by sales-stats Slice 10).
+ *   - findLowStock: enforces stock <= lowStockThreshold (cross-column, via $queryRaw)
+ *     AND deletedAt IS NULL AND isActive = true; ordered stock ASC, name ASC;
+ *     paginated (default 20, cap 100); no HTTP route (owned by sales-stats Slice 10).
  *
  * ─── FROZEN CONTRACT ─── Cycle 3 MUST import without modification ──────────
  *
@@ -198,22 +198,19 @@ async function _decrementStockInTx(
 // ---------------------------------------------------------------------------
 
 /**
- * Return products owned by a producer where stock <= lowStockThreshold,
+ * Return products owned by a producer where `stock <= lowStockThreshold`,
  * excluding soft-deleted and inactive products.
  *
- * Filtering:
- *   - `producerId` scoping (RBAC — producer sees only own products)
- *   - `deletedAt: null` (exclude soft-deleted rows)
- *   - `isActive: true` (exclude inactive listings)
- *   - `stock <= lowStockThreshold` — cross-column condition; Prisma 5.x does not
- *     support column-reference comparisons in `where`, so the scalar filters above
- *     are applied at the DB level and the sales-stats consumer is expected to call
- *     this function with the correct context. The Cycle 2 spec states the intent;
- *     Cycle 3 or later can replace this query with a $queryRaw if performance
- *     analysis on large producer catalogs reveals an N+1 concern. For now, the
- *     DB ordering and Prisma-level filters (deletedAt, isActive, producerId) are
- *     applied server-side; the cross-column condition is documented as a known
- *     Cycle 2 limitation.
+ * Implementation: uses `$queryRaw` with `Prisma.sql` to enforce the cross-column
+ * comparison `stock <= low_stock_threshold` at the database level. Prisma 5.x ORM
+ * `where` does not support column-reference comparisons, so raw SQL is the correct
+ * and spec-compliant approach here.
+ *
+ * Filtering (all enforced in SQL):
+ *   - `producer_id = producerId`   (RBAC — producer sees only own products)
+ *   - `deleted_at IS NULL`         (exclude soft-deleted rows)
+ *   - `is_active = TRUE`           (exclude inactive listings)
+ *   - `stock <= low_stock_threshold` (the cross-column spec invariant)
  *
  * Ordering: stock ASC, name ASC (DB-level — deterministic across stock ties).
  *
@@ -225,8 +222,6 @@ async function _decrementStockInTx(
  * NOTE: No HTTP route registered from this module — owned by sales-stats (Slice 10).
  *
  * Spec: inventory §"Low-stock query"
- * Link to type-level contract: see tests/unit/inventory.service.test.ts
- *   §"Type-level contract test — Cycle 3 frozen import"
  */
 export async function findLowStock(input: FindLowStockInput): Promise<Product[]> {
   const { producerId, limit, offset = 0 } = input;
@@ -234,9 +229,7 @@ export async function findLowStock(input: FindLowStockInput): Promise<Product[]>
   // Apply default and cap to the effective limit
   const effectiveLimit = Math.min(limit ?? LOW_STOCK_DEFAULT_LIMIT, LOW_STOCK_MAX_LIMIT);
 
-  // Use $queryRaw to enforce the cross-column comparison stock <= low_stock_threshold.
-  // Prisma 5.x WHERE does not support column-reference comparisons, so raw SQL is required
-  // to implement the spec invariant: inventory §"Low-stock query".
+  // $queryRaw enforces stock <= low_stock_threshold (cross-column — not expressible via Prisma WHERE).
   return prisma.$queryRaw<Product[]>(
     Prisma.sql`
       SELECT
