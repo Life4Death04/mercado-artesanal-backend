@@ -1,0 +1,20 @@
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: mercado-artesanal-backend-postgres-test
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: mercado_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mercado_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_test_data:
