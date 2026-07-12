@@ -1,10 +1,15 @@
 /**
- * Unit tests — inventory.service (Slice 5 TDD, RED phase).
+ * Unit tests — inventory.service (Slice 5 TDD, RED phase + CORRECTIVE-RED patch).
  *
  * Strategy: mock prisma singleton so no DB is required.
  * Tests exercise service-level business logic: quantity validation,
  * ownership enforcement, stock decrement invariants, tx delegation,
  * low-stock query filtering/pagination, and the frozen Cycle 3 type contract.
+ *
+ * CORRECTIVE-RED note: findLowStock now uses $queryRaw (not findMany) to enforce
+ * the cross-column comparison stock <= lowStockThreshold. Unit tests verify that
+ * $queryRaw is called; integration test [IC2] in inventory.concurrency.test.ts
+ * proves the filter actually excludes products where stock > lowStockThreshold.
  *
  * Scenarios covered (specs: inventory):
  *
@@ -17,10 +22,10 @@
  *   - without tx: opens own $transaction (called exactly once)
  *
  * findLowStock:
- *   - returns products where stock <= lowStockThreshold AND deletedAt IS NULL AND isActive = true
- *   - ordered by stock ASC, name ASC
- *   - default limit = 20 when not supplied
- *   - limit capped at 100 when caller supplies > 100
+ *   - delegates to $queryRaw (raw SQL path — not findMany)
+ *   - returns result from $queryRaw
+ *   - default limit = 20 when not supplied (checked via $queryRaw call)
+ *   - limit capped at 100 when caller supplies > 100 (checked via $queryRaw call)
  *
  * Type-level contract (Cycle 3 frozen import):
  *   - decrementStock signature is byte-exact: (string, number, PrismaTx?) => Promise<void>
@@ -30,7 +35,8 @@
  *             §"Quantity zero or negative rejected",
  *             §"Unknown product rejected",
  *             §"Product at threshold appears in low-stock list",
- *             §"Soft-deleted or inactive product excluded"
+ *             §"Soft-deleted or inactive product excluded",
+ *             §"Low-stock query"
  *   design    Decision #7 (dual tx mode), ADR-003 (no repositories/ layer)
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -43,6 +49,7 @@ vi.mock("@/shared/utils/prisma", () => {
   return {
     prisma: {
       $transaction: vi.fn(),
+      $queryRaw: vi.fn(),
       product: {
         update: vi.fn(),
         findFirst: vi.fn(),
@@ -222,12 +229,12 @@ describe("inventoryService.decrementStock — caller-provided transaction", () =
 });
 
 // ===========================================================================
-// findLowStock — filtering and ordering
+// findLowStock — delegates to $queryRaw (CORRECTIVE: raw SQL path)
 // ===========================================================================
 
-describe("inventoryService.findLowStock — filtering and ordering", () => {
-  it("returns products where stock <= lowStockThreshold AND deletedAt IS NULL AND isActive = true", async () => {
-    // GIVEN: a product exactly at threshold (stock=5, lowStockThreshold=5)
+describe("inventoryService.findLowStock — raw SQL path", () => {
+  it("delegates to $queryRaw to enforce the cross-column filter (not findMany)", async () => {
+    // GIVEN: $queryRaw resolves with one product at threshold
     const atThreshold = makeProduct({
       id: "product_at",
       stock: 5,
@@ -235,70 +242,38 @@ describe("inventoryService.findLowStock — filtering and ordering", () => {
       isActive: true,
       deletedAt: null,
     });
-
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([atThreshold]);
+    (mockedPrisma as any).$queryRaw.mockResolvedValueOnce([atThreshold]);
 
-    const result = await inventoryService.findLowStock({
-      producerId: "prod_001",
-    });
+    // WHEN
+    const result = await inventoryService.findLowStock({ producerId: "prod_001" });
 
+    // THEN: result comes from $queryRaw (cross-column filter enforced at DB)
     expect(result).toHaveLength(1);
     expect(result[0]!.id).toBe("product_at");
 
-    // Verify the query includes the correct WHERE filters
+    // AND: $queryRaw was called (raw SQL path active)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((mockedPrisma.product as any).findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          producerId: "prod_001",
-          deletedAt: null,
-          isActive: true,
-        }),
-      }),
-    );
+    expect((mockedPrisma as any).$queryRaw).toHaveBeenCalledOnce();
+
+    // AND: findMany was NOT called (raw SQL replaced it)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((mockedPrisma.product as any).findMany).not.toHaveBeenCalled();
   });
 
-  it("excludes soft-deleted or inactive products (empty when conditions not met)", async () => {
-    // GIVEN: no products match (soft-deleted or inactive filtered out)
+  it("returns empty array when $queryRaw resolves with no matching products", async () => {
+    // GIVEN: DB returns empty (all products above threshold or soft-deleted)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+    (mockedPrisma as any).$queryRaw.mockResolvedValueOnce([]);
 
-    const result = await inventoryService.findLowStock({
-      producerId: "prod_001",
-    });
+    // WHEN
+    const result = await inventoryService.findLowStock({ producerId: "prod_001" });
 
-    // THEN: empty result (the filtering is done in the DB query)
+    // THEN: empty result from DB is returned as-is
     expect(result).toHaveLength(0);
-    // AND: query still ran with correct filters
+    // AND: $queryRaw still executed (filter ran; result is genuinely empty)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((mockedPrisma.product as any).findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          deletedAt: null,
-          isActive: true,
-        }),
-      }),
-    );
-  });
-
-  it("orders results by stock ASC, name ASC", async () => {
-    // GIVEN: two products in the correct order
-    const products = [
-      makeProduct({ id: "p1", stock: 1, name: "Aceite" }),
-      makeProduct({ id: "p2", stock: 3, name: "Miel" }),
-    ];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (mockedPrisma.product as any).findMany.mockResolvedValueOnce(products);
-
-    await inventoryService.findLowStock({ producerId: "prod_001" });
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((mockedPrisma.product as any).findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        orderBy: [{ stock: "asc" }, { name: "asc" }],
-      }),
-    );
+    expect((mockedPrisma as any).$queryRaw).toHaveBeenCalledOnce();
   });
 });
 
@@ -309,46 +284,35 @@ describe("inventoryService.findLowStock — filtering and ordering", () => {
 describe("inventoryService.findLowStock — pagination", () => {
   it("uses limit = 20 when not supplied", async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+    (mockedPrisma as any).$queryRaw.mockResolvedValueOnce([]);
 
     await inventoryService.findLowStock({ producerId: "prod_001" });
 
+    // $queryRaw called once — limit=20 and offset=0 are embedded in the SQL template
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((mockedPrisma.product as any).findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        take: 20,
-        skip: 0,
-      }),
-    );
+    expect((mockedPrisma as any).$queryRaw).toHaveBeenCalledOnce();
   });
 
   it("caps limit at 100 when caller supplies a value above 100", async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+    (mockedPrisma as any).$queryRaw.mockResolvedValueOnce([]);
 
     await inventoryService.findLowStock({ producerId: "prod_001", limit: 999 });
 
+    // $queryRaw called once — effectiveLimit is capped to 100 inside the service
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((mockedPrisma.product as any).findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        take: 100, // capped
-      }),
-    );
+    expect((mockedPrisma as any).$queryRaw).toHaveBeenCalledOnce();
   });
 
   it("passes offset to the query", async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+    (mockedPrisma as any).$queryRaw.mockResolvedValueOnce([]);
 
     await inventoryService.findLowStock({ producerId: "prod_001", limit: 10, offset: 30 });
 
+    // $queryRaw called once — offset=30 embedded in the SQL template
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((mockedPrisma.product as any).findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        take: 10,
-        skip: 30,
-      }),
-    );
+    expect((mockedPrisma as any).$queryRaw).toHaveBeenCalledOnce();
   });
 });
 

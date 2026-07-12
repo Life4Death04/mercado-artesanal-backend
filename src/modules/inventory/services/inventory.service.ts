@@ -59,7 +59,8 @@
  *   design    Decision #7 (dual tx mode)
  *   design    ADR-003 (no repositories/ layer)
  */
-import type { Prisma, Product } from "@prisma/client";
+import { Prisma } from "@prisma/client";
+import type { Product } from "@prisma/client";
 
 import {
   InsufficientStockError,
@@ -233,14 +234,40 @@ export async function findLowStock(input: FindLowStockInput): Promise<Product[]>
   // Apply default and cap to the effective limit
   const effectiveLimit = Math.min(limit ?? LOW_STOCK_DEFAULT_LIMIT, LOW_STOCK_MAX_LIMIT);
 
-  return prisma.product.findMany({
-    where: {
-      producerId,
-      deletedAt: null,
-      isActive: true,
-    },
-    orderBy: [{ stock: "asc" }, { name: "asc" }],
-    take: effectiveLimit,
-    skip: offset,
-  });
+  // Use $queryRaw to enforce the cross-column comparison stock <= low_stock_threshold.
+  // Prisma 5.x WHERE does not support column-reference comparisons, so raw SQL is required
+  // to implement the spec invariant: inventory §"Low-stock query".
+  return prisma.$queryRaw<Product[]>(
+    Prisma.sql`
+      SELECT
+        id,
+        producer_id    AS "producerId",
+        category_id    AS "categoryId",
+        name,
+        description,
+        price,
+        stock,
+        low_stock_threshold AS "lowStockThreshold",
+        is_active      AS "isActive",
+        ingredients,
+        allergens,
+        weight,
+        presentation,
+        reported_at    AS "reportedAt",
+        moderation_status AS "moderationStatus",
+        report_reason  AS "reportReason",
+        deleted_at     AS "deletedAt",
+        created_at     AS "createdAt",
+        updated_at     AS "updatedAt"
+      FROM products
+      WHERE
+        producer_id = ${producerId}
+        AND deleted_at IS NULL
+        AND is_active = TRUE
+        AND stock <= low_stock_threshold
+      ORDER BY stock ASC, name ASC
+      LIMIT ${effectiveLimit}
+      OFFSET ${offset}
+    `,
+  );
 }
