@@ -10,7 +10,8 @@
  * semantics inside a `$transaction`. Only a real DB can verify that exactly
  * one of two concurrent callers wins and the other gets InsufficientStockError.
  *
- * Scenario covered:
+ * Scenarios covered:
+ *
  *   [IC1] Concurrent decrements never oversell
  *     GIVEN  a product with stock = 1
  *     WHEN   two concurrent decrementStock(id, 1) calls execute (Promise.allSettled)
@@ -18,13 +19,23 @@
  *     AND    the other throws InsufficientStockError (409)
  *     AND    the DB shows stock = 0 (no negative, no oversell)
  *
+ *   [IC2] findLowStock cross-column filter — only products where stock <= lowStockThreshold returned
+ *     GIVEN  Prod1(stock=5, lowStockThreshold=5) — at threshold → MUST appear
+ *     AND    Prod2(stock=3, lowStockThreshold=2) — above threshold → MUST NOT appear
+ *     AND    Prod3(stock=0, lowStockThreshold=5) — below threshold → MUST appear
+ *     WHEN   findLowStock is called for the owning producer
+ *     THEN   only Prod1 and Prod3 appear in the result
+ *     AND    Prod2 is excluded because stock(3) > lowStockThreshold(2)
+ *
  * Spec references:
  *   inventory §"Concurrent decrements never oversell" (RNF-11)
+ *   inventory §"Product at threshold appears in low-stock list"
+ *   inventory §"Low-stock query" (stock <= lowStockThreshold requirement)
  *   design    §"Testing Strategy" — concurrency test (Gap #3)
  *
- * NOTE: This test is skipped when the database is unreachable (localhost:5433).
- * It only passes when the real test DB container is running. The CI pipeline
- * MUST start the postgres container before running `npm test`.
+ * SKIP POLICY: When the database is unreachable, each test calls `ctx.skip()`
+ * so Vitest reports it as SKIPPED (not passed). This prevents silent false-greens.
+ * The CI pipeline MUST start the postgres container before running `pnpm test`.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
@@ -39,15 +50,11 @@ import * as inventoryService from "@/modules/inventory/services/inventory.servic
 const db = new PrismaClient();
 
 // ---------------------------------------------------------------------------
-// Test state
+// DB reachability — set in beforeAll; tests call ctx.skip() when false.
+// Using ctx.skip() rather than describe.skipIf because skipIf is evaluated
+// at collection time (before beforeAll runs), so the flag would always be false.
 // ---------------------------------------------------------------------------
-let testProductId: string;
-let testProducerId: string;
-let testCategoryId: string;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+let dbReachable = false;
 
 async function isDbReachable(): Promise<boolean> {
   try {
@@ -59,20 +66,31 @@ async function isDbReachable(): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared test state (IC1)
+// ---------------------------------------------------------------------------
+let testProductId: string;
+let testProducerId: string;
+let testCategoryId: string;
+
+// ---------------------------------------------------------------------------
+// Shared test state (IC2 — cross-column filter)
+// ---------------------------------------------------------------------------
+let ic2ProducerId: string;
+let ic2ProductAtThresholdId: string;   // stock=5, lowStockThreshold=5 → included
+let ic2ProductAboveThresholdId: string; // stock=3, lowStockThreshold=2 → excluded
+let ic2ProductBelowThresholdId: string; // stock=0, lowStockThreshold=5 → included
+
+// ---------------------------------------------------------------------------
 // Setup / Teardown
 // ---------------------------------------------------------------------------
 
 beforeAll(async () => {
-  const reachable = await isDbReachable();
-  if (!reachable) {
-    // Skip gracefully — test infra not available
+  dbReachable = await isDbReachable();
+  if (!dbReachable) {
     return;
   }
 
-  // Seed: create a minimal producer + category + product with stock = 1
-  // Use upsert/create with a unique test identifier to avoid collisions
-
-  // Find or create a test user + producer
+  // ── IC1 seed ──────────────────────────────────────────────────────────────
   const user = await db.user.upsert({
     where: { auth0Sub: "test-inventory-concurrency-user" },
     create: {
@@ -99,7 +117,6 @@ beforeAll(async () => {
   });
   testProducerId = producer.id;
 
-  // Find or create a test category
   const category = await db.category.upsert({
     where: { slug: "test-inventory-cat" },
     create: {
@@ -111,7 +128,6 @@ beforeAll(async () => {
   });
   testCategoryId = category.id;
 
-  // Create the product with stock = 1 for the concurrency test
   const product = await db.product.create({
     data: {
       producerId: testProducerId,
@@ -125,36 +141,108 @@ beforeAll(async () => {
     },
   });
   testProductId = product.id;
+
+  // ── IC2 seed ──────────────────────────────────────────────────────────────
+  const ic2User = await db.user.upsert({
+    where: { auth0Sub: "test-inventory-crosscol-user" },
+    create: {
+      auth0Sub: "test-inventory-crosscol-user",
+      email: "inventory-crosscol@test.local",
+      role: "PRODUCER",
+    },
+    update: {},
+  });
+
+  const ic2Producer = await db.producer.upsert({
+    where: { userId: ic2User.id },
+    create: {
+      userId: ic2User.id,
+      businessName: "Test Cross-Column Producer",
+      nif: "B88888876",
+      description: "Producer for cross-column filter tests",
+      addressLine1: "Calle Cross 2",
+      addressCity: "Barcelona",
+      addressPostalCode: "08001",
+      addressProvince: "Barcelona",
+    },
+    update: {},
+  });
+  ic2ProducerId = ic2Producer.id;
+
+  // Prod1: stock=5, lowStockThreshold=5 → stock <= threshold → MUST appear
+  const prod1 = await db.product.create({
+    data: {
+      producerId: ic2ProducerId,
+      categoryId: testCategoryId,
+      name: "Aceite IC2 AtThreshold",
+      description: "stock=5, lowStockThreshold=5",
+      price: 10.0,
+      stock: 5,
+      lowStockThreshold: 5,
+      isActive: true,
+    },
+  });
+  ic2ProductAtThresholdId = prod1.id;
+
+  // Prod2: stock=3, lowStockThreshold=2 → stock(3) > threshold(2) → MUST NOT appear
+  const prod2 = await db.product.create({
+    data: {
+      producerId: ic2ProducerId,
+      categoryId: testCategoryId,
+      name: "Miel IC2 AboveThreshold",
+      description: "stock=3, lowStockThreshold=2",
+      price: 8.0,
+      stock: 3,
+      lowStockThreshold: 2,
+      isActive: true,
+    },
+  });
+  ic2ProductAboveThresholdId = prod2.id;
+
+  // Prod3: stock=0, lowStockThreshold=5 → stock(0) <= threshold(5) → MUST appear
+  const prod3 = await db.product.create({
+    data: {
+      producerId: ic2ProducerId,
+      categoryId: testCategoryId,
+      name: "Queso IC2 BelowThreshold",
+      description: "stock=0, lowStockThreshold=5",
+      price: 15.0,
+      stock: 0,
+      lowStockThreshold: 5,
+      isActive: true,
+    },
+  });
+  ic2ProductBelowThresholdId = prod3.id;
 });
 
 afterAll(async () => {
-  const reachable = await isDbReachable();
-  if (!reachable) {
-    await db.$disconnect();
-    return;
-  }
-
-  // Clean up: delete the test product (and any data we created)
-  if (testProductId) {
-    await db.product.deleteMany({ where: { id: testProductId } });
+  if (dbReachable) {
+    if (testProductId) {
+      await db.product.deleteMany({ where: { id: testProductId } });
+    }
+    // Clean up IC2 products
+    const ic2Ids = [
+      ic2ProductAtThresholdId,
+      ic2ProductAboveThresholdId,
+      ic2ProductBelowThresholdId,
+    ].filter(Boolean);
+    if (ic2Ids.length) {
+      await db.product.deleteMany({ where: { id: { in: ic2Ids } } });
+    }
   }
   await db.$disconnect();
 });
 
 // ---------------------------------------------------------------------------
-// Tests
+// [IC1] Concurrency — decrementStock never oversells
 // ---------------------------------------------------------------------------
 
 describe("inventory concurrency — decrementStock never oversells [IC1]", () => {
   it(
     "exactly one of two concurrent decrements commits; the other throws InsufficientStockError; DB shows stock = 0",
-    async () => {
-      const reachable = await isDbReachable();
-      if (!reachable) {
-        // Cannot run without real DB — mark as skipped
-        console.warn(
-          "[IC1] Skipped: Postgres not reachable at localhost:5433. Start the DB container to run this test.",
-        );
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
         return;
       }
 
@@ -192,5 +280,45 @@ describe("inventory concurrency — decrementStock never oversells [IC1]", () =>
       expect(after.stock).toBe(0);
     },
     15000, // 15 s timeout for DB round-trips
+  );
+});
+
+// ---------------------------------------------------------------------------
+// [IC2] Cross-column filter — findLowStock enforces stock <= lowStockThreshold
+// ---------------------------------------------------------------------------
+
+describe("inventory findLowStock — cross-column filter [IC2]", () => {
+  it(
+    "returns only products where stock <= lowStockThreshold; excludes products where stock > lowStockThreshold",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      // GIVEN: three products with distinct stock/threshold combinations (seeded in beforeAll)
+      // Prod1: stock=5, lowStockThreshold=5 → included (at threshold)
+      // Prod2: stock=3, lowStockThreshold=2 → excluded (above threshold)
+      // Prod3: stock=0, lowStockThreshold=5 → included (below threshold)
+
+      // WHEN: findLowStock is called for ic2ProducerId
+      const result = await inventoryService.findLowStock({
+        producerId: ic2ProducerId,
+      });
+
+      // THEN: only Prod1 and Prod3 are returned
+      const ids = result.map((p) => p.id);
+      expect(ids).toContain(ic2ProductAtThresholdId);    // stock=5 <= threshold=5 ✓
+      expect(ids).toContain(ic2ProductBelowThresholdId); // stock=0 <= threshold=5 ✓
+      expect(ids).not.toContain(ic2ProductAboveThresholdId); // stock=3 > threshold=2 ✗
+
+      // AND: exactly 2 results for this producer
+      expect(result).toHaveLength(2);
+
+      // AND: ordered by stock ASC (Prod3 stock=0 first, Prod1 stock=5 second)
+      expect(result[0]!.id).toBe(ic2ProductBelowThresholdId); // stock=0
+      expect(result[1]!.id).toBe(ic2ProductAtThresholdId);    // stock=5
+    },
+    15000,
   );
 });
