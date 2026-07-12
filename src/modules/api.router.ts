@@ -15,6 +15,7 @@
  *   onboardingRouter — POST /users/me/onboarding/consumer|producer
  *   addressesRouter  — GET/POST/PATCH/DELETE /users/me/addresses[/:id]
  *   productsRouter   — Cycle 2: product CRUD + POST /products/:id/report
+ *   imagesRouter     — Cycle 2: presign + confirm under /producers/me/products/:id/images/*
  *
  * Mount order: public routers (categoriesRouter) are registered BEFORE
  * auth-gated routers so they are reachable without any auth header.
@@ -24,6 +25,7 @@ import { Router } from "express";
 import { addressesRouter } from "./addresses/routes/addresses.routes";
 import { authRouter } from "./auth/routes/auth.routes";
 import { categoriesRouter } from "./categories/routes/categories.routes";
+import { imagesRouter } from "./images/routes/images.routes";
 import { onboardingRouter } from "./onboarding/routes/onboarding.routes";
 import { productsRouter } from "./products/routes/products.routes";
 import { usersRouter } from "./users/routes/users.routes";
@@ -39,3 +41,4 @@ apiRouter.use(usersRouter);
 apiRouter.use(onboardingRouter);
 apiRouter.use(addressesRouter);
 apiRouter.use(productsRouter);
+apiRouter.use(imagesRouter);
