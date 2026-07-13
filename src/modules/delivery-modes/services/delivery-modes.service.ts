@@ -12,7 +12,8 @@
  *   - create: validates PICKUP+pickupLocation guard BEFORE any DB write.
  *   - findAll: filters by producerId — returns only own delivery modes.
  *   - findById: findFirst({ where: { id, producerId } }) — cross-producer returns 404 (no-leak).
- *   - update: runs inside $transaction; findFirst guard before update.
+ *   - update: runs inside $transaction; findFirst guard before update; enforces PICKUP invariant
+ *       using effective type/pickupLocation (patch fields merged with existing row).
  *   - hardDelete: runs inside $transaction:
  *       1. findFirst guard (404-no-leak on cross-producer)
  *       2. subOrder.count (active status filter: pending, preparing, sent)
@@ -47,6 +48,35 @@ import type {
 const ACTIVE_SUBORDER_STATUSES: SubOrderStatus[] = ["pending", "preparing", "sent"];
 
 // ---------------------------------------------------------------------------
+// PICKUP invariant guard — shared by create and update
+// ---------------------------------------------------------------------------
+
+/**
+ * Enforce the PICKUP+pickupLocation invariant.
+ *
+ * If `effectiveType` is "PICKUP" and `effectivePickupLocation` is absent or empty,
+ * throw ValidationFailedError (422) before any DB write.
+ *
+ * Called by both `create()` (with direct input fields) and `update()` (with merged
+ * effective values: `input.type ?? existingType`, `input.pickupLocation ?? existingPickupLocation`).
+ *
+ * Spec: delivery-modes §"PICKUP without pickupLocation rejected"
+ */
+function ensurePickupLocationForPickup(
+  effectiveType: string | undefined,
+  effectivePickupLocation: string | null | undefined,
+): void {
+  if (effectiveType === "PICKUP" && !effectivePickupLocation) {
+    throw new ValidationFailedError([
+      {
+        path: "pickupLocation",
+        message: "pickupLocation is required when type is PICKUP",
+      },
+    ]);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // create
 // ---------------------------------------------------------------------------
 
@@ -62,16 +92,9 @@ export async function create(
   producerId: string,
   input: CreateDeliveryModeBody,
 ): Promise<DeliveryMode> {
-  // PICKUP guard — enforced at service layer per spec/design.
+  // PICKUP guard — enforced via shared invariant helper.
   // Produces VALIDATION_FAILED (422) when PICKUP has no pickupLocation.
-  if (input.type === "PICKUP" && !input.pickupLocation) {
-    throw new ValidationFailedError([
-      {
-        path: "pickupLocation",
-        message: "pickupLocation is required when type is PICKUP",
-      },
-    ]);
-  }
+  ensurePickupLocationForPickup(input.type, input.pickupLocation);
 
   return prisma.deliveryMode.create({
     data: {
@@ -138,10 +161,20 @@ export async function findById(
 
 /**
  * Partially update a delivery mode owned by the producer.
- * Runs inside $transaction: findFirst guard → update.
+ * Runs inside $transaction: findFirst guard → PICKUP invariant check → update.
  * Cross-producer: DeliveryModeNotFoundError (404) — no-leak.
  *
+ * PICKUP invariant for partial updates:
+ *   - effectiveType = input.type ?? existing dm.type
+ *   - effectivePickupLocation = input.pickupLocation (from patch) ?? existing dm.pickupLocation
+ *   - If effectiveType is "PICKUP" and effectivePickupLocation is absent/empty → ValidationFailedError (422)
+ *   This handles:
+ *     1. Patching type to "PICKUP" without a location (and existing row has no location).
+ *     2. Patching type to "PICKUP" while the existing row already has a location (allowed).
+ *     3. Clearing pickupLocation while type remains "PICKUP" → rejected.
+ *
  * Spec: delivery-modes §"Producer-scoped CRUD" — update
+ *       delivery-modes §"PICKUP without pickupLocation rejected"
  */
 export async function update(
   producerId: string,
@@ -154,6 +187,14 @@ export async function update(
     if (!dm) {
       throw new DeliveryModeNotFoundError("Delivery mode not found");
     }
+
+    // PICKUP invariant — evaluate against merged (effective) values.
+    // Use payload value when present; fall back to the persisted row value.
+    const effectiveType = input.type ?? dm.type;
+    const effectivePickupLocation =
+      input.pickupLocation !== undefined ? input.pickupLocation : dm.pickupLocation;
+
+    ensurePickupLocationForPickup(effectiveType, effectivePickupLocation);
 
     return tx.deliveryMode.update({
       where: { id },

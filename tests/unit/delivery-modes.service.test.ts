@@ -70,6 +70,7 @@ import {
   ValidationFailedError,
 } from "@/shared/errors/errors";
 import * as deliveryModesService from "@/modules/delivery-modes/services/delivery-modes.service";
+import { DeliveryModeTypeSchema } from "@/modules/delivery-modes/dto/delivery-modes.dto";
 
 // ---------------------------------------------------------------------------
 // Typed mock accessors
@@ -387,14 +388,9 @@ describe("deliveryModesService.hardDelete", () => {
  * Layer: Unit — no prisma calls; pure DTO schema assertion.
  */
 describe("DeliveryModeTypeSchema — enum boundary (enum widening rejected in review)", () => {
-  // Import the DTO schema directly; no mocking of prisma needed for this test.
-  // (The prisma mock above is hoisted but doesn't affect this describe block.)
-  let DeliveryModeTypeSchema: import("zod").ZodEnum<["PICKUP", "SHIPPING_FLAT_RATE"]>;
-
-  beforeEach(async () => {
-    const dto = await import("@/modules/delivery-modes/dto/delivery-modes.dto");
-    DeliveryModeTypeSchema = dto.DeliveryModeTypeSchema;
-  });
+  // Uses the statically imported DeliveryModeTypeSchema from the DTO module.
+  // No prisma calls; pure DTO schema assertion. The prisma mock above is hoisted
+  // but this describe block does not exercise service code.
 
   it("accepts PICKUP as a valid DeliveryModeType", () => {
     const result = DeliveryModeTypeSchema.safeParse("PICKUP");
