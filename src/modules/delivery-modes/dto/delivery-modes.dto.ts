@@ -28,9 +28,16 @@ import { strictObject } from "@/shared/validation/zod";
 
 /**
  * DeliveryModeType enum — exact wire strings from Prisma schema.
- * Spec: delivery-modes §"Enum literal stability".
- * The enum values MUST match the Prisma-generated DeliveryModeType exactly:
- *   PICKUP | SHIPPING_FLAT_RATE
+ *
+ * Uses `z.enum([...])` with the literal values from the Prisma `DeliveryModeType` enum
+ * (`prisma/schema.prisma`). No re-encoding, no lowercase transforms, no aliasing.
+ *
+ * Wire contract (Cycle 3 forward): `PICKUP` and `SHIPPING_FLAT_RATE` MUST remain
+ * stable on the wire — Cycle 3 checkout snapshots `DeliveryMode.type` into SubOrder.
+ * Any new variant (e.g. `COURIER`) MUST go through a new SDD cycle and amend this schema.
+ *
+ * Spec: delivery-modes §"Enum literal stability", §"Forward contract for Cycle 3"
+ * Design: §"Delivery-modes delete guard" (enum stability context)
  */
 export const DeliveryModeTypeSchema = z.enum(["PICKUP", "SHIPPING_FLAT_RATE"]);
 

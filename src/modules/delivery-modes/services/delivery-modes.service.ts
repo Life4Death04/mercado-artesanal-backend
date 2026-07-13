@@ -92,6 +92,9 @@ export async function create(
  * List all delivery modes owned by a producer.
  * Returns an empty array if the producer has none.
  *
+ * Owner-scoping: filters strictly by `producerId` — a producer NEVER sees
+ * another producer's rows. No cross-producer leakage is possible.
+ *
  * Spec: delivery-modes §"Producer-scoped CRUD" — list
  */
 export async function findAll(producerId: string): Promise<DeliveryMode[]> {
@@ -107,7 +110,10 @@ export async function findAll(producerId: string): Promise<DeliveryMode[]> {
 
 /**
  * Get a single delivery mode by id, scoped to the producer.
- * Cross-producer access returns DeliveryModeNotFoundError (404) — no-leak pattern.
+ *
+ * Owner-scoping: `findFirst({ where: { id, producerId } })` — cross-producer
+ * access returns `DeliveryModeNotFoundError` (404) without revealing that the
+ * resource exists for another producer (no-leak pattern).
  *
  * Spec: delivery-modes §"Cross-producer read returns 404"
  */
@@ -169,15 +175,23 @@ export async function update(
 /**
  * Hard-delete a delivery mode owned by the producer.
  *
- * Runs inside $transaction to avoid TOCTOU:
- *   1. findFirst guard — 404-no-leak on cross-producer access.
- *   2. subOrder.count — counts active SubOrders referencing this delivery mode.
- *   3. If count > 0 → ProducerHasActiveOrdersError (409).
- *      Design: reuse ProducerHasActiveOrdersError per §"Delivery-modes delete guard".
- *   4. If count === 0 → delete.
+ * Runs inside `$transaction` to avoid TOCTOU:
+ *   1. `findFirst({ where: { id, producerId } })` — 404-no-leak on cross-producer access.
+ *   2. `subOrder.count({ where: { deliveryModeId: id, status: { in: ACTIVE_SUBORDER_STATUSES } } })`
+ *      — counts SubOrders in status `pending | preparing | sent` referencing this delivery mode.
+ *   3. If count > 0 → throw `ProducerHasActiveOrdersError` (409, `PRODUCER_HAS_ACTIVE_ORDERS`).
+ *      Design decision: reuse the canonical `ProducerHasActiveOrdersError` from
+ *      `src/shared/errors/errors.ts` — the guard semantics are identical to the producer
+ *      soft-delete guard and the spec only requires 409 without prescribing a new error code.
+ *      See design §"Delivery-modes delete guard".
+ *   4. If count === 0 → `deliveryMode.delete({ where: { id } })`.
+ *
+ * Transaction rationale: steps 2–4 must be atomic. Without the transaction,
+ * a concurrent SubOrder creation between step 2 (count) and step 4 (delete)
+ * could leave an orphaned deliveryModeId FK reference.
  *
  * Spec: delivery-modes §"Delete blocked by active SubOrder reference"
- * Design: §"Delivery-modes delete guard" — reuse ProducerHasActiveOrdersError
+ * Design: §"Delivery-modes delete guard" — reuse ProducerHasActiveOrdersError (canonical)
  */
 export async function hardDelete(
   producerId: string,

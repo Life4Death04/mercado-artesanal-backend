@@ -141,8 +141,9 @@ describe("deliveryModesService.findAll", () => {
     const result = await deliveryModesService.findAll("prod_001");
 
     expect(result).toHaveLength(2);
-    expect(result[0].id).toBe("dm_001");
-    expect(result[1].id).toBe("dm_002");
+    // Non-null assertions safe: length asserted above (noUncheckedIndexedAccess TS2532 fix)
+    expect(result[0]!.id).toBe("dm_001");
+    expect(result[1]!.id).toBe("dm_002");
   });
 
   it("returns empty array when producer has no delivery modes", async () => {
