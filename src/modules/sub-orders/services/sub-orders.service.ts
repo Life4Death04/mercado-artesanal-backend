@@ -56,13 +56,31 @@ import type { ListSubOrdersQuery, PatchSubOrderBody, SubOrderStatusValue } from 
  *
  * Terminal states (delivered, cancelled) have no valid targets — missing
  * from this map means "no transitions allowed".
+ *
+ * Spec: order-fulfillment §"State machine"
+ *   pending   → preparing | cancelled
+ *   preparing → sent | cancelled
+ *   sent      → delivered
+ *   delivered → (terminal — no further transitions)
+ *   cancelled → (terminal — no further transitions)
  */
 const ALLOWED_TRANSITIONS: Readonly<Record<string, readonly SubOrderStatusValue[]>> = {
   pending: ["preparing", "cancelled"],
   preparing: ["sent", "cancelled"],
   sent: ["delivered"],
-  // delivered and cancelled are terminal — no transitions
+  // delivered and cancelled intentionally absent — terminal states have no allowed targets.
+  // A missing key in this map triggers InvalidOrderTransitionError (allowedTargets = []).
 } as const;
+
+/**
+ * Returns true if the given status is a terminal state (no transitions possible).
+ * Pure function — useful for callers (e.g., Cycle 9 producer soft-delete guard).
+ *
+ * Spec: order-fulfillment §"State machine" — terminal states: delivered, cancelled.
+ */
+export function isTerminalStatus(status: SubOrderStatusValue): boolean {
+  return !(status in ALLOWED_TRANSITIONS);
+}
 
 // ---------------------------------------------------------------------------
 // findAll
