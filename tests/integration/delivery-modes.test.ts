@@ -22,6 +22,8 @@
  *   [DM8]  DELETE /producers/me/delivery-modes/:id            — 409 active SubOrder blocks delete
  *   [DM9]  DELETE /producers/me/delivery-modes/:id            — 204 hard-delete when no active SubOrders
  *   [DM10] GET    /producers/me/delivery-modes/:id            — enum literal "SHIPPING_FLAT_RATE" on wire
+ *   [DM11] POST   /producers/me/delivery-modes               — 422 unknown type rejected at API boundary
+ *   [DM12] PATCH  /producers/me/delivery-modes/:id           — 422 unknown type rejected at API boundary
  *   [DM-unauth] POST /producers/me/delivery-modes             — 401 unauthenticated
  *
  * Spec references:
@@ -458,5 +460,67 @@ describe("Enum literal stability — DeliveryModeType wire strings", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.type).toBe("PICKUP");
+  });
+});
+
+// ===========================================================================
+// Enum widening rejection — API boundary contract
+// ===========================================================================
+
+describe("Enum widening rejection — unknown type rejected at API boundary", () => {
+  /**
+   * [DM11] POST with type='COURIER' (outside the allowed enum PICKUP | SHIPPING_FLAT_RATE)
+   * MUST be rejected by the DTO validation layer before reaching the service.
+   *
+   * Strict TDD note: The DTO already enforces DeliveryModeTypeSchema = z.enum(["PICKUP",
+   * "SHIPPING_FLAT_RATE"]) via validateBody(), which throws ValidationFailedError (422).
+   * This test proves that invariant holds at the full HTTP boundary, not just at unit level.
+   *
+   * Spec: delivery-modes §"Enum literal stability", §"Forward contract for Cycle 3"
+   */
+  it("[DM11] rejects unknown delivery mode type at API boundary with 422 VALIDATION_FAILED (POST)", async () => {
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+
+    mockLoadUser(user);
+    // No Prisma mock needed — DTO validation rejects the request before the service is called.
+
+    const res = await request
+      .post("/api/v1/producers/me/delivery-modes")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({
+        type: "COURIER", // Not in the allowed enum — must be rejected
+        cost: 3.5,
+        coverageZone: "Valencia",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("VALIDATION_FAILED");
+  });
+
+  /**
+   * [DM12] PATCH with type='COURIER' MUST also be rejected by the update DTO schema.
+   *
+   * UpdateDeliveryModeBodySchema uses DeliveryModeTypeSchema.optional() — same enum,
+   * same rejection. Proves the API boundary is closed on both write paths.
+   *
+   * No existing-record seed needed: the DTO validation runs before any Prisma look-up.
+   */
+  it("[DM12] rejects unknown delivery mode type at API boundary with 422 VALIDATION_FAILED (PATCH)", async () => {
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+
+    mockLoadUser(user);
+    // No Prisma $transaction mock needed — DTO validation rejects before service is reached.
+
+    const res = await request
+      .patch("/api/v1/producers/me/delivery-modes/dm_001")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({
+        type: "COURIER", // Not in the allowed enum — must be rejected
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("VALIDATION_FAILED");
   });
 });
