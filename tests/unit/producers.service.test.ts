@@ -70,6 +70,7 @@ import {
   UnknownCategoryError,
 } from "@/shared/errors/errors";
 import * as producersService from "@/modules/producers/services/producers.service";
+import { isTerminalStatus } from "@/modules/sub-orders/services/sub-orders.service";
 
 // ---------------------------------------------------------------------------
 // Typed mock accessors
@@ -287,12 +288,15 @@ describe("producersService.findPublicById", () => {
     expect(result.address.country).toBe("ES");
     expect(Array.isArray(result.categories)).toBe(true);
 
-    // PII fields MUST NOT appear
-    expect((result as Record<string, unknown>).nif).toBeUndefined();
-    expect((result as Record<string, unknown>).userId).toBeUndefined();
-    expect(result.address.line1).toBeUndefined();
-    expect(result.address.line2).toBeUndefined();
-    expect(result.address.postalCode).toBeUndefined();
+    // PII fields MUST NOT appear — cast to unknown to avoid TS complaining
+    // about absent keys on a correctly-typed return type (that's the whole point).
+    const resultUnknown = result as unknown as Record<string, unknown>;
+    const addressUnknown = result.address as unknown as Record<string, unknown>;
+    expect(resultUnknown.nif).toBeUndefined();
+    expect(resultUnknown.userId).toBeUndefined();
+    expect(addressUnknown.line1).toBeUndefined();
+    expect(addressUnknown.line2).toBeUndefined();
+    expect(addressUnknown.postalCode).toBeUndefined();
 
     // Raw PII strings should not be in the serialized output
     const serialized = JSON.stringify(result);
@@ -328,19 +332,13 @@ describe("producersService.findPublicById", () => {
 // ===========================================================================
 
 describe("isTerminalStatus (sub-orders reuse — awareness test)", () => {
-  it("confirms 'delivered' and 'cancelled' are terminal", async () => {
-    // This validates the reuse pattern imported from sub-orders.service
-    const { isTerminalStatus } = await import(
-      "@/modules/sub-orders/services/sub-orders.service"
-    );
+  it("confirms 'delivered' and 'cancelled' are terminal", () => {
+    // This validates the reuse pattern exported from sub-orders.service
     expect(isTerminalStatus("delivered")).toBe(true);
     expect(isTerminalStatus("cancelled")).toBe(true);
   });
 
-  it("confirms 'pending', 'preparing', 'sent' are non-terminal", async () => {
-    const { isTerminalStatus } = await import(
-      "@/modules/sub-orders/services/sub-orders.service"
-    );
+  it("confirms 'pending', 'preparing', 'sent' are non-terminal", () => {
     expect(isTerminalStatus("pending")).toBe(false);
     expect(isTerminalStatus("preparing")).toBe(false);
     expect(isTerminalStatus("sent")).toBe(false);

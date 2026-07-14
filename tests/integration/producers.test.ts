@@ -131,7 +131,7 @@ function makeConsumerUser(overrides: Record<string, unknown> = {}) {
     id: "cuid_user_002",
     role: "CONSUMER",
     email: "consumer@example.com",
-    producerId: null,
+    producerId: undefined as string | undefined,
     ...overrides,
   };
 }
@@ -157,11 +157,13 @@ function makeProducer(overrides: Record<string, unknown> = {}) {
   };
 }
 
+type AnyTestUser = { id: string; role: string; email: string; producerId?: string | undefined };
+
 /**
  * Configure prisma.user.findUnique to return a user projection for loadUser.
  * PRODUCER role also returns a producer relation for producerId.
  */
-function mockLoadUser(user: ReturnType<typeof makeProducerUser> | null): void {
+function mockLoadUser(user: AnyTestUser | null): void {
   if (!user) {
     mockedUser.findUnique.mockResolvedValueOnce(null);
     return;
