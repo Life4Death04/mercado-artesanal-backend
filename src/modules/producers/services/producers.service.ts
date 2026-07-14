@@ -13,28 +13,33 @@
  *
  * Key invariants:
  *   - patch: runs inside $transaction:
- *       1. findFirst guard (404 when not found — no-leak scoping)
+ *       1. findFirst guard (404 when not found — existence-scoped to non-deleted rows)
  *       2. if categorySlugs present: resolve slugs → validate all exist → deleteMany + createMany
- *       3. update producer with provided scalar fields
+ *       3. update scalar fields on the producer row
  *   - softDelete: runs inside $transaction:
- *       1. findFirst guard (404 when not found)
+ *       1. findFirst guard (404 when not found or already soft-deleted)
  *       2. subOrder.count non-terminal statuses (pending, preparing, sent)
  *       3. if count > 0 → ProducerHasActiveOrdersError (409)
+ *          Reuse rationale: same error code (PRODUCER_HAS_ACTIVE_ORDERS) as delivery-modes delete
+ *          guard — the spec only requires 409 without prescribing a new error code.
+ *          See design §"Delivery-modes delete guard" and §"Errors" table.
  *       4. if count === 0 → producer.update({ deletedAt: now() })
  *   - findPublicById: direct query (no transaction needed — read-only):
- *       1. producer.findFirst({ where: { id, deletedAt: null } })
+ *       1. producer.findFirst({ where: { id, deletedAt: null } }) — soft-deleted → 404
  *       2. if null → NotFoundError (404)
  *       3. return redacted projection (omit nif, userId, addressLine1, addressLine2, addressPostalCode)
+ *          PII-safety audit: nif and address PII columns never appear in PublicProducerProjection.
  *
  * Design references:
- *   design §"Transactions required": producers.patch (categorySlugs), producers.softDelete (guard + setdeletedAt)
+ *   design §"Transactions required": producers.patch (categorySlugs), producers.softDelete (guard + set deletedAt)
+ *   design §"Delivery-modes delete guard": ProducerHasActiveOrdersError reuse pattern
  *   design §"Errors": ProducerHasActiveOrdersError (409, PRODUCER_HAS_ACTIVE_ORDERS)
  *   design ADR-003: no repositories/ layer
  *   spec producer-bootstrap §"Private profile edit endpoint"
  *   spec producer-bootstrap §"Public producer projection endpoint"
  *   spec producer-bootstrap §"Producer soft-delete guard against non-terminal SubOrders"
  */
-import type { SubOrderStatus } from "@prisma/client";
+import type { Producer, SubOrderStatus } from "@prisma/client";
 
 import {
   NotFoundError,
@@ -104,9 +109,9 @@ export interface PublicProducerProjection {
 export async function patch(
   producerId: string,
   input: PatchProducerBody,
-): Promise<Record<string, unknown>> {
+): Promise<Producer> {
   return prisma.$transaction(async (tx) => {
-    // Step 1: ownership + existence guard
+    // Step 1: ownership + existence guard (deletedAt: null scopes to live rows only)
     const producer = await tx.producer.findFirst({
       where: { id: producerId, deletedAt: null },
     });
@@ -124,6 +129,7 @@ export async function patch(
       });
 
       if (categories.length !== uniqueSlugs.length) {
+        // Identify which slugs were not found for the error detail
         const foundSlugs = new Set(categories.map((c: { slug: string }) => c.slug));
         const missingSlugs = uniqueSlugs.filter((s) => !foundSlugs.has(s));
         throw new UnknownCategoryError(
@@ -131,10 +137,10 @@ export async function patch(
         );
       }
 
-      // Replace current M-N set atomically
-      await tx.producerCategoryOnProducer.deleteMany({
-        where: { producerId },
-      });
+      // Replace current M-N set atomically:
+      // deleteMany removes all existing join rows; createMany inserts the new set.
+      // Both run inside the same transaction — concurrent patch cannot interleave.
+      await tx.producerCategoryOnProducer.deleteMany({ where: { producerId } });
 
       if (categories.length > 0) {
         await tx.producerCategoryOnProducer.createMany({
@@ -146,30 +152,22 @@ export async function patch(
       }
     }
 
-    // Step 3: update scalar fields — build data object from provided fields only
-    const data: Record<string, unknown> = {};
+    // Step 3: build scalar update data from provided fields only (undefined → not included).
+    // Using spread-conditional pattern keeps the data object free of undefined entries.
+    const data = {
+      ...(input.businessName !== undefined && { businessName: input.businessName }),
+      ...(input.description !== undefined && { description: input.description }),
+      ...(input.address?.line1 !== undefined && { addressLine1: input.address.line1 }),
+      ...(input.address?.line2 !== undefined && { addressLine2: input.address.line2 }),
+      ...(input.address?.city !== undefined && { addressCity: input.address.city }),
+      ...(input.address?.postalCode !== undefined && { addressPostalCode: input.address.postalCode }),
+      ...(input.address?.province !== undefined && { addressProvince: input.address.province }),
+      ...(input.address?.country !== undefined && { addressCountry: input.address.country }),
+    };
 
-    if (input.businessName !== undefined) {
-      data.businessName = input.businessName;
-    }
-    if (input.description !== undefined) {
-      data.description = input.description;
-    }
-    if (input.address !== undefined) {
-      if (input.address.line1 !== undefined) data.addressLine1 = input.address.line1;
-      if (input.address.line2 !== undefined) data.addressLine2 = input.address.line2;
-      if (input.address.city !== undefined) data.addressCity = input.address.city;
-      if (input.address.postalCode !== undefined) data.addressPostalCode = input.address.postalCode;
-      if (input.address.province !== undefined) data.addressProvince = input.address.province;
-      if (input.address.country !== undefined) data.addressCountry = input.address.country;
-    }
-
-    // Always update to refresh updatedAt even if only categories changed
-    return tx.producer.update({
-      where: { id: producerId },
-      data,
-    }) as Promise<Record<string, unknown>>;
-  }) as Promise<Record<string, unknown>>;
+    // Always call update so updatedAt is refreshed (covers category-only patches too).
+    return tx.producer.update({ where: { id: producerId }, data });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +212,11 @@ export async function softDelete(producerId: string): Promise<void> {
       },
     });
 
-    // Step 3: block soft-delete if non-terminal SubOrders exist
+    // Step 3: block soft-delete if non-terminal SubOrders exist.
+    // Reuse ProducerHasActiveOrdersError (409, PRODUCER_HAS_ACTIVE_ORDERS) — the same
+    // error class used by the delivery-modes delete guard. The spec only requires 409;
+    // it does not prescribe a distinct error code for producer vs. delivery-mode guards.
+    // See design §"Delivery-modes delete guard" and §"Errors" table.
     if (activeCount > 0) {
       throw new ProducerHasActiveOrdersError(
         "Cannot delete producer: it has non-terminal sub-orders",
@@ -237,15 +239,23 @@ export async function softDelete(producerId: string): Promise<void> {
  * Fetch a live producer by id and return a PII-redacted public projection.
  *
  * Filters `deletedAt: null` so soft-deleted producers appear as 404.
- * Includes `categories` M-N join to build the `[{slug, name}]` projection.
+ * Uses `select` (not `include`) to request only the spec-approved columns from
+ * Postgres — this is defense-in-depth: PII columns (nif, addressLine1, etc.)
+ * never leave the DB layer, even if the projection builder were to break.
  *
  * Returned fields (spec: producer-bootstrap §"Public producer projection endpoint"):
  *   id, businessName, description, address.city, address.province,
  *   address.country, categories: [{slug, name}], createdAt
  *
- * Redacted fields (MUST NOT appear):
- *   nif, userId, address.line1, address.line2, address.postalCode,
+ * Redacted fields (MUST NOT appear — enforced by select):
+ *   nif, userId, addressLine1, addressLine2, addressPostalCode,
  *   deletedAt, updatedAt
+ *
+ * PII-safety audit:
+ *   - nif: NOT in select → never reaches service layer
+ *   - addressLine1/2: NOT in select → never reaches service layer
+ *   - addressPostalCode: NOT in select → never reaches service layer
+ *   - userId: NOT in select → never reaches service layer
  *
  * Spec scenario: "Public projection redacts PII"
  * Spec scenario: "Soft-deleted producer returns 404"
@@ -253,9 +263,17 @@ export async function softDelete(producerId: string): Promise<void> {
 export async function findPublicById(id: string): Promise<PublicProducerProjection> {
   const producer = await prisma.producer.findFirst({
     where: { id, deletedAt: null },
-    include: {
+    select: {
+      id: true,
+      businessName: true,
+      description: true,
+      addressCity: true,
+      addressProvince: true,
+      addressCountry: true,
+      createdAt: true,
+      // M-N join — select only slug + name from the ProducerCategory side
       categories: {
-        include: {
+        select: {
           category: {
             select: { slug: true, name: true },
           },
@@ -268,7 +286,8 @@ export async function findPublicById(id: string): Promise<PublicProducerProjecti
     throw new NotFoundError("Producer not found");
   }
 
-  // Build redacted projection — only include spec-approved fields
+  // Build the public projection shape — address fields are remapped to the
+  // nested { city, province, country } structure the spec requires.
   return {
     id: producer.id,
     businessName: producer.businessName,
@@ -278,12 +297,10 @@ export async function findPublicById(id: string): Promise<PublicProducerProjecti
       province: producer.addressProvince,
       country: producer.addressCountry,
     },
-    categories: producer.categories.map(
-      (pc: { category: { slug: string; name: string } }) => ({
-        slug: pc.category.slug,
-        name: pc.category.name,
-      }),
-    ),
+    categories: producer.categories.map((pc) => ({
+      slug: pc.category.slug,
+      name: pc.category.name,
+    })),
     createdAt: producer.createdAt,
   };
 }
