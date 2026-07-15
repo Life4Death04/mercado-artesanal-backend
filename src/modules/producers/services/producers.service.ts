@@ -47,18 +47,29 @@ import {
   UnknownCategoryError,
 } from "@/shared/errors/errors";
 import { prisma } from "@/shared/utils/prisma";
+import { isTerminalStatus } from "../../sub-orders/services/sub-orders.service";
 
 import type { PatchProducerBody } from "../dto/producers.dto";
+import type { SubOrderStatusValue } from "../../sub-orders/dto/sub-orders.dto";
 
 // ---------------------------------------------------------------------------
-// Non-terminal SubOrder statuses for the soft-delete guard
+// Terminal SubOrder statuses for the soft-delete guard
 // Spec: producer-bootstrap §"Producer soft-delete guard against non-terminal SubOrders"
-// Design: count SubOrder rows where status IN (pending, preparing, sent)
-// Note: isTerminalStatus() from sub-orders.service is not imported here to avoid
-// circular-ish coupling; we define the non-terminal set directly, which is the
-// same source of truth as ALLOWED_TRANSITIONS keys in sub-orders.service.
+// Design: count SubOrder rows where status NOT IN terminal statuses (delivered, cancelled)
+// Reuses isTerminalStatus() from Slice 8 sub-orders.service — single source of truth
+// for the state machine terminal set. No circular dependency: sub-orders does not
+// import from producers.
 // ---------------------------------------------------------------------------
-const NON_TERMINAL_SUBORDER_STATUSES: SubOrderStatus[] = ["pending", "preparing", "sent"];
+const ALL_SUBORDER_STATUSES: SubOrderStatusValue[] = [
+  "pending",
+  "preparing",
+  "sent",
+  "delivered",
+  "cancelled",
+];
+const TERMINAL_SUBORDER_STATUSES: SubOrderStatus[] = ALL_SUBORDER_STATUSES.filter(
+  isTerminalStatus,
+) as SubOrderStatus[];
 
 // ---------------------------------------------------------------------------
 // Public projection type
@@ -179,7 +190,7 @@ export async function patch(
  *
  * Runs inside `$transaction`:
  *   1. findFirst({ where: { id: producerId, deletedAt: null } }) — 404 when not found.
- *   2. Count SubOrders with non-terminal status (pending, preparing, sent).
+ *   2. Count SubOrders whose status is NOT terminal (notIn: derived from isTerminalStatus()).
  *   3. If count > 0 → ProducerHasActiveOrdersError (409, PRODUCER_HAS_ACTIVE_ORDERS).
  *   4. If count === 0 → producer.update({ deletedAt: now() }).
  *
@@ -204,11 +215,13 @@ export async function softDelete(producerId: string): Promise<void> {
       throw new NotFoundError("Producer not found");
     }
 
-    // Step 2: count non-terminal SubOrders owned by this producer
+    // Step 2: count non-terminal SubOrders owned by this producer.
+    // Uses terminal-status exclusion (notIn) derived from isTerminalStatus() — Slice 8 contract.
+    // This keeps the terminal set in sync with the sub-orders state machine automatically.
     const activeCount = await tx.subOrder.count({
       where: {
         producerId,
-        status: { in: NON_TERMINAL_SUBORDER_STATUSES },
+        status: { notIn: TERMINAL_SUBORDER_STATUSES },
       },
     });
 
