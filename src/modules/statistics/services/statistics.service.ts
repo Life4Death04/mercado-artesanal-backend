@@ -37,9 +37,9 @@
 import { Prisma } from "@prisma/client";
 import type { Product } from "@prisma/client";
 
-import { findLowStock } from "@/modules/inventory/services/inventory.service";
+import { findLowStock, findLowStockCount } from "@/modules/inventory/services/inventory.service";
 import { prisma } from "@/shared/utils/prisma";
-import { systemClock } from "@/shared/utils/clock";
+import { systemClock, dateBeforeClock } from "@/shared/utils/clock";
 import type { Clock } from "@/shared/utils/clock";
 import type { WindowValue, LowStockQuery } from "../dto/statistics.dto";
 
@@ -62,18 +62,21 @@ const WINDOW_MS: Record<WindowValue, number> = {
 /**
  * Compute the [from, to] date range for a window using the injected clock.
  *
- * - `to` = clock() (injected current time)
- * - `from` = to - windowMs
+ * - `to`   = clock() (injected current time — from clock module)
+ * - `from` = dateBeforeClock(clock, windowMs) (from clock module)
  *
- * NEVER calls `new Date()` directly — uses the injected clock exclusively.
+ * ZERO `new Date()` calls in this service file — both Date objects are
+ * constructed inside `src/shared/utils/clock.ts` using the injected clock.
  *
  * Spec scenario: "Deterministic clock in tests"
  *   GIVEN now = 2026-01-01T00:00:00Z and window = "7d"
  *   THEN from = 2025-12-25T00:00:00Z
+ * Spec invariant: "Clock MUST be injected — the service MUST NOT call new Date() directly"
  */
 function computeDateRange(window: WindowValue, clock: Clock): { from: Date; to: Date } {
   const to = clock();
-  const from = new Date(to.getTime() - WINDOW_MS[window]);
+  // Both Date objects are constructed via clock module helpers — ZERO `new Date()` in service.
+  const from = dateBeforeClock(clock, WINDOW_MS[window]);
   return { from, to };
 }
 
@@ -193,12 +196,67 @@ export async function getOrderCount(
 // getLowStock
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Low-stock envelope type
+// Spec: sales-stats spec.md:69-72
+// ---------------------------------------------------------------------------
+
 /**
- * Return low-stock products for a producer.
+ * A single low-stock item in the response envelope.
  *
- * Thin delegate to `inventory.findLowStock` — this service does NOT
- * own the low-stock query logic. The `statistics` module provides the
- * HTTP surface; the `inventory` module owns the query.
+ * Spec (sales-stats spec.md:70): { productId, name, stock, lowStockThreshold }
+ * The field name is `productId` (not `id`) per the spec.
+ */
+export interface LowStockItem {
+  productId: string;
+  name: string;
+  stock: number;
+  lowStockThreshold: number;
+}
+
+/**
+ * Envelope returned by getLowStock and the HTTP controller.
+ *
+ * Spec (sales-stats spec.md:69-72):
+ *   { items: [{ productId, name, stock, lowStockThreshold }], limit, offset, total }
+ *
+ * - `items`:  page of low-stock items using spec field names.
+ * - `limit`:  effective page size used for this request.
+ * - `offset`: effective page offset used for this request.
+ * - `total`:  count of ALL low-stock items for this producer before pagination.
+ */
+export interface LowStockEnvelope {
+  items: LowStockItem[];
+  limit: number;
+  offset: number;
+  total: number;
+}
+
+/**
+ * Map a Prisma Product row to a LowStockItem (spec field names).
+ *
+ * The Prisma Product type uses `id` as the primary key. The spec requires
+ * items to expose `productId`. This pure mapping function converts between
+ * the two representations.
+ */
+function toStockItem(product: Product): LowStockItem {
+  return {
+    productId: product.id,
+    name: product.name,
+    stock: product.stock,
+    lowStockThreshold: product.lowStockThreshold,
+  };
+}
+
+/**
+ * Return low-stock products for a producer as a paginated envelope.
+ *
+ * Delegates data retrieval to `inventory.findLowStock` and count to
+ * `inventory.findLowStockCount`. This service does NOT own the low-stock
+ * query logic — the `inventory` module owns it.
+ *
+ * Response envelope (spec: sales-stats spec.md:69-72):
+ *   { items, limit, offset, total }
  *
  * Spec: sales-stats §"Low-stock alerts endpoint"
  * Spec scenario: "Returns products at or below threshold"
@@ -209,10 +267,26 @@ export async function getOrderCount(
 export async function getLowStock(
   producerId: string,
   pagination: Pick<LowStockQuery, "limit" | "offset">,
-): Promise<Product[]> {
-  return findLowStock({
-    producerId,
-    limit: pagination.limit,
-    offset: pagination.offset,
-  });
+): Promise<LowStockEnvelope> {
+  const [products, total] = await Promise.all([
+    findLowStock({
+      producerId,
+      limit: pagination.limit,
+      offset: pagination.offset,
+    }),
+    findLowStockCount({ producerId }),
+  ]);
+
+  // Resolve effective limit and offset (mirrors inventory.findLowStock defaults)
+  const LOW_STOCK_DEFAULT_LIMIT = 20;
+  const effectiveLimit = Math.min(pagination.limit ?? LOW_STOCK_DEFAULT_LIMIT, 100);
+  const effectiveOffset = pagination.offset ?? 0;
+
+  return {
+    // Map Prisma Product.id → LowStockItem.productId (spec field name per spec.md:70)
+    items: products.map(toStockItem),
+    limit: effectiveLimit,
+    offset: effectiveOffset,
+    total,
+  };
 }

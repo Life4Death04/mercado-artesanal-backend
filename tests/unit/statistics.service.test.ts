@@ -284,9 +284,10 @@ describe("statisticsService.getLowStock — envelope contract", () => {
     // Spec (sales-stats spec.md:69-72):
     //   Response body: { items: [{ productId, name, stock, lowStockThreshold }], limit, offset, total }
     // getLowStock MUST return this envelope, NOT a bare array.
+    // findLowStock mock returns Prisma Product shape (id field), service maps id → productId.
     const products = [
-      { productId: "p1", name: "Cheese", stock: 0, lowStockThreshold: 5 },
-      { productId: "p2", name: "Honey", stock: 5, lowStockThreshold: 5 },
+      { id: "p1", name: "Cheese", stock: 0, lowStockThreshold: 5 },
+      { id: "p2", name: "Honey", stock: 5, lowStockThreshold: 5 },
     ];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     mockedFindLowStock.mockResolvedValueOnce(products as any);
@@ -304,9 +305,10 @@ describe("statisticsService.getLowStock — envelope contract", () => {
 
   it("[SLS-1b] items expose productId (not id) — spec field name", async () => {
     // Spec (sales-stats spec.md:70): items: [{ productId, name, stock, lowStockThreshold }]
-    // Items MUST expose `productId`, NOT `id`.
+    // findLowStock returns Prisma Product with `id`; service maps id → productId.
+    // Items in the envelope MUST expose `productId`, NOT `id`.
     const products = [
-      { productId: "p1", name: "Cheese", stock: 0, lowStockThreshold: 5 },
+      { id: "p1", name: "Cheese", stock: 0, lowStockThreshold: 5 },
     ];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     mockedFindLowStock.mockResolvedValueOnce(products as any);
@@ -317,18 +319,17 @@ describe("statisticsService.getLowStock — envelope contract", () => {
     expect(result.items).toHaveLength(1);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const item = (result.items as any[])[0];
+    // Service maps Prisma Product.id → LowStockItem.productId per spec
     expect(item).toHaveProperty("productId");
     expect(item.productId).toBe("p1");
-    // `id` should NOT be the field used to identify items in the spec
-    // (productId is the authoritative spec field name)
   });
 
   it("[SLS-1c] total reflects count before pagination (from findLowStockCount)", async () => {
     // Spec: total must be the count of ALL matching low-stock items, NOT items.length
     // Here pagination returns 2 items but total = 10 (10 low-stock items for producer)
     const products = [
-      { productId: "p1", name: "Cheese", stock: 0, lowStockThreshold: 5 },
-      { productId: "p2", name: "Honey", stock: 5, lowStockThreshold: 5 },
+      { id: "p1", name: "Cheese", stock: 0, lowStockThreshold: 5 },
+      { id: "p2", name: "Honey", stock: 5, lowStockThreshold: 5 },
     ];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     mockedFindLowStock.mockResolvedValueOnce(products as any);

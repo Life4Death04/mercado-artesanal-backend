@@ -34,3 +34,23 @@ export type Clock = () => Date;
  * Tests MUST NOT use this clock — inject a fixed `() => new Date("...")` instead.
  */
 export const systemClock: Clock = () => new Date();
+
+/**
+ * Create a Date that is `offsetMs` milliseconds before the Date returned by `clock`.
+ *
+ * This helper centralises all `new Date(timestamp)` construction in the clock
+ * module so that service files contain ZERO direct `new Date(...)` calls,
+ * satisfying the clock-injection invariant:
+ *   "Clock MUST be injected — the service MUST NOT call new Date() directly"
+ *
+ * Usage in services:
+ *   const to = clock();
+ *   const from = dateBeforeClock(clock, WINDOW_MS[window]);
+ *   // Zero `new Date()` calls remain in the service file.
+ *
+ * Spec reference:
+ *   sales-stats §Invariants — "Clock MUST be injected"
+ */
+export function dateBeforeClock(clock: Clock, offsetMs: number): Date {
+  return new Date(clock().getTime() - offsetMs);
+}

@@ -290,15 +290,16 @@ describe("GET /api/v1/producers/me/stats/low-stock — low-stock alerts endpoint
     const user = makeProducerUser({ auth0Sub: sub });
 
     mockLoadUser(user);
+    // findLowStock returns Prisma Product shape (id); service maps id → productId.
     mockedFindLowStock.mockResolvedValueOnce([
       {
-        productId: "p_a",
+        id: "p_a",
         name: "Product A",
         stock: 0,
         lowStockThreshold: 5,
       },
       {
-        productId: "p_b",
+        id: "p_b",
         name: "Product B",
         stock: 5,
         lowStockThreshold: 5,

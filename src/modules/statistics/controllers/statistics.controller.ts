@@ -93,8 +93,13 @@ export async function getOrderCount(
 /**
  * GET /api/v1/producers/me/stats/low-stock[?limit&offset]
  *
- * Returns 200 with array of low-stock products for the producer.
- * Delegates to inventory.findLowStock via statistics.service.
+ * Returns 200 with paginated low-stock alert envelope for the producer.
+ *
+ * Response body (spec: sales-stats spec.md:69-72):
+ *   { items: [{ productId, name, stock, lowStockThreshold }], limit, offset, total }
+ *
+ * Delegates to statistics.service.getLowStock which in turn delegates to
+ * inventory.findLowStock (items) and inventory.findLowStockCount (total).
  *
  * Spec: sales-stats §"Low-stock alerts endpoint"
  * Spec scenario: "Returns products at or below threshold"
@@ -108,9 +113,10 @@ export async function getLowStock(
     if (!req.user?.producerId) throw new UnauthorizedError("Producer not found for this user");
 
     const pagination = validateBody(LowStockQuerySchema, req.query);
-    const products = await statisticsService.getLowStock(req.user.producerId, pagination);
+    // getLowStock now returns { items, limit, offset, total } envelope per spec:69-72
+    const envelope = await statisticsService.getLowStock(req.user.producerId, pagination);
 
-    res.status(200).json(products);
+    res.status(200).json(envelope);
   } catch (err) {
     next(err);
   }
