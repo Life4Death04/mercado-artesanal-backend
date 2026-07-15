@@ -118,3 +118,88 @@ export class AddressDefaultConflictError extends AppError {
   readonly status = 409;
   readonly title = "Address default conflict";
 }
+
+// ===========================================================================
+// Cycle 2 additions — 8 new subclasses per error-handling spec registry
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 404 — Product missing, soft-deleted, or not owned by the requesting producer
+// ---------------------------------------------------------------------------
+
+export class ProductNotFoundError extends AppError {
+  readonly code = "PRODUCT_NOT_FOUND" as const;
+  readonly status = 404;
+  readonly title = "Product not found";
+}
+
+// ---------------------------------------------------------------------------
+// 409 — decrementStock would drive Product.stock below 0
+// ---------------------------------------------------------------------------
+
+export class InsufficientStockError extends AppError {
+  readonly code = "INSUFFICIENT_STOCK" as const;
+  readonly status = 409;
+  readonly title = "Insufficient stock";
+}
+
+// ---------------------------------------------------------------------------
+// 409 — Soft-delete or isActive → false while non-terminal OrderLines exist
+// ---------------------------------------------------------------------------
+
+export class ProductHasActiveOrdersError extends AppError {
+  readonly code = "PRODUCT_HAS_ACTIVE_ORDERS" as const;
+  readonly status = 409;
+  readonly title = "Product has active orders";
+}
+
+// ---------------------------------------------------------------------------
+// 409 — Producer soft-delete while non-terminal SubOrders exist
+// ---------------------------------------------------------------------------
+
+export class ProducerHasActiveOrdersError extends AppError {
+  readonly code = "PRODUCER_HAS_ACTIVE_ORDERS" as const;
+  readonly status = 409;
+  readonly title = "Producer has active orders";
+}
+
+// ---------------------------------------------------------------------------
+// 409 — Fulfillment state machine rejects source→target for a SubOrder
+// ---------------------------------------------------------------------------
+
+export class InvalidOrderTransitionError extends AppError {
+  readonly code = "INVALID_ORDER_TRANSITION" as const;
+  readonly status = 409;
+  readonly title = "Invalid order transition";
+}
+
+// ---------------------------------------------------------------------------
+// 404 — DeliveryMode missing or not owned by the requesting producer
+// ---------------------------------------------------------------------------
+
+export class DeliveryModeNotFoundError extends AppError {
+  readonly code = "DELIVERY_MODE_NOT_FOUND" as const;
+  readonly status = 404;
+  readonly title = "Delivery mode not found";
+}
+
+// ---------------------------------------------------------------------------
+// 400 — Presign or confirm parameters violate mime/size/position policy.
+//       PII-safety: detail MUST NOT include the s3Key, email, NIF, or JWT.
+// ---------------------------------------------------------------------------
+
+export class ImageUploadInvalidError extends AppError {
+  readonly code = "IMAGE_UPLOAD_INVALID" as const;
+  readonly status = 400;
+  readonly title = "Image upload invalid";
+}
+
+// ---------------------------------------------------------------------------
+// 404 — Product.categoryId references a non-existent product Category
+// ---------------------------------------------------------------------------
+
+export class CategoryNotFoundError extends AppError {
+  readonly code = "CATEGORY_NOT_FOUND" as const;
+  readonly status = 404;
+  readonly title = "Category not found";
+}

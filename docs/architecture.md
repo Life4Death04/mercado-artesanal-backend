@@ -43,8 +43,7 @@ src/
 │   ├── addresses/
 │   │   ├── routes/addresses.routes.ts
 │   │   ├── controllers/addresses.controller.ts
-│   │   ├── services/addresses.service.ts
-│   │   └── repositories/address.repository.ts
+│   │   └── services/addresses.service.ts
 │   └── health/
 │       ├── routes/health.routes.ts
 │       └── controllers/health.controller.ts
@@ -107,11 +106,11 @@ src/
 
 ### ADR-003 — Soft-delete via explicit `where: { deletedAt: null }`
 
-**Decision**: Every read query in every repository MUST include `where: { deletedAt: null }`. No Prisma middleware, no `$extends` query extension.
+**Decision**: Every Prisma query that reads business entities MUST include `where: { deletedAt: null }` explicitly. No Prisma middleware, no `$extends` query extension.
 
 **Why**: Explicit is bulletproof. Middleware-based solutions have been known to silently skip on nested reads or raw queries.
 
-**Consequence**: Verbose repository code, but reviewers can always see the filter. Repository layer is the single Prisma touchpoint — controllers and services never touch `prisma` directly.
+**Consequence**: Verbose query code, but reviewers can always see the filter. Services call `prisma` (or a transaction client `tx`) directly — the `repositories/` sub-layer existed only in `onboarding` and `shared/` where cross-module reuse justified it; `addresses` and `products` services issue Prisma calls inline.
 
 ---
 

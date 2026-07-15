@@ -10,6 +10,7 @@ export default defineConfig({
     sequence: {
       concurrent: false,
     },
+    setupFiles: ["./tests/setup.ts"],
     testTimeout: 10000,
     // Provide minimum required env vars so env.ts validates at import time.
     // Tests that need a real DB spin up docker-compose.test.yml (Cycle 2+).

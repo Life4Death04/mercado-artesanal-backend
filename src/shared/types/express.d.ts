@@ -44,8 +44,12 @@ declare global {
        * - Defined and non-null: user exists in DB.
        * - null: user has no DB record yet (first call to POST /auth/sync is allowed).
        * - undefined: loadUser has not run (public route or pre-auth middleware).
+       *
+       * Cycle 2 extension (Decision #8): `producerId` is set when role === 'PRODUCER'
+       * and the linked Producer row exists. Producer-scoped services read this field
+       * instead of issuing a second DB round-trip per request.
        */
-      user?: { id: string; role: string; email: string } | null;
+      user?: { id: string; role: string; email: string; producerId?: string } | null;
     }
   }
 }
