@@ -10,6 +10,8 @@
  *
  * Module routers mounted here:
  *   categoriesRouter     — Cycle 2: GET /categories, GET /categories/:slug (PUBLIC — no auth)
+ *   producersRouter      — Cycle 2: PATCH /producers/me, DELETE /producers/me (producer);
+ *                          GET /producers/:id (PUBLIC — no auth)
  *   authRouter           — POST /auth/sync
  *   usersRouter          — GET /users/me
  *   onboardingRouter     — POST /users/me/onboarding/consumer|producer
@@ -19,8 +21,11 @@
  *   deliveryModesRouter  — Cycle 2: producer-scoped CRUD under /producers/me/delivery-modes[/:id]
  *   subOrdersRouter      — Cycle 2: producer-scoped read + state-machine PATCH under /producers/me/sub-orders[/:id]
  *
- * Mount order: public routers (categoriesRouter) are registered BEFORE
- * auth-gated routers so they are reachable without any auth header.
+ * Mount order: public routers (categoriesRouter, producersRouter GET /:id) are registered
+ * BEFORE auth-gated routers so they are reachable without any auth header.
+ * Note on producersRouter: it registers both public (GET /producers/:id) and producer-scoped
+ * (PATCH /producers/me, DELETE /producers/me) routes. Express resolves /producers/me before
+ * /producers/:id because literal segments take priority over param segments.
  */
 import { Router } from "express";
 
@@ -30,6 +35,7 @@ import { categoriesRouter } from "./categories/routes/categories.routes";
 import { deliveryModesRouter } from "./delivery-modes/routes/delivery-modes.routes";
 import { imagesRouter } from "./images/routes/images.routes";
 import { onboardingRouter } from "./onboarding/routes/onboarding.routes";
+import { producersRouter } from "./producers/routes/producers.routes";
 import { productsRouter } from "./products/routes/products.routes";
 import { subOrdersRouter } from "./sub-orders/routes/sub-orders.routes";
 import { usersRouter } from "./users/routes/users.routes";
@@ -37,7 +43,10 @@ import { usersRouter } from "./users/routes/users.routes";
 export const apiRouter: Router = Router();
 
 // Public routes — no auth required
+// producersRouter is registered here because GET /producers/:id is public;
+// the PATCH and DELETE /producers/me routes inside it carry their own producerGuard.
 apiRouter.use(categoriesRouter);
+apiRouter.use(producersRouter);
 
 // Auth-gated routes
 apiRouter.use(authRouter);
