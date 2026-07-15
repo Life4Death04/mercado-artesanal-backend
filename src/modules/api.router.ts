@@ -20,6 +20,7 @@
  *   imagesRouter         — Cycle 2: presign + confirm under /producers/me/products/:id/images/*
  *   deliveryModesRouter  — Cycle 2: producer-scoped CRUD under /producers/me/delivery-modes[/:id]
  *   subOrdersRouter      — Cycle 2: producer-scoped read + state-machine PATCH under /producers/me/sub-orders[/:id]
+ *   statisticsRouter     — Cycle 2: GET /producers/me/stats/{revenue,order-count,low-stock} (producer)
  *
  * Mount order: public routers (categoriesRouter, producersRouter GET /:id) are registered
  * BEFORE auth-gated routers so they are reachable without any auth header.
@@ -37,6 +38,7 @@ import { imagesRouter } from "./images/routes/images.routes";
 import { onboardingRouter } from "./onboarding/routes/onboarding.routes";
 import { producersRouter } from "./producers/routes/producers.routes";
 import { productsRouter } from "./products/routes/products.routes";
+import { statisticsRouter } from "./statistics/routes/statistics.routes";
 import { subOrdersRouter } from "./sub-orders/routes/sub-orders.routes";
 import { usersRouter } from "./users/routes/users.routes";
 
@@ -57,3 +59,4 @@ apiRouter.use(productsRouter);
 apiRouter.use(imagesRouter);
 apiRouter.use(deliveryModesRouter);
 apiRouter.use(subOrdersRouter);
+apiRouter.use(statisticsRouter);

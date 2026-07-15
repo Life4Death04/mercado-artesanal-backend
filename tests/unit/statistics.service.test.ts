@@ -229,7 +229,8 @@ describe("statisticsService.getLowStock", () => {
       offset: undefined,
     });
     expect(result).toHaveLength(2);
-    expect(result[0].id).toBe("p1");
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(result[0]!.id).toBe("p1");
   });
 
   it("[SLS-2] passes limit and offset through to inventory.findLowStock", async () => {
