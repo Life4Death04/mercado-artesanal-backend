@@ -142,13 +142,20 @@ describe("producersService.patch", () => {
   it("throws UnknownCategoryError when categorySlugs contains an unknown slug", async () => {
     // Spec: producer-bootstrap scenario "Unknown categorySlug rejected"
     const existing = makeProducer();
+    // Capture mocks to assert join-table and producer row are NOT mutated
+    let capturedProducerUpdate: ReturnType<typeof vi.fn> | undefined;
+    let capturedDeleteMany: ReturnType<typeof vi.fn> | undefined;
+    let capturedCreateMany: ReturnType<typeof vi.fn> | undefined;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.$transaction as any).mockImplementationOnce(async (fn: any) => {
+      capturedProducerUpdate = vi.fn();
+      capturedDeleteMany = vi.fn();
+      capturedCreateMany = vi.fn();
       const tx = {
         producer: {
           findFirst: vi.fn().mockResolvedValueOnce(existing),
-          update: vi.fn(),
+          update: capturedProducerUpdate,
         },
         subOrder: { count: vi.fn().mockResolvedValueOnce(0) },
         producerCategory: {
@@ -158,8 +165,8 @@ describe("producersService.patch", () => {
           ]),
         },
         producerCategoryOnProducer: {
-          deleteMany: vi.fn(),
-          createMany: vi.fn(),
+          deleteMany: capturedDeleteMany,
+          createMany: capturedCreateMany,
         },
       };
       return fn(tx);
@@ -168,6 +175,15 @@ describe("producersService.patch", () => {
     await expect(
       producersService.patch("prod_001", { categorySlugs: ["queso", "not-a-real-slug"] }),
     ).rejects.toBeInstanceOf(UnknownCategoryError);
+
+    // Invariant: unknown category rejection MUST NOT mutate the join table or the producer row
+    // Spec: "Unknown categorySlug rejected" → row stays unchanged
+    expect(capturedProducerUpdate).toBeDefined();
+    expect(capturedProducerUpdate!).not.toHaveBeenCalled();
+    expect(capturedDeleteMany).toBeDefined();
+    expect(capturedDeleteMany!).not.toHaveBeenCalled();
+    expect(capturedCreateMany).toBeDefined();
+    expect(capturedCreateMany!).not.toHaveBeenCalled();
   });
 
   it("throws NotFoundError when producer not found", async () => {
@@ -201,13 +217,16 @@ describe("producersService.softDelete", () => {
     // Spec: producer-bootstrap §"Producer soft-delete guard against non-terminal SubOrders"
     // Scenario: "Delete blocked by non-terminal SubOrder"
     const existing = makeProducer();
+    // Capture tx.producer.update to assert it was NOT called (deletedAt invariant)
+    let capturedUpdate: ReturnType<typeof vi.fn> | undefined;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.$transaction as any).mockImplementationOnce(async (fn: any) => {
+      capturedUpdate = vi.fn();
       const tx = {
         producer: {
           findFirst: vi.fn().mockResolvedValueOnce(existing),
-          update: vi.fn(),
+          update: capturedUpdate,
         },
         subOrder: { count: vi.fn().mockResolvedValueOnce(1) }, // 1 active SubOrder
       };
@@ -217,19 +236,27 @@ describe("producersService.softDelete", () => {
     await expect(
       producersService.softDelete("prod_001"),
     ).rejects.toBeInstanceOf(ProducerHasActiveOrdersError);
+
+    // Invariant: blocked delete MUST NOT write deletedAt — producer.update must not be called
+    // Spec: "Delete blocked by non-terminal SubOrder" → producer row stays unchanged
+    expect(capturedUpdate).toBeDefined();
+    expect(capturedUpdate!).not.toHaveBeenCalled();
   });
 
   it("sets deletedAt when all SubOrders are terminal (count = 0)", async () => {
     // Spec: producer-bootstrap scenario "Delete allowed when all SubOrders terminal"
     const existing = makeProducer();
     const deleted = makeProducer({ deletedAt: new Date("2026-07-14T00:00:00Z") });
+    // Capture tx.producer.update to assert it WAS called with deletedAt
+    let capturedUpdate: ReturnType<typeof vi.fn> | undefined;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.$transaction as any).mockImplementationOnce(async (fn: any) => {
+      capturedUpdate = vi.fn().mockResolvedValueOnce(deleted);
       const tx = {
         producer: {
           findFirst: vi.fn().mockResolvedValueOnce(existing),
-          update: vi.fn().mockResolvedValueOnce(deleted),
+          update: capturedUpdate,
         },
         subOrder: { count: vi.fn().mockResolvedValueOnce(0) },
       };
@@ -238,20 +265,30 @@ describe("producersService.softDelete", () => {
 
     await producersService.softDelete("prod_001");
 
-    // No exception means success (204 → void return)
+    // Invariant: successful delete MUST write deletedAt on the producer row
+    // Spec: "Delete allowed when all SubOrders terminal" → producer.update with { deletedAt }
+    expect(capturedUpdate).toBeDefined();
+    expect(capturedUpdate!).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ deletedAt: expect.any(Date) }),
+      }),
+    );
   });
 
   it("sets deletedAt when producer has no SubOrders (count = 0)", async () => {
     // Spec: producer-bootstrap scenario "Delete allowed when producer has no SubOrders"
     const existing = makeProducer();
     const deleted = makeProducer({ deletedAt: new Date("2026-07-14T00:00:00Z") });
+    // Capture tx.producer.update to assert it WAS called with deletedAt
+    let capturedUpdate: ReturnType<typeof vi.fn> | undefined;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.$transaction as any).mockImplementationOnce(async (fn: any) => {
+      capturedUpdate = vi.fn().mockResolvedValueOnce(deleted);
       const tx = {
         producer: {
           findFirst: vi.fn().mockResolvedValueOnce(existing),
-          update: vi.fn().mockResolvedValueOnce(deleted),
+          update: capturedUpdate,
         },
         subOrder: { count: vi.fn().mockResolvedValueOnce(0) },
       };
@@ -259,7 +296,15 @@ describe("producersService.softDelete", () => {
     });
 
     await producersService.softDelete("prod_001");
-    // No exception — success
+
+    // Invariant: successful delete MUST write deletedAt on the producer row
+    // Spec: "Delete allowed when producer has no SubOrders" → producer.update with { deletedAt }
+    expect(capturedUpdate).toBeDefined();
+    expect(capturedUpdate!).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ deletedAt: expect.any(Date) }),
+      }),
+    );
   });
 });
 
@@ -324,6 +369,51 @@ describe("producersService.findPublicById", () => {
     await expect(
       producersService.findPublicById("prod_deleted"),
     ).rejects.toBeInstanceOf(NotFoundError);
+  });
+});
+
+// ===========================================================================
+// isTerminalStatus reuse contract (CRITICAL 1 — cross-slice contract)
+// ===========================================================================
+
+describe("softDelete guard uses isTerminalStatus() from sub-orders (CRITICAL 1 reuse contract)", () => {
+  it("counts SubOrders using notIn terminal statuses, not a local hardcoded non-terminal list", async () => {
+    // CRITICAL 1: design contract requires producers.service to delegate to isTerminalStatus()
+    // from sub-orders.service rather than hardcoding a local NON_TERMINAL_SUBORDER_STATUSES array.
+    // The query must use { status: { notIn: ['delivered','cancelled'] } } (terminal exclusion)
+    // instead of { status: { in: ['pending','preparing','sent'] } } (non-terminal inclusion).
+    // RED: current implementation uses the local hardcoded `in` filter — this test FAILS.
+    const existing = makeProducer();
+    let capturedSubOrderCount: ReturnType<typeof vi.fn> | undefined;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.$transaction as any).mockImplementationOnce(async (fn: any) => {
+      capturedSubOrderCount = vi.fn().mockResolvedValueOnce(0);
+      const tx = {
+        producer: {
+          findFirst: vi.fn().mockResolvedValueOnce(existing),
+          update: vi.fn().mockResolvedValueOnce({ ...existing, deletedAt: new Date() }),
+        },
+        subOrder: { count: capturedSubOrderCount },
+      };
+      return fn(tx);
+    });
+
+    await producersService.softDelete("prod_001");
+
+    // Assert: the count WHERE clause uses terminal-status exclusion (notIn)
+    // derived from isTerminalStatus(), NOT a local hardcoded `in` list.
+    // Spec: cross-slice contract — producers guard must stay in sync with sub-orders state machine.
+    expect(capturedSubOrderCount).toBeDefined();
+    expect(capturedSubOrderCount!).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: expect.objectContaining({
+            notIn: expect.arrayContaining(["delivered", "cancelled"]),
+          }),
+        }),
+      }),
+    );
   });
 });
 

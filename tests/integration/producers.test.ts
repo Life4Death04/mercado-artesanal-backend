@@ -247,6 +247,10 @@ describe("PATCH /api/v1/producers/me — partial profile update", () => {
 
     expect(res.status).toBe(422);
     expect(res.body.code).toBe("VALIDATION_FAILED");
+
+    // Invariant: NIF rejection happens at DTO layer — producer row MUST NOT be touched.
+    // Spec: "NIF edit rejected" → the service is never called, no DB mutation occurs.
+    expect(mockedPrisma.$transaction).not.toHaveBeenCalled();
   });
 
   it("[PB3] returns 422 UNKNOWN_CATEGORY when unknown categorySlug provided", async () => {
@@ -254,12 +258,17 @@ describe("PATCH /api/v1/producers/me — partial profile update", () => {
     const sub = "auth0|producer001";
     const user = makeProducerUser({ auth0Sub: sub });
     const existing = makeProducer();
+    // Capture join-table mocks to assert they were NOT called (join table stays unchanged)
+    let capturedDeleteMany: ReturnType<typeof vi.fn> | undefined;
+    let capturedCreateMany: ReturnType<typeof vi.fn> | undefined;
 
     mockLoadUser(user);
 
     // $transaction callback: findFirst → producerCategory.findMany returns only 1 (not 2)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.$transaction as any).mockImplementationOnce(async (fn: any) => {
+      capturedDeleteMany = vi.fn();
+      capturedCreateMany = vi.fn();
       const tx = {
         producer: {
           findFirst: vi.fn().mockResolvedValueOnce(existing),
@@ -273,8 +282,8 @@ describe("PATCH /api/v1/producers/me — partial profile update", () => {
           ]),
         },
         producerCategoryOnProducer: {
-          deleteMany: vi.fn(),
-          createMany: vi.fn(),
+          deleteMany: capturedDeleteMany,
+          createMany: capturedCreateMany,
         },
       };
       return fn(tx);
@@ -287,6 +296,13 @@ describe("PATCH /api/v1/producers/me — partial profile update", () => {
 
     expect(res.status).toBe(422);
     expect(res.body.code).toBe("UNKNOWN_CATEGORY");
+
+    // Invariant: unknown category rejection MUST leave the join table unchanged.
+    // Spec: "Unknown categorySlug rejected" → neither deleteMany nor createMany runs.
+    expect(capturedDeleteMany).toBeDefined();
+    expect(capturedDeleteMany!).not.toHaveBeenCalled();
+    expect(capturedCreateMany).toBeDefined();
+    expect(capturedCreateMany!).not.toHaveBeenCalled();
   });
 
   it("[PB4] returns 403 FORBIDDEN when consumer role calls PATCH /producers/me", async () => {
@@ -325,16 +341,19 @@ describe("DELETE /api/v1/producers/me — soft-delete with guard", () => {
     const sub = "auth0|producer001";
     const user = makeProducerUser({ auth0Sub: sub });
     const existing = makeProducer();
+    // Capture update mock to assert deletedAt was NOT written on blocked delete
+    let capturedUpdate: ReturnType<typeof vi.fn> | undefined;
 
     mockLoadUser(user);
 
     // $transaction: findFirst → subOrder.count returns 1 → guard fires
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.$transaction as any).mockImplementationOnce(async (fn: any) => {
+      capturedUpdate = vi.fn();
       const tx = {
         producer: {
           findFirst: vi.fn().mockResolvedValueOnce(existing),
-          update: vi.fn(),
+          update: capturedUpdate,
         },
         subOrder: { count: vi.fn().mockResolvedValueOnce(1) },
       };
@@ -347,6 +366,11 @@ describe("DELETE /api/v1/producers/me — soft-delete with guard", () => {
 
     expect(res.status).toBe(409);
     expect(res.body.code).toBe("PRODUCER_HAS_ACTIVE_ORDERS");
+
+    // Invariant: blocked delete MUST NOT write deletedAt — producer row stays unchanged.
+    // Spec: "Delete blocked by non-terminal SubOrder" → no update issued.
+    expect(capturedUpdate).toBeDefined();
+    expect(capturedUpdate!).not.toHaveBeenCalled();
   });
 
   it("[PB6] returns 204 when all SubOrders are terminal", async () => {
@@ -354,16 +378,19 @@ describe("DELETE /api/v1/producers/me — soft-delete with guard", () => {
     const sub = "auth0|producer001";
     const user = makeProducerUser({ auth0Sub: sub });
     const existing = makeProducer();
+    // Capture update mock to assert deletedAt WAS written on successful delete
+    let capturedUpdate: ReturnType<typeof vi.fn> | undefined;
 
     mockLoadUser(user);
 
     // $transaction: findFirst → subOrder.count = 0 → update sets deletedAt
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.$transaction as any).mockImplementationOnce(async (fn: any) => {
+      capturedUpdate = vi.fn().mockResolvedValueOnce({ ...existing, deletedAt: new Date() });
       const tx = {
         producer: {
           findFirst: vi.fn().mockResolvedValueOnce(existing),
-          update: vi.fn().mockResolvedValueOnce({ ...existing, deletedAt: new Date() }),
+          update: capturedUpdate,
         },
         subOrder: { count: vi.fn().mockResolvedValueOnce(0) },
       };
@@ -375,6 +402,15 @@ describe("DELETE /api/v1/producers/me — soft-delete with guard", () => {
       .set("X-Test-Auth", authHeader({ sub }));
 
     expect(res.status).toBe(204);
+
+    // Invariant: successful delete MUST write deletedAt on the producer row.
+    // Spec: "Delete allowed when all SubOrders terminal" → producer.update({ deletedAt: <Date> }).
+    expect(capturedUpdate).toBeDefined();
+    expect(capturedUpdate!).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ deletedAt: expect.any(Date) }),
+      }),
+    );
   });
 
   it("[PB7] returns 204 when producer has no SubOrders", async () => {
@@ -382,16 +418,19 @@ describe("DELETE /api/v1/producers/me — soft-delete with guard", () => {
     const sub = "auth0|producer001";
     const user = makeProducerUser({ auth0Sub: sub });
     const existing = makeProducer();
+    // Capture update mock to assert deletedAt WAS written on successful delete
+    let capturedUpdate: ReturnType<typeof vi.fn> | undefined;
 
     mockLoadUser(user);
 
     // $transaction: findFirst → subOrder.count = 0 → update sets deletedAt
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.$transaction as any).mockImplementationOnce(async (fn: any) => {
+      capturedUpdate = vi.fn().mockResolvedValueOnce({ ...existing, deletedAt: new Date() });
       const tx = {
         producer: {
           findFirst: vi.fn().mockResolvedValueOnce(existing),
-          update: vi.fn().mockResolvedValueOnce({ ...existing, deletedAt: new Date() }),
+          update: capturedUpdate,
         },
         subOrder: { count: vi.fn().mockResolvedValueOnce(0) },
       };
@@ -403,6 +442,15 @@ describe("DELETE /api/v1/producers/me — soft-delete with guard", () => {
       .set("X-Test-Auth", authHeader({ sub }));
 
     expect(res.status).toBe(204);
+
+    // Invariant: successful delete MUST write deletedAt on the producer row.
+    // Spec: "Delete allowed when producer has no SubOrders" → producer.update({ deletedAt: <Date> }).
+    expect(capturedUpdate).toBeDefined();
+    expect(capturedUpdate!).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ deletedAt: expect.any(Date) }),
+      }),
+    );
   });
 });
 
