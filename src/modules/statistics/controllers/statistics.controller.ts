@@ -10,7 +10,7 @@
  * Response codes:
  *   GET /producers/me/stats/revenue?window=<value>     → 200 { window, totalRevenue, currency, from, to }
  *   GET /producers/me/stats/order-count?window=<value> → 200 { window, count, from, to }
- *   GET /producers/me/stats/low-stock[?limit&offset]   → 200 Product[]
+ *   GET /producers/me/stats/low-stock[?limit&offset]   → 200 { items, limit, offset, total }
  *
  * Spec references:
  *   sales-stats §"Revenue window endpoint"
