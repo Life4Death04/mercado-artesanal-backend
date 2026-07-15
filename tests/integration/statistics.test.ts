@@ -1,5 +1,5 @@
 /**
- * Integration tests — statistics endpoints (Slice 10 TDD, Commit A RED).
+ * Integration tests — statistics endpoints (Slice 10 TDD, Commit A RED + Corrective RED).
  *
  * Strategy: mock prisma singleton and express-oauth2-jwt-bearer.
  * Tests exercise the full wire contract: routing, middleware chain,
@@ -11,22 +11,24 @@
  *   - `@/modules/inventory/services/inventory.service` mocked for low-stock delegation.
  *
  * Scenarios covered (specs: sales-stats):
- *   [SS-1]   GET /producers/me/stats/revenue?window=30d      — 200 { window, totalRevenue: string }
- *   [SS-2]   GET /producers/me/stats/revenue?window=7d       — 200 totalRevenue = "0.00" (empty)
- *   [SS-3]   GET /producers/me/stats/revenue?window=42d      — 422 VALIDATION_FAILED (unknown window)
- *   [SS-4]   GET /producers/me/stats/revenue (no window)     — 422 VALIDATION_FAILED (required)
- *   [SS-5]   GET /producers/me/stats/order-count?window=30d  — 200 { window, count: number }
- *   [SS-6]   GET /producers/me/stats/order-count?window=42d  — 422 VALIDATION_FAILED
- *   [SS-7]   GET /producers/me/stats/low-stock               — 200 products array
- *   [SS-8]   GET /producers/me/stats/low-stock?limit=5       — 200 with pagination
- *   [SS-9]   GET /producers/me/stats/revenue                 — 401 unauthenticated
- *   [SS-10]  GET /producers/me/stats/top-products            — 404 (non-goal: no ranking endpoint)
+ *   [SS-1]       GET /producers/me/stats/revenue?window=30d      — 200 { window, totalRevenue: string }
+ *   [SS-2]       GET /producers/me/stats/revenue?window=7d       — 200 totalRevenue = "0.00" (empty)
+ *   [SS-3]       GET /producers/me/stats/revenue?window=42d      — 422 VALIDATION_FAILED (unknown window)
+ *   [SS-4]       GET /producers/me/stats/revenue (no window)     — 422 VALIDATION_FAILED (required)
+ *   [SS-5]       GET /producers/me/stats/order-count?window=30d  — 200 { window, count: number }
+ *   [SS-6]       GET /producers/me/stats/order-count?window=42d  — 422 VALIDATION_FAILED
+ *   [SS-7]       GET /producers/me/stats/low-stock               — 200 envelope { items, limit, offset, total }
+ *   [SS-8]       GET /producers/me/stats/low-stock?limit=5       — 200 with pagination forwarded
+ *   [SS-7-empty] GET /producers/me/stats/low-stock               — 200 { items: [], limit, offset, total: 0 }
+ *   [SS-unauth]  GET /producers/me/stats/revenue                 — 401 unauthenticated
+ *   [SS-10]      GET /producers/me/stats/top-products            — 404 (non-goal: no ranking endpoint)
+ *   [SS-11]      GET /producers/me/stats/cohort                  — 404 (non-goal: no cohort endpoint)
  *
  * Spec references:
  *   sales-stats §"Window parameter contract"
  *   sales-stats §"Revenue window endpoint"
  *   sales-stats §"Order count endpoint"
- *   sales-stats §"Low-stock alerts endpoint"
+ *   sales-stats §"Low-stock alerts endpoint" (spec lines 69-72: envelope contract)
  *   sales-stats §"Non-goals"
  */
 import supertest from "supertest";
@@ -79,6 +81,7 @@ vi.mock("@/shared/utils/prisma", () => ({
 // ---------------------------------------------------------------------------
 vi.mock("@/modules/inventory/services/inventory.service", () => ({
   findLowStock: vi.fn(),
+  findLowStockCount: vi.fn(),
 }));
 
 import { prisma } from "@/shared/utils/prisma";
@@ -96,6 +99,10 @@ const mockedQueryRaw = mockedPrisma.$queryRaw as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedSubOrderCount = mockedPrisma.subOrder as any;
 const mockedFindLowStock = vi.mocked(inventoryService.findLowStock);
+const mockedFindLowStockCount = vi.mocked(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (inventoryService as any).findLowStockCount as (...args: unknown[]) => Promise<number>,
+);
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -270,43 +277,58 @@ describe("GET /api/v1/producers/me/stats/order-count — order count endpoint", 
 });
 
 // ===========================================================================
-// GET /api/v1/producers/me/stats/low-stock
+// GET /api/v1/producers/me/stats/low-stock — envelope contract (Corrective RED)
 // ===========================================================================
 
 describe("GET /api/v1/producers/me/stats/low-stock — low-stock alerts endpoint", () => {
-  it("[SS-7] returns 200 with products at or below threshold (delegation)", async () => {
-    // Spec scenario: "Returns products at or below threshold"
-    // Products A(stock=0, thr=5), B(stock=5, thr=5) → in result
-    // Product C(stock=6, thr=5) → excluded (handled by inventory.findLowStock)
+  it("[SS-7] returns 200 with envelope { items, limit, offset, total } — spec:69-72", async () => {
+    // Spec (sales-stats spec.md:69-72):
+    //   Response body: { items: [{ productId, name, stock, lowStockThreshold }], limit, offset, total }
+    // Items MUST use `productId` (spec field name), NOT `id`.
+    // The response MUST be an envelope object, NOT a bare array.
     const sub = "auth0|producer001";
     const user = makeProducerUser({ auth0Sub: sub });
 
     mockLoadUser(user);
     mockedFindLowStock.mockResolvedValueOnce([
       {
-        id: "p_a",
+        productId: "p_a",
         name: "Product A",
         stock: 0,
         lowStockThreshold: 5,
       },
       {
-        id: "p_b",
+        productId: "p_b",
         name: "Product B",
         stock: 5,
         lowStockThreshold: 5,
       },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ] as any);
+    mockedFindLowStockCount.mockResolvedValueOnce(2);
 
     const res = await request
       .get("/api/v1/producers/me/stats/low-stock")
       .set("X-Test-Auth", authHeader({ sub }));
 
     expect(res.status).toBe(200);
-    expect(Array.isArray(res.body)).toBe(true);
-    expect(res.body).toHaveLength(2);
-    expect(res.body[0].id).toBe("p_a");
-    expect(res.body[1].id).toBe("p_b");
+
+    // MUST be an envelope, NOT a bare array
+    expect(Array.isArray(res.body)).toBe(false);
+    expect(res.body).toHaveProperty("items");
+    expect(res.body).toHaveProperty("limit");
+    expect(res.body).toHaveProperty("offset");
+    expect(res.body).toHaveProperty("total");
+
+    // items content
+    expect(res.body.items).toHaveLength(2);
+    // items MUST expose productId (spec field name)
+    expect(res.body.items[0].productId).toBe("p_a");
+    expect(res.body.items[1].productId).toBe("p_b");
+
+    // total reflects count before pagination
+    expect(res.body.total).toBe(2);
+
     // Verify delegation happened with correct producerId
     expect(mockedFindLowStock).toHaveBeenCalledTimes(1);
     expect(mockedFindLowStock).toHaveBeenCalledWith(
@@ -322,6 +344,7 @@ describe("GET /api/v1/producers/me/stats/low-stock — low-stock alerts endpoint
     mockLoadUser(user);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     mockedFindLowStock.mockResolvedValueOnce([] as any);
+    mockedFindLowStockCount.mockResolvedValueOnce(0);
 
     const res = await request
       .get("/api/v1/producers/me/stats/low-stock?limit=5&offset=10")
@@ -333,20 +356,25 @@ describe("GET /api/v1/producers/me/stats/low-stock — low-stock alerts endpoint
     );
   });
 
-  it("[SS-7-empty] returns 200 with empty array when no low-stock products", async () => {
+  it("[SS-7-empty] returns 200 with envelope { items: [], total: 0 } when no low-stock products", async () => {
+    // Spec: empty result MUST still be an envelope object, NOT an empty array
     const sub = "auth0|producer001";
     const user = makeProducerUser({ auth0Sub: sub });
 
     mockLoadUser(user);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     mockedFindLowStock.mockResolvedValueOnce([] as any);
+    mockedFindLowStockCount.mockResolvedValueOnce(0);
 
     const res = await request
       .get("/api/v1/producers/me/stats/low-stock")
       .set("X-Test-Auth", authHeader({ sub }));
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual([]);
+    // MUST be envelope, NOT bare array
+    expect(Array.isArray(res.body)).toBe(false);
+    expect(res.body.items).toEqual([]);
+    expect(res.body.total).toBe(0);
   });
 });
 
