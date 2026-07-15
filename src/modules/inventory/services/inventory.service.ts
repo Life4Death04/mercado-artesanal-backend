@@ -51,6 +51,16 @@
  *   Consumed by: sales-stats §"Low-stock alerts endpoint" (Slice 10).
  *   No HTTP route is registered from this module.
  *
+ * ─── findLowStockCount ────────────────────────────────────────────────────────
+ *
+ *   findLowStockCount({ producerId }): Promise<number>
+ *
+ *   Returns the COUNT(*) of low-stock products (stock <= lowStockThreshold,
+ *   active, not soft-deleted) for a producer — without pagination offsets.
+ *   Used by sales-stats getLowStock to compute `total` for the envelope.
+ *
+ *   Consumed by: sales-stats §"Low-stock alerts endpoint" (Slice 10, total field).
+ *
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * Spec references:
@@ -263,4 +273,40 @@ export async function findLowStock(input: FindLowStockInput): Promise<Product[]>
       OFFSET ${offset}
     `,
   );
+}
+
+// ---------------------------------------------------------------------------
+// findLowStockCount
+// ---------------------------------------------------------------------------
+
+/**
+ * Count the total number of low-stock products for a producer (before pagination).
+ *
+ * Uses the same WHERE predicate as findLowStock but returns COUNT(*) only.
+ * The result is consumed by sales-stats getLowStock to populate the `total`
+ * field of the { items, limit, offset, total } envelope required by the spec.
+ *
+ * Implementation: $queryRaw with COUNT(*) — same cross-column comparison
+ * (stock <= low_stock_threshold) is not expressible in Prisma ORM WHERE.
+ *
+ * Spec: sales-stats §"Low-stock alerts endpoint" (spec lines 69-72)
+ */
+export async function findLowStockCount(input: Pick<FindLowStockInput, "producerId">): Promise<number> {
+  const { producerId } = input;
+
+  const rows = await prisma.$queryRaw<[{ count: string | bigint }]>(
+    Prisma.sql`
+      SELECT COUNT(*) AS count
+      FROM products
+      WHERE
+        producer_id = ${producerId}
+        AND deleted_at IS NULL
+        AND is_active = TRUE
+        AND stock <= low_stock_threshold
+    `,
+  );
+
+  // Postgres returns COUNT as bigint; coerce to JS number (safe — product counts are small)
+  const raw = rows[0]?.count ?? 0;
+  return typeof raw === "bigint" ? Number(raw) : Number(raw);
 }
