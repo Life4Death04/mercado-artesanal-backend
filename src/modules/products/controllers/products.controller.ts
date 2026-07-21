@@ -9,16 +9,20 @@
  *
  * Response codes:
  *   POST   /producers/me/products        → 201 created product
- *   GET    /producers/me/products        → 200 array
- *   GET    /producers/me/products/:id    → 200 product
+ *   GET    /producers/me/products        → 200 array (each product includes images[])
+ *   GET    /producers/me/products/:id    → 200 product (includes images[])
  *   PATCH  /producers/me/products/:id    → 200 updated product
  *   DELETE /producers/me/products/:id    → 204 No Content
  *   POST   /products/:id/report          → 200 { productId, moderationStatus, reportedAt }
  *
+ * Slice 3: listProducts and getProduct now return ProductWithImages shapes
+ * (images: ProductImageResponse[]). Controller stays thin — passes service output through.
+ *
  * Spec references:
- *   product-catalog  §"Publish-on-create lifecycle", §"RBAC-scoped ownership"
+ *   product-catalog  §"Publish-on-create lifecycle", §"RBAC-scoped ownership",
+ *                    §"Producer product responses include images array"
  *   product-reporting §"Report endpoint"
- *   design — API surface table, Controller layer is thin
+ *   design — API surface table, Controller layer is thin, Decision #4
  */
 import type { NextFunction, Request, Response } from "express";
 
