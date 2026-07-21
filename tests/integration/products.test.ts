@@ -411,6 +411,40 @@ describe("GET /api/v1/producers/me/products/:id — get own product", () => {
     expect(res.body.code).toBe("PRODUCT_NOT_FOUND");
   });
 
+  it("[PC4-IMG-COUNT] detail returns ALL images regardless of count — no implicit cap (spec: all images returned)", async () => {
+    // Spec: product-images §"All images returned regardless of count"
+    // Fixture: 12 images — large enough to catch an accidental take:5 or take:10.
+    // Mutation-verify: injecting `take: 5` into include.images in the service
+    // drops this test from passing (res.body.images.length becomes 5).
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+    const N = 12;
+    const images = Array.from({ length: N }, (_, i) => ({
+      id: `img_pc4_count_${i}`,
+      position: i,
+      s3Key: `producers/p1/count/img_${i}.jpg`,
+      createdAt: new Date(`2026-03-${String(i + 1).padStart(2, "0")}T00:00:00Z`),
+    }));
+    const product = makeProduct({ images });
+
+    mockLoadUser(user);
+    mockedProduct.findFirst.mockResolvedValueOnce(product);
+
+    const res = await request
+      .get("/api/v1/producers/me/products/product_001")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const responseImages = res.body.images as Array<Record<string, unknown>>;
+    // All 12 images must be present — no implicit pagination or cap
+    expect(responseImages).toHaveLength(N);
+    // Every input id must appear in the response (identity check, order-agnostic)
+    const returnedIds = responseImages.map((img) => img["id"] as string).sort();
+    const expectedIds = images.map((img) => img.id).sort();
+    expect(returnedIds).toEqual(expectedIds);
+  });
+
   it("[PC4-IMG1] detail returns images mapped to { id, position, url } — s3Key absent (spec: wire shape)", async () => {
     const sub = "auth0|producer001";
     const user = makeProducerUser({ auth0Sub: sub });

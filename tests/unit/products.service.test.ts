@@ -302,6 +302,45 @@ describe("productsService.findAll — image mapping (Slice 3)", () => {
 });
 
 // ===========================================================================
+// findAll — Slice 3: image count guarantee [PU-IMG-COUNT-LIST]
+// ===========================================================================
+// Spec: product-images §"All images returned regardless of count"
+// Proves: service returns ALL N images — no implicit take/limit/cap applies.
+// Mutation-verify: injecting `take: 5` into include.images makes this test
+// fail with "expected 12 to deeply equal 12 → expected Array(5) to have length 12".
+
+describe("productsService.findAll — image count guarantee (Slice 3)", () => {
+  it("[PU-IMG-COUNT-LIST] returns ALL images regardless of count — no implicit cap (spec: all images returned)", async () => {
+    const N = 12;
+    const imageRows = Array.from({ length: N }, (_, i) => ({
+      id: `img_count_${i}`,
+      position: i,
+      s3Key: `producers/p1/img/count_${i}.jpg`,
+      createdAt: new Date(`2026-01-${String(i + 1).padStart(2, "0")}T00:00:00Z`),
+    }));
+    const productWithImages = {
+      ...makeProduct(),
+      images: imageRows,
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([productWithImages]);
+
+    const results = await productsService.findAll("prod_001");
+
+    // All N images must be present — no truncation, no cap
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(results[0]!.images).toHaveLength(N);
+
+    // Every input id must be present in the output (identity check, order-agnostic)
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    const returnedIds = results[0]!.images.map((img) => img.id).sort();
+    const expectedIds = imageRows.map((row) => row.id).sort();
+    expect(returnedIds).toEqual(expectedIds);
+  });
+});
+
+// ===========================================================================
 // findById — Slice 3: image mapping
 // ===========================================================================
 
@@ -344,6 +383,36 @@ describe("productsService.findById — image mapping (Slice 3)", () => {
     const result = await productsService.findById("prod_001", "product_001");
 
     expect(result.images).toEqual([]);
+  });
+
+  it("[PU-IMG-COUNT-DETAIL] returns ALL images regardless of count — no implicit cap (spec: all images returned)", async () => {
+    // Spec: product-images §"All images returned regardless of count"
+    // Mutation-verify: injecting `take: 5` into include.images makes this test
+    // fail because result.images.length becomes 5, not 12.
+    const N = 12;
+    const imageRows = Array.from({ length: N }, (_, i) => ({
+      id: `img_detail_count_${i}`,
+      position: i,
+      s3Key: `producers/p1/detail/count_${i}.jpg`,
+      createdAt: new Date(`2026-02-${String(i + 1).padStart(2, "0")}T00:00:00Z`),
+    }));
+    const productWithImages = {
+      ...makeProduct(),
+      images: imageRows,
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findFirst.mockResolvedValueOnce(productWithImages);
+
+    const result = await productsService.findById("prod_001", "product_001");
+
+    // All N images must be present — no truncation, no cap
+    expect(result.images).toHaveLength(N);
+
+    // Every input id must appear in the output (identity check, order-agnostic)
+    const returnedIds = result.images.map((img) => img.id).sort();
+    const expectedIds = imageRows.map((row) => row.id).sort();
+    expect(returnedIds).toEqual(expectedIds);
   });
 });
 
