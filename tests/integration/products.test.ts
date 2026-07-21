@@ -367,6 +367,11 @@ describe("GET /api/v1/producers/me/products — list products", () => {
     // Deep scan: the field name "s3Key" must not appear in the serialized body.
     // The key PATH may appear inside the url value (that is by design) — only the field name is forbidden.
     expect(JSON.stringify(res.body)).not.toContain('"s3Key"');
+    // Exact key-set allowlist: image objects must expose ONLY { id, position, url }.
+    // Any future field added to mapImageRow without updating this test will cause a failure.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const image = (res.body[0].images as Array<Record<string, unknown>>)[0]!;
+    expect(Object.keys(image).sort()).toEqual(['id', 'position', 'url']);
   });
 });
 
@@ -435,6 +440,10 @@ describe("GET /api/v1/producers/me/products/:id — get own product", () => {
     // The field name "s3Key" must not appear in the response body.
     // Key path values appear inside the url field (by design) — only the field name is forbidden.
     expect(JSON.stringify(res.body)).not.toContain('"s3Key"');
+    // Exact key-set allowlist: image objects must expose ONLY { id, position, url }.
+    // Any future field added to mapImageRow without updating this test will cause a failure.
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(Object.keys(responseImages[0]!).sort()).toEqual(['id', 'position', 'url']);
   });
 });
 
