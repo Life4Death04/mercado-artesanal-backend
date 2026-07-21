@@ -12,6 +12,8 @@
  *   - Soft-delete guard: DELETE and isActive→false blocked when active OrderLines exist.
  *   - Report first-wins: moderationStatus=REPORTED only once; subsequent reports are no-ops.
  *   - Category validation: create rejects unknown/inactive categoryId with CategoryNotFoundError.
+ *   - Image mapping: findAll/findById include images ordered at DB level (position ASC, createdAt ASC),
+ *     mapped to { id, position, url } — s3Key is NEVER exposed on the wire (Slice 3).
  *
  * All multi-row state transitions run inside `prisma.$transaction(async (tx) => { ... })`
  * callback form (NOT the array form) — required by the test mock strategy.
@@ -19,10 +21,15 @@
  * Spec references:
  *   product-catalog  §"Publish-on-create lifecycle", §"RBAC-scoped ownership",
  *                    §"Soft-delete guard against active order lines",
- *                    §"Reactive-moderation data layer"
+ *                    §"Reactive-moderation data layer",
+ *                    §"Producer product responses include images array"
+ *   product-images   §"Wire shape", §"Deterministic ordering",
+ *                    §"URL derivation", §"Empty images state"
  *   product-reporting §"Report endpoint", §"Second report is idempotent",
  *                     §"Report on removed product rejected"
- *   design — Decision #8 (producerId from req.user), Decision #3 (idempotent no-op)
+ *   design — Decision #8 (producerId from req.user), Decision #3 (idempotent no-op),
+ *            Decision #3 (DB-level ordering), Decision #4 (service maps, controller thin),
+ *            Decision #5 (introduce ProductWithImages)
  */
 import type { ModerationStatus, Product, SubOrderStatus } from "@prisma/client";
 
@@ -31,7 +38,30 @@ import {
   ProductHasActiveOrdersError,
   ProductNotFoundError,
 } from "@/shared/errors/errors";
+import { toImageUrl } from "@/shared/utils/image-url";
 import { prisma } from "@/shared/utils/prisma";
+
+// ---------------------------------------------------------------------------
+// Response types (Slice 3 — image exposure)
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire shape for a single exposed product image.
+ * s3Key is intentionally absent — URL is derived at service level via toImageUrl.
+ * Spec: product-images §"Wire shape".
+ */
+export interface ProductImageResponse {
+  id: string;
+  position: number;
+  url: string;
+}
+
+/**
+ * Product enriched with its images array.
+ * Returned by findAll and findById after Slice 3.
+ * Spec: product-catalog §"Producer product responses include images array".
+ */
+export type ProductWithImages = Product & { images: ProductImageResponse[] };
 
 // ---------------------------------------------------------------------------
 // Input types
@@ -72,6 +102,16 @@ export interface UpdateProductInput {
  * Spec: product-catalog §"Soft-delete guard against active order lines".
  */
 const NON_TERMINAL_SUB_ORDER_STATUSES: SubOrderStatus[] = ["pending", "preparing", "sent"];
+
+/**
+ * Map a Prisma image row (with s3Key) to the wire shape (with url).
+ * s3Key is dropped — never reaches the response body.
+ * Spec: product-images §"Wire shape", §"URL derivation".
+ * Design: Decision #4 — explicit construction, never spread.
+ */
+function mapImageRow(row: { id: string; position: number; s3Key: string }): ProductImageResponse {
+  return { id: row.id, position: row.position, url: toImageUrl(row.s3Key) };
+}
 
 // ---------------------------------------------------------------------------
 // create
@@ -123,13 +163,30 @@ export async function create(producerId: string, input: CreateProductInput): Pro
 
 /**
  * List all non-deleted products for a producer, ordered newest first.
- * Spec: product-catalog §"RBAC-scoped ownership".
+ * Each product includes its images mapped to { id, position, url } — s3Key not exposed.
+ * Images are ordered at DB level by position ASC then createdAt ASC.
+ *
+ * Spec: product-catalog §"RBAC-scoped ownership",
+ *       §"Producer product responses include images array";
+ *       product-images §"Deterministic ordering", §"Empty images state".
+ * Design: Decision #3 (DB-level ordering), Decision #4 (service maps).
  */
-export async function findAll(producerId: string): Promise<Product[]> {
-  return prisma.product.findMany({
+export async function findAll(producerId: string): Promise<ProductWithImages[]> {
+  const products = await prisma.product.findMany({
     where: { producerId, deletedAt: null },
     orderBy: [{ createdAt: "desc" }],
+    include: {
+      images: {
+        orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+        select: { id: true, position: true, s3Key: true },
+      },
+    },
   });
+
+  return products.map((product) => ({
+    ...product,
+    images: product.images.map(mapImageRow),
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -138,17 +195,31 @@ export async function findAll(producerId: string): Promise<Product[]> {
 
 /**
  * Get a single product owned by the producer.
+ * Includes images mapped to { id, position, url } — s3Key not exposed.
  * Returns ProductNotFoundError (404) when not owned or soft-deleted (no-leak).
- * Spec: product-catalog §"RBAC-scoped ownership".
+ *
+ * Spec: product-catalog §"RBAC-scoped ownership",
+ *       §"Producer product responses include images array";
+ *       product-images §"Deterministic ordering", §"Empty images state".
+ * Design: Decision #3 (DB-level ordering), Decision #4 (service maps).
  */
-export async function findById(producerId: string, id: string): Promise<Product> {
+export async function findById(producerId: string, id: string): Promise<ProductWithImages> {
   const product = await prisma.product.findFirst({
     where: { id, producerId, deletedAt: null },
+    include: {
+      images: {
+        orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+        select: { id: true, position: true, s3Key: true },
+      },
+    },
   });
   if (!product) {
     throw new ProductNotFoundError("Product not found");
   }
-  return product;
+  return {
+    ...product,
+    images: product.images.map(mapImageRow),
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -3,18 +3,29 @@
  *
  * Strategy: mock prisma singleton so no DB is required.
  * Tests exercise service-level business logic: ownership enforcement,
- * validation branching, active-order guard, and report first-wins semantics.
+ * validation branching, active-order guard, report first-wins semantics,
+ * and image mapping (Slice 3).
  *
- * Scenarios covered (specs: product-catalog + product-reporting):
+ * Scenarios covered (specs: product-catalog + product-images + product-reporting):
  *
  * create:
  *   - product is created with isActive=true, moderationStatus=OK (publish-on-create)
  *   - throws CategoryNotFoundError when categoryId is inactive or missing
  *
+ * findAll (Slice 3 — image mapping):
+ *   - maps image rows to { id, position, url } with s3Key absent
+ *   - orders images by position ASC (Prisma include.orderBy contract)
+ *   - returns images: [] when product has no images
+ *   - url is derived via toImageUrl(s3Key)
+ *
  * findById:
  *   - returns product when owned by producer and not deleted
  *   - throws ProductNotFoundError when not owned (404-no-leak)
  *   - throws ProductNotFoundError when soft-deleted
+ *
+ * findById (Slice 3 — image mapping):
+ *   - maps image rows to { id, position, url } with s3Key absent
+ *   - returns images: [] when product has no images
  *
  * update:
  *   - updates fields when product is owned
@@ -34,7 +45,10 @@
  * Spec references:
  *   product-catalog  §"Publish-on-create lifecycle", §"RBAC-scoped ownership",
  *                    §"Soft-delete guard against active order lines",
- *                    §"Reactive-moderation data layer"
+ *                    §"Reactive-moderation data layer",
+ *                    §"Producer product responses include images array"
+ *   product-images   §"Wire shape", §"Deterministic ordering",
+ *                    §"URL derivation", §"Empty images state"
  *   product-reporting §"Report endpoint", §"Second report is idempotent",
  *                     §"Report on removed product rejected"
  */
@@ -58,6 +72,12 @@ vi.mock("@/shared/utils/prisma", () => {
     },
   };
 });
+
+// ---------------------------------------------------------------------------
+// Mock image-url utility (Slice 3)
+// We let toImageUrl run via the env mock (no spy needed — integration inside unit).
+// env is already seeded with S3_PUBLIC_BASE_URL in vitest.config.ts.
+// ---------------------------------------------------------------------------
 
 import type { ModerationStatus } from "@prisma/client";
 import { Decimal } from "@prisma/client/runtime/library";
@@ -99,6 +119,8 @@ function makeProduct(overrides: Record<string, unknown> = {}) {
     deletedAt: null,
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
+    // Slice 3: Prisma include returns images array; default to empty for pre-existing tests.
+    images: [] as Array<{ id: string; position: number; s3Key: string; createdAt: Date }>,
     ...overrides,
   };
 }
@@ -184,6 +206,213 @@ describe("productsService.findById", () => {
     await expect(productsService.findById("prod_attacker", "product_001")).rejects.toThrow(
       ProductNotFoundError,
     );
+  });
+});
+
+// ===========================================================================
+// findAll — Slice 3: image mapping
+// ===========================================================================
+
+describe("productsService.findAll — image mapping (Slice 3)", () => {
+  it("maps image rows to { id, position, url } — s3Key MUST NOT appear in output", async () => {
+    const imageRow = {
+      id: "img_001",
+      position: 0,
+      s3Key: "producers/p1/products/prod1/img/abc",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    };
+    const productWithImages = {
+      ...makeProduct(),
+      images: [imageRow],
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([productWithImages]);
+
+    const results = await productsService.findAll("prod_001");
+
+    expect(results).toHaveLength(1);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    const img = results[0]!.images[0]!;
+
+    // Required fields
+    expect(img.id).toBe("img_001");
+    expect(img.position).toBe(0);
+    expect(img.url).toBe("https://test-cdn.example.com/producers/p1/products/prod1/img/abc");
+
+    // s3Key MUST NOT be present
+    expect(img).not.toHaveProperty("s3Key");
+  });
+
+  it("asserts Prisma include.images orderBy is [{ position: 'asc' }, { createdAt: 'asc' }] (DB-level ordering contract)", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findAll("prod_001");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.include.images.orderBy).toEqual([
+      { position: "asc" },
+      { createdAt: "asc" },
+    ]);
+  });
+
+  it("returns images: [] for a product that has no images", async () => {
+    const productNoImages = {
+      ...makeProduct(),
+      images: [],
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([productNoImages]);
+
+    const results = await productsService.findAll("prod_001");
+
+    expect(results).toHaveLength(1);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(results[0]!.images).toEqual([]);
+  });
+
+  it("url is derived via toImageUrl: base + key joined with single slash", async () => {
+    const imageRow = {
+      id: "img_002",
+      position: 1,
+      s3Key: "/leading/slash/key.jpg",
+      createdAt: new Date("2026-01-02T00:00:00Z"),
+    };
+    const productWithImages = {
+      ...makeProduct(),
+      images: [imageRow],
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([productWithImages]);
+
+    const results = await productsService.findAll("prod_001");
+
+    // Leading slash on key should be stripped → exactly one slash between base and key
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(results[0]!.images[0]!.url).toBe(
+      "https://test-cdn.example.com/leading/slash/key.jpg",
+    );
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(results[0]!.images[0]!).not.toHaveProperty("s3Key");
+  });
+});
+
+// ===========================================================================
+// findAll — Slice 3: image count guarantee [PU-IMG-COUNT-LIST]
+// ===========================================================================
+// Spec: product-images §"All images returned regardless of count"
+// Proves: service returns ALL N images — no implicit take/limit/cap applies.
+// Mutation-verify: injecting `take: 5` into include.images makes this test
+// fail with "expected 12 to deeply equal 12 → expected Array(5) to have length 12".
+
+describe("productsService.findAll — image count guarantee (Slice 3)", () => {
+  it("[PU-IMG-COUNT-LIST] returns ALL images regardless of count — no implicit cap (spec: all images returned)", async () => {
+    const N = 12;
+    const imageRows = Array.from({ length: N }, (_, i) => ({
+      id: `img_count_${i}`,
+      position: i,
+      s3Key: `producers/p1/img/count_${i}.jpg`,
+      createdAt: new Date(`2026-01-${String(i + 1).padStart(2, "0")}T00:00:00Z`),
+    }));
+    const productWithImages = {
+      ...makeProduct(),
+      images: imageRows,
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([productWithImages]);
+
+    const results = await productsService.findAll("prod_001");
+
+    // All N images must be present — no truncation, no cap
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(results[0]!.images).toHaveLength(N);
+
+    // Every input id must be present in the output (identity check, order-agnostic)
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    const returnedIds = results[0]!.images.map((img) => img.id).sort();
+    const expectedIds = imageRows.map((row) => row.id).sort();
+    expect(returnedIds).toEqual(expectedIds);
+  });
+});
+
+// ===========================================================================
+// findById — Slice 3: image mapping
+// ===========================================================================
+
+describe("productsService.findById — image mapping (Slice 3)", () => {
+  it("maps image rows to { id, position, url } — s3Key MUST NOT appear in output", async () => {
+    const imageRow = {
+      id: "img_101",
+      position: 2,
+      s3Key: "producers/p1/img/xyz.jpg",
+      createdAt: new Date("2026-01-05T00:00:00Z"),
+    };
+    const productWithImages = {
+      ...makeProduct(),
+      images: [imageRow],
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findFirst.mockResolvedValueOnce(productWithImages);
+
+    const result = await productsService.findById("prod_001", "product_001");
+
+    expect(result.images).toHaveLength(1);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    const img = result.images[0]!;
+    expect(img.id).toBe("img_101");
+    expect(img.position).toBe(2);
+    expect(img.url).toBe("https://test-cdn.example.com/producers/p1/img/xyz.jpg");
+    expect(img).not.toHaveProperty("s3Key");
+  });
+
+  it("returns images: [] for a product that has no images", async () => {
+    const productNoImages = {
+      ...makeProduct(),
+      images: [],
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findFirst.mockResolvedValueOnce(productNoImages);
+
+    const result = await productsService.findById("prod_001", "product_001");
+
+    expect(result.images).toEqual([]);
+  });
+
+  it("[PU-IMG-COUNT-DETAIL] returns ALL images regardless of count — no implicit cap (spec: all images returned)", async () => {
+    // Spec: product-images §"All images returned regardless of count"
+    // Mutation-verify: injecting `take: 5` into include.images makes this test
+    // fail because result.images.length becomes 5, not 12.
+    const N = 12;
+    const imageRows = Array.from({ length: N }, (_, i) => ({
+      id: `img_detail_count_${i}`,
+      position: i,
+      s3Key: `producers/p1/detail/count_${i}.jpg`,
+      createdAt: new Date(`2026-02-${String(i + 1).padStart(2, "0")}T00:00:00Z`),
+    }));
+    const productWithImages = {
+      ...makeProduct(),
+      images: imageRows,
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findFirst.mockResolvedValueOnce(productWithImages);
+
+    const result = await productsService.findById("prod_001", "product_001");
+
+    // All N images must be present — no truncation, no cap
+    expect(result.images).toHaveLength(N);
+
+    // Every input id must appear in the output (identity check, order-agnostic)
+    const returnedIds = result.images.map((img) => img.id).sort();
+    const expectedIds = imageRows.map((row) => row.id).sort();
+    expect(returnedIds).toEqual(expectedIds);
   });
 });
 

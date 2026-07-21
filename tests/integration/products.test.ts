@@ -1,5 +1,5 @@
 /**
- * Integration tests — products endpoints (Slice 3).
+ * Integration tests — products endpoints (Slice 3 extended).
  *
  * Strategy: mock prisma singleton and express-oauth2-jwt-bearer.
  * Tests exercise the full wire contract: routing, middleware chain,
@@ -11,11 +11,15 @@
  *     loadUser calls `prisma.user.findUnique`; product operations call
  *     `prisma.$transaction` (callback form) or direct model accessors.
  *
- * Scenarios covered (specs: product-catalog + product-reporting):
+ * Scenarios covered (specs: product-catalog + product-images + product-reporting):
  *   [PC1]  POST   /producers/me/products           — 201 published-on-create
  *   [PC2]  POST   /producers/me/products           — 422 negative price
  *   [PC3]  GET    /producers/me/products           — 200 list own products
+ *   [PC3-IMG1] GET /producers/me/products          — images[]: [] for product with no images
+ *   [PC3-IMG2] GET /producers/me/products          — images[]: [{id,position,url}] for product with images
+ *   [PC3-IMG3] GET /producers/me/products          — s3Key never in response body
  *   [PC4]  GET    /producers/me/products/:id       — 200 get own product
+ *   [PC4-IMG1] GET /producers/me/products/:id      — images mapped to {id,position,url}, s3Key absent
  *   [PC5]  GET    /producers/me/products/:id       — 404 PRODUCT_NOT_FOUND (cross-producer)
  *   [PC6]  PATCH  /producers/me/products/:id       — 200 partial update
  *   [PC7]  PATCH  /producers/me/products/:id       — 404 PRODUCT_NOT_FOUND (cross-producer)
@@ -29,7 +33,10 @@
  *
  * Spec references:
  *   product-catalog  §"Publish-on-create lifecycle", §"RBAC-scoped ownership",
- *                    §"Soft-delete guard against active order lines"
+ *                    §"Soft-delete guard against active order lines",
+ *                    §"Producer product responses include images array"
+ *   product-images   §"Wire shape", §"Deterministic ordering",
+ *                    §"URL derivation", §"Empty images state"
  *   product-reporting §"Report endpoint", §"Second report is idempotent",
  *                     §"Unauthenticated report rejected"
  */
@@ -142,6 +149,8 @@ function makeProduct(overrides: Record<string, unknown> = {}) {
     deletedAt: null,
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
+    // Slice 3: service now returns images (from Prisma include). Default empty.
+    images: [] as Array<{ id: string; position: number; s3Key: string; createdAt: Date }>,
     ...overrides,
   };
 }
@@ -285,6 +294,85 @@ describe("GET /api/v1/producers/me/products — list products", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
   });
+
+  it("[PC3-IMG1] returns images: [] for a product that has no images (spec: empty images state)", async () => {
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+    const product = makeProduct({ images: [] });
+
+    mockLoadUser(user);
+    mockedProduct.findMany.mockResolvedValueOnce([product]);
+
+    const res = await request
+      .get("/api/v1/producers/me/products")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body).toHaveLength(1);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    expect(res.body[0].images).toEqual([]);
+  });
+
+  it("[PC3-IMG2] returns images mapped to { id, position, url } — ordered by position ASC (spec: wire shape + deterministic ordering)", async () => {
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+
+    // Simulate Prisma returning images already ordered by position ASC (DB-level ordering contract)
+    const images = [
+      { id: "img_a", position: 0, s3Key: "path/to/img0.jpg", createdAt: new Date("2026-01-01T00:00:00Z") },
+      { id: "img_b", position: 1, s3Key: "path/to/img1.jpg", createdAt: new Date("2026-01-02T00:00:00Z") },
+    ];
+    const product = makeProduct({ images });
+
+    mockLoadUser(user);
+    mockedProduct.findMany.mockResolvedValueOnce([product]);
+
+    const res = await request
+      .get("/api/v1/producers/me/products")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const responseImages = res.body[0].images as Array<Record<string, unknown>>;
+    expect(responseImages).toHaveLength(2);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(responseImages[0]!.id).toBe("img_a");
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(responseImages[0]!.position).toBe(0);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(typeof responseImages[0]!.url).toBe("string");
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect((responseImages[0]!.url as string)).toContain("path/to/img0.jpg");
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(responseImages[1]!.position).toBe(1);
+  });
+
+  it("[PC3-IMG3] response body NEVER contains s3Key on any image (spec: s3Key must not leave server)", async () => {
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+    const images = [
+      { id: "img_secret", position: 0, s3Key: "sensitive/internal/key.jpg", createdAt: new Date() },
+    ];
+    const product = makeProduct({ images });
+
+    mockLoadUser(user);
+    mockedProduct.findMany.mockResolvedValueOnce([product]);
+
+    const res = await request
+      .get("/api/v1/producers/me/products")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    // Deep scan: the field name "s3Key" must not appear in the serialized body.
+    // The key PATH may appear inside the url value (that is by design) — only the field name is forbidden.
+    expect(JSON.stringify(res.body)).not.toContain('"s3Key"');
+    // Exact key-set allowlist: image objects must expose ONLY { id, position, url }.
+    // Any future field added to mapImageRow without updating this test will cause a failure.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const image = (res.body[0].images as Array<Record<string, unknown>>)[0]!;
+    expect(Object.keys(image).sort()).toEqual(['id', 'position', 'url']);
+  });
 });
 
 // ===========================================================================
@@ -321,6 +409,75 @@ describe("GET /api/v1/producers/me/products/:id — get own product", () => {
 
     expect(res.status).toBe(404);
     expect(res.body.code).toBe("PRODUCT_NOT_FOUND");
+  });
+
+  it("[PC4-IMG-COUNT] detail returns ALL images regardless of count — no implicit cap (spec: all images returned)", async () => {
+    // Spec: product-images §"All images returned regardless of count"
+    // Fixture: 12 images — large enough to catch an accidental take:5 or take:10.
+    // Mutation-verify: injecting `take: 5` into include.images in the service
+    // drops this test from passing (res.body.images.length becomes 5).
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+    const N = 12;
+    const images = Array.from({ length: N }, (_, i) => ({
+      id: `img_pc4_count_${i}`,
+      position: i,
+      s3Key: `producers/p1/count/img_${i}.jpg`,
+      createdAt: new Date(`2026-03-${String(i + 1).padStart(2, "0")}T00:00:00Z`),
+    }));
+    const product = makeProduct({ images });
+
+    mockLoadUser(user);
+    mockedProduct.findFirst.mockResolvedValueOnce(product);
+
+    const res = await request
+      .get("/api/v1/producers/me/products/product_001")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const responseImages = res.body.images as Array<Record<string, unknown>>;
+    // All 12 images must be present — no implicit pagination or cap
+    expect(responseImages).toHaveLength(N);
+    // Every input id must appear in the response (identity check, order-agnostic)
+    const returnedIds = responseImages.map((img) => img["id"] as string).sort();
+    const expectedIds = images.map((img) => img.id).sort();
+    expect(returnedIds).toEqual(expectedIds);
+  });
+
+  it("[PC4-IMG1] detail returns images mapped to { id, position, url } — s3Key absent (spec: wire shape)", async () => {
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+    const images = [
+      { id: "img_detail_001", position: 0, s3Key: "detail/img0.jpg", createdAt: new Date("2026-01-01T00:00:00Z") },
+      { id: "img_detail_002", position: 1, s3Key: "detail/img1.jpg", createdAt: new Date("2026-01-02T00:00:00Z") },
+    ];
+    const product = makeProduct({ images });
+
+    mockLoadUser(user);
+    mockedProduct.findFirst.mockResolvedValueOnce(product);
+
+    const res = await request
+      .get("/api/v1/producers/me/products/product_001")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const responseImages = res.body.images as Array<Record<string, unknown>>;
+    expect(responseImages).toHaveLength(2);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(responseImages[0]!.id).toBe("img_detail_001");
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(responseImages[0]!.position).toBe(0);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(typeof responseImages[0]!.url).toBe("string");
+    // The field name "s3Key" must not appear in the response body.
+    // Key path values appear inside the url field (by design) — only the field name is forbidden.
+    expect(JSON.stringify(res.body)).not.toContain('"s3Key"');
+    // Exact key-set allowlist: image objects must expose ONLY { id, position, url }.
+    // Any future field added to mapImageRow without updating this test will cause a failure.
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    expect(Object.keys(responseImages[0]!).sort()).toEqual(['id', 'position', 'url']);
   });
 });
 
