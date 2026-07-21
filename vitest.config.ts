@@ -21,6 +21,9 @@ export default defineConfig({
       AUTH0_AUDIENCE: "https://api.test.example",
       LOG_LEVEL: "error",
       CORS_ORIGIN: "*",
+      // Required after expose-product-images-in-producer-list Slice 1.
+      // Tests use https:// so the singleton boots cleanly in NODE_ENV=test.
+      S3_PUBLIC_BASE_URL: "https://test-cdn.example.com",
     },
     coverage: {
       provider: "v8",
