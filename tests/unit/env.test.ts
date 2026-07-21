@@ -18,7 +18,7 @@
  *   7. NODE_ENV=production + https:// URL → pass
  *   8. NODE_ENV=development + https:// URL → pass
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { parseEnv } from "@/shared/utils/env";
 
@@ -142,5 +142,57 @@ describe("S3_PUBLIC_BASE_URL: https:// in development", () => {
     };
     const result = parseEnv(input);
     expect(result.S3_PUBLIC_BASE_URL).toBe("https://cdn.example.com");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 9 — non-prod + http:// → console.warn emitted (downgrade notice)
+// Spec §"Non-HTTPS URL accepted outside production" + warn requirement:
+//   The app MUST emit a warn log when S3_PUBLIC_BASE_URL uses http:// in a
+//   non-production environment, so the configuration is not silently ignored.
+// ---------------------------------------------------------------------------
+describe("S3_PUBLIC_BASE_URL: warn log on non-prod http://", () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it("calls console.warn with a message mentioning S3_PUBLIC_BASE_URL and http:// when NODE_ENV=development", () => {
+    const input = {
+      ...BASE_VALID,
+      NODE_ENV: "development" as const,
+      S3_PUBLIC_BASE_URL: "http://cdn.example.com",
+    };
+
+    parseEnv(input);
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("S3_PUBLIC_BASE_URL"),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("http://"));
+  });
+
+  // Triangulation: https:// must NOT trigger the warn
+  it("does NOT call console.warn when NODE_ENV=development and S3_PUBLIC_BASE_URL uses https://", () => {
+    const input = {
+      ...BASE_VALID,
+      NODE_ENV: "development" as const,
+      S3_PUBLIC_BASE_URL: "https://cdn.example.com",
+    };
+
+    parseEnv(input);
+
+    // Warn must not have been called for this config (no downgrade, no noise)
+    const callsWithS3Mention = warnSpy.mock.calls.filter((args) =>
+      args.some(
+        (a) => typeof a === "string" && a.includes("S3_PUBLIC_BASE_URL"),
+      ),
+    );
+    expect(callsWithS3Mention).toHaveLength(0);
   });
 });
