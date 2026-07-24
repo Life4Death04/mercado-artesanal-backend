@@ -203,3 +203,49 @@ export class CategoryNotFoundError extends AppError {
   readonly status = 404;
   readonly title = "Category not found";
 }
+
+// ===========================================================================
+// Cycle 3 additions — cart slice (consumer-purchase-flow 1/3)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 409 — POST /carrito/items when Product.isActive = false
+//       Distinct from InsufficientStockError (owned by payments transactional decrement).
+// ---------------------------------------------------------------------------
+
+export class ProductInactiveError extends AppError {
+  readonly code = "PRODUCT_INACTIVE" as const;
+  readonly status = 409;
+  readonly title = "Product inactive";
+}
+
+// ---------------------------------------------------------------------------
+// 422 — POST or PATCH /carrito/items when quantity > Product.stock
+//       Informational check (Decision 2, obs #882) — no stock reservation.
+//       Distinct from InsufficientStockError (reserved for the hard decrement
+//       inside the payments checkout transaction).
+// ---------------------------------------------------------------------------
+
+export class QuantityExceedsStockError extends AppError {
+  readonly code = "QUANTITY_EXCEEDS_STOCK" as const;
+  readonly status = 422;
+  readonly title = "Quantity exceeds stock";
+}
+
+// ---------------------------------------------------------------------------
+// 501 — Endpoint route is wired but the handler is not implemented yet.
+//       Used by stub handlers introduced in a slice's foundation PR while
+//       later PRs fill in real behavior. Ensures every stub response still
+//       flows through errorMiddleware and uses the canonical RFC 7807
+//       Problem Details envelope (application/problem+json).
+// ---------------------------------------------------------------------------
+
+export class NotImplementedError extends AppError {
+  readonly code = "NOT_IMPLEMENTED" as const;
+  readonly status = 501;
+  readonly title = "Not implemented";
+
+  constructor(detail = "Endpoint not implemented yet", cause?: unknown) {
+    super(detail, cause);
+  }
+}
