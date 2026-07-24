@@ -231,3 +231,21 @@ export class QuantityExceedsStockError extends AppError {
   readonly status = 422;
   readonly title = "Quantity exceeds stock";
 }
+
+// ---------------------------------------------------------------------------
+// 501 — Endpoint route is wired but the handler is not implemented yet.
+//       Used by stub handlers introduced in a slice's foundation PR while
+//       later PRs fill in real behavior. Ensures every stub response still
+//       flows through errorMiddleware and uses the canonical RFC 7807
+//       Problem Details envelope (application/problem+json).
+// ---------------------------------------------------------------------------
+
+export class NotImplementedError extends AppError {
+  readonly code = "NOT_IMPLEMENTED" as const;
+  readonly status = 501;
+  readonly title = "Not implemented";
+
+  constructor(detail = "Endpoint not implemented yet", cause?: unknown) {
+    super(detail, cause);
+  }
+}

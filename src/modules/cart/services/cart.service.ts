@@ -24,7 +24,9 @@
  *            D4 (query-count seam), D5 (Zod 422)
  */
 
-import { prisma } from "@/shared/utils/prisma";
+// NOTE: `prisma` import intentionally omitted in PR #1. Stubs throw
+// NotImplementedError before touching the DB. PR #2/#3 will re-add the
+// import when the real handlers are wired in.
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -157,7 +159,3 @@ export async function getCartForCheckout(_userId: string): Promise<CartForChecko
   await Promise.resolve();
   throw new Error("NOT_IMPLEMENTED");
 }
-
-// Prevent "prisma imported but never used" lint error in the stub phase.
-// PR #2/#3 will replace stubs with real calls.
-void prisma;

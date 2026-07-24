@@ -17,7 +17,7 @@
  *   [D8] UpdateItemSchema — unknown keys rejected (strictObject policy)
  *
  * Spec references:
- *   cart §"Request DTOs" — productId: string (cuid), quantity: int min 1
+ *   cart §"Request DTOs" — productId: non-empty string, quantity: int min 1
  *   cart §D5 (Zod → 422 VALIDATION_FAILED via errorMiddleware)
  *   design — strictObject from @/shared/validation/zod (Cycle 2 policy)
  */

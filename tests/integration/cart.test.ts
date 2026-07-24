@@ -18,6 +18,10 @@
  *   [C-AUTH-4] DELETE /carrito/items/:itemId — 401 when no Authorization header
  *   [C-AUTH-5] DELETE /carrito — 401 when no Authorization header
  *   [C-ONBOARD-1] GET /carrito — 403 ONBOARDING_REQUIRED when user is PENDING_ROLE
+ *   [C-ONBOARD-2] POST /carrito/items — 403 ONBOARDING_REQUIRED when user is PENDING_ROLE
+ *   [C-ONBOARD-3] PATCH /carrito/items/:itemId — 403 ONBOARDING_REQUIRED when user is PENDING_ROLE
+ *   [C-ONBOARD-4] DELETE /carrito/items/:itemId — 403 ONBOARDING_REQUIRED when user is PENDING_ROLE
+ *   [C-ONBOARD-5] DELETE /carrito — 403 ONBOARDING_REQUIRED when user is PENDING_ROLE
  *   [C-STUB-1] GET /carrito — 501 NOT_IMPLEMENTED when auth passes (stub handler, PR #1)
  *
  * PR #2/#3 scenarios (GET behavior, POST, PATCH, DELETE handlers) are NOT tested here.
@@ -218,16 +222,67 @@ describe("Cart endpoints — 403 ONBOARDING_REQUIRED for PENDING_ROLE user", () 
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
   });
+
+  it("[C-ONBOARD-2] POST /api/v1/carrito/items — 403 when user is PENDING_ROLE", async () => {
+    const pendingUser = makeUser({ role: "PENDING_ROLE" });
+    mockLoadUser(pendingUser);
+
+    const res = await request
+      .post("/api/v1/carrito/items")
+      .set("x-test-auth", authHeader(consumerClaim()))
+      .send({ productId: "some-product-id", quantity: 1 });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
+  });
+
+  it("[C-ONBOARD-3] PATCH /api/v1/carrito/items/:productId — 403 when user is PENDING_ROLE", async () => {
+    const pendingUser = makeUser({ role: "PENDING_ROLE" });
+    mockLoadUser(pendingUser);
+
+    const res = await request
+      .patch("/api/v1/carrito/items/some-product-id")
+      .set("x-test-auth", authHeader(consumerClaim()))
+      .send({ quantity: 2 });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
+  });
+
+  it("[C-ONBOARD-4] DELETE /api/v1/carrito/items/:productId — 403 when user is PENDING_ROLE", async () => {
+    const pendingUser = makeUser({ role: "PENDING_ROLE" });
+    mockLoadUser(pendingUser);
+
+    const res = await request
+      .delete("/api/v1/carrito/items/some-product-id")
+      .set("x-test-auth", authHeader(consumerClaim()));
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
+  });
+
+  it("[C-ONBOARD-5] DELETE /api/v1/carrito — 403 when user is PENDING_ROLE", async () => {
+    const pendingUser = makeUser({ role: "PENDING_ROLE" });
+    mockLoadUser(pendingUser);
+
+    const res = await request
+      .delete("/api/v1/carrito")
+      .set("x-test-auth", authHeader(consumerClaim()));
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
+  });
 });
 
 // ---------------------------------------------------------------------------
-// [C-STUB] Auth passes → 501 NOT_IMPLEMENTED (PR #1 stub policy — design suggestion #2)
-// These tests prove the middleware chain is fully wired and the router is mounted.
+// [C-STUB] Auth passes → 501 NOT_IMPLEMENTED via RFC 7807 envelope (PR #1 stub policy).
+// These tests prove the middleware chain is fully wired, the router is mounted,
+// and the stub response flows through errorMiddleware (application/problem+json).
 // PR #2 will replace them with real behavior assertions.
 // ---------------------------------------------------------------------------
 
 describe("Cart endpoints — 501 stub when auth passes (PR #1 wiring proof)", () => {
-  it("[C-STUB-1] GET /api/v1/carrito — 501 when authenticated CONSUMER (stub handler)", async () => {
+  it("[C-STUB-1] GET /api/v1/carrito — 501 NOT_IMPLEMENTED envelope when authenticated CONSUMER", async () => {
     const user = makeUser();
     mockLoadUser(user);
 
@@ -236,5 +291,11 @@ describe("Cart endpoints — 501 stub when auth passes (PR #1 wiring proof)", ()
       .set("x-test-auth", authHeader(consumerClaim()));
 
     expect(res.status).toBe(501);
+    expect(res.headers["content-type"]).toContain("application/problem+json");
+    expect(res.body).toMatchObject({
+      code: "NOT_IMPLEMENTED",
+      status: 501,
+      title: "Not implemented",
+    });
   });
 });
