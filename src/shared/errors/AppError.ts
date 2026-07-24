@@ -9,7 +9,8 @@
  * Semantic code registry (per error-handling spec):
  *   UNAUTHORIZED, FORBIDDEN, ONBOARDING_REQUIRED, NOT_FOUND,
  *   ROLE_ALREADY_SET, NIF_ALREADY_REGISTERED, VALIDATION_FAILED,
- *   UNKNOWN_CATEGORY, INVALID_DEFAULT_TRANSITION, INTERNAL_ERROR.
+ *   UNKNOWN_CATEGORY, INVALID_DEFAULT_TRANSITION, INTERNAL_ERROR,
+ *   PRODUCT_INACTIVE, QUANTITY_EXCEEDS_STOCK.
  *
  * Wire shape (RFC 7807):
  *   { type, title, status, detail, code, instance, errors? }
@@ -36,7 +37,10 @@ export type ErrorCode =
   | "INVALID_ORDER_TRANSITION"
   | "DELIVERY_MODE_NOT_FOUND"
   | "IMAGE_UPLOAD_INVALID"
-  | "CATEGORY_NOT_FOUND";
+  | "CATEGORY_NOT_FOUND"
+  // Cycle 3 additions
+  | "PRODUCT_INACTIVE"
+  | "QUANTITY_EXCEEDS_STOCK";
 
 export interface ProblemDetails {
   type: string;

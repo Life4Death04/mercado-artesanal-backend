@@ -1,5 +1,5 @@
 // prisma/schema.prisma
-// Authoritative schema — Cycle 2 (producer-environment), after Slice 1b schema-orders.
+// Authoritative schema — Cycle 3 (consumer-purchase-flow), after cart foundation (PR #1).
 // Any change requires a new migration via `prisma migrate dev`.
 
 generator client {
@@ -38,6 +38,7 @@ model User {
 
   producer  Producer?
   addresses Address[]
+  cart      Cart?
 
   @@index([auth0Sub])
   @@map("users")
@@ -241,6 +242,7 @@ model Product {
   category   Category       @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   images     ProductImage[]
   orderLines OrderLine[]
+  cartItems  CartItem[]
 
   @@index([producerId, isActive])
   @@index([categoryId, isActive])
@@ -365,4 +367,43 @@ model OrderLine {
   product  Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
 
   @@map("order_lines")
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 3 — Cart models (consumer-purchase-flow 1/3)
+// ---------------------------------------------------------------------------
+
+/// Consumer shopping cart — one per user, lazy-created on first item add.
+/// userId @unique enforces one-cart-per-user and enables race-safe upsert.
+/// Cleared (items deleted, Cart row preserved) on DELETE /carrito.
+model Cart {
+  id        String     @id @default(cuid())
+  userId    String     @unique @map("user_id")
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items     CartItem[]
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+
+  @@map("carts")
+}
+
+/// Line item inside a Cart. unitPriceSnapshot is written ONCE at add time
+/// and MUST NOT be rewritten by any subsequent operation (Decision 1, obs #882).
+/// @@unique([cartId, productId]) enables race-safe upsert and prevents duplicate rows.
+/// onDelete: Restrict on Product prevents accidental cascade on product hard-delete;
+/// producers soft-delete products (isActive=false), not hard-delete.
+model CartItem {
+  id                String   @id @default(cuid())
+  cartId            String   @map("cart_id")
+  cart              Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  productId         String   @map("product_id")
+  product           Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity          Int
+  unitPriceSnapshot Decimal  @db.Decimal(10, 2) @map("unit_price_snapshot")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@unique([cartId, productId], name: "cart_product_unique")
+  @@index([cartId])
+  @@map("cart_items")
 }
