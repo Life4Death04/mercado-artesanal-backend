@@ -18,15 +18,23 @@
  * All multi-row state transitions run inside `prisma.$transaction(async (tx) => { ... })`
  * callback form (NOT the array form) — required by the test mock strategy (D3, obs #887).
  *
+ * PR #2 note (producer.isActive derivation): the `Producer` Prisma model has
+ * NO `isActive` boolean field — it uses `deletedAt: DateTime | null` for
+ * soft-delete (see prisma/schema.prisma). The spec/design wire shape declares
+ * `producer.isActive: boolean`, so this service derives it as
+ * `producer.deletedAt === null`. This preserves the design's INTENT (an
+ * inactive/removed producer makes its items unavailable) without a schema
+ * field that does not exist. Flagged as a spec/design correction candidate
+ * for the next revision — see apply-progress deviations.
+ *
  * Spec references:
  *   cart §R1–R8 — full requirement set
  *   design — D1 (error taxonomy), D2 (synthetic empty view), D3 ($transaction callback),
  *            D4 (query-count seam), D5 (Zod 422)
  */
+import type { Prisma } from "@prisma/client";
 
-// NOTE: `prisma` import intentionally omitted in PR #1. Stubs throw
-// NotImplementedError before touching the DB. PR #2/#3 will re-add the
-// import when the real handlers are wired in.
+import { prisma } from "@/shared/utils/prisma";
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -87,7 +95,63 @@ export interface CartForCheckout {
 }
 
 // ---------------------------------------------------------------------------
-// Service functions — STUB implementations for PR #1
+// Internal row shapes (nested Prisma includes) — mapping helpers only
+// ---------------------------------------------------------------------------
+
+type ProducerRow = { id: string; deletedAt: Date | null };
+type ProductRow = {
+  id: string;
+  name: string;
+  price: Prisma.Decimal;
+  stock: number;
+  isActive: boolean;
+  producer: ProducerRow;
+};
+type CartItemRow = {
+  id: string;
+  productId: string;
+  quantity: number;
+  unitPriceSnapshot: Prisma.Decimal;
+  createdAt: Date;
+  updatedAt: Date;
+  product: ProductRow;
+};
+
+/**
+ * Computes item availability: product is active AND its producer is not
+ * soft-deleted. See file header note on the producer.isActive derivation.
+ */
+function computeIsAvailable(product: ProductRow): boolean {
+  return product.isActive && product.producer.deletedAt === null;
+}
+
+/** Maps a Prisma CartItem row (with nested product+producer) to the wire shape. */
+function mapCartItemView(item: CartItemRow): CartItemView {
+  const { product } = item;
+  return {
+    id: item.id,
+    productId: item.productId,
+    quantity: item.quantity,
+    unitPriceSnapshot: item.unitPriceSnapshot.toFixed(2),
+    isAvailable: computeIsAvailable(product),
+    product: {
+      id: product.id,
+      name: product.name,
+      price: product.price.toFixed(2),
+      stock: product.stock,
+      isActive: product.isActive,
+      producer: {
+        id: product.producer.id,
+        isActive: product.producer.deletedAt === null,
+      },
+    },
+    createdAt: item.createdAt.toISOString(),
+    updatedAt: item.updatedAt.toISOString(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Service functions
 // PR #2 implements: getCartView, addItem
 // PR #3 implements: updateItemQuantity, removeItem, clearCart, getCartForCheckout
 // ---------------------------------------------------------------------------
@@ -95,18 +159,40 @@ export interface CartForCheckout {
 /**
  * GET /carrito — return cart + computed availability for each item.
  * Returns synthetic empty view when user has no Cart row (D2).
- * STUB in PR #1 — implemented in PR #2.
+ *
+ * NFR-1: issues exactly ONE Prisma query — a single `cart.findUnique` with a
+ * nested `include` (no N+1, no second round trip for items/product/producer).
  */
-export async function getCartView(_userId: string): Promise<CartReadView> {
-  // PR #1 stub — returns 501 via controller; actual implementation in PR #2
-  await Promise.resolve();
-  throw new Error("NOT_IMPLEMENTED");
+export async function getCartView(userId: string): Promise<CartReadView> {
+  const cart = await prisma.cart.findUnique({
+    where: { userId },
+    include: {
+      items: {
+        include: {
+          product: { include: { producer: true } },
+        },
+      },
+    },
+  });
+
+  if (!cart) {
+    // D2 — synthetic empty view, no lazy-create on read.
+    return { id: null, userId, items: [], createdAt: null, updatedAt: null };
+  }
+
+  return {
+    id: cart.id,
+    userId: cart.userId,
+    items: cart.items.map((item) => mapCartItemView(item as CartItemRow)),
+    createdAt: cart.createdAt.toISOString(),
+    updatedAt: cart.updatedAt.toISOString(),
+  };
 }
 
 /**
  * POST /carrito/items — add or increment an item with price snapshotting.
  * Creates Cart row if it doesn't exist (double-upsert pattern, D3).
- * STUB in PR #1 — implemented in PR #2.
+ * STUB — implemented in the next commit (WU3-T1).
  */
 export async function addItem(
   _userId: string,

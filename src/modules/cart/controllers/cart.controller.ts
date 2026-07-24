@@ -5,25 +5,25 @@
  * cart.service, and serializes responses. All domain errors are thrown
  * and caught by the central errorMiddleware (RFC 7807).
  *
- * PR #1 stub policy: all handlers throw NotImplementedError (501). The
- * errorMiddleware serializes it as application/problem+json with code
- * NOT_IMPLEMENTED, keeping stubs on the canonical error envelope.
- * PR #2 will implement: getCart, addItem
- * PR #3 will implement: updateItem, removeItem, clearCart
+ * PR #2 implements: getCart, addItem (real behavior).
+ * PR #3 will implement: updateItem, removeItem, clearCart. Those three
+ * remain PR #1 stubs — they throw NotImplementedError (501) so the
+ * response still goes through errorMiddleware and uses the canonical
+ * application/problem+json envelope.
  *
- * Response codes (target — implemented in PR #2/#3):
- *   GET  /carrito               → 200 CartReadView
- *   POST /carrito/items         → 201 CartItemView
- *   PATCH /carrito/items/:id    → 200 CartItemView
- *   DELETE /carrito/items/:id   → 204 No Content
- *   DELETE /carrito             → 200 CartReadView (empty items)
+ * Response codes:
+ *   GET  /carrito               → 200 CartReadView                  (PR #2)
+ *   POST /carrito/items         → 201 CartItemView                  (PR #2)
+ *   PATCH /carrito/items/:id    → 200 CartItemView                  (PR #3 stub)
+ *   DELETE /carrito/items/:id   → 204 No Content                    (PR #3 stub)
+ *   DELETE /carrito             → 200 CartReadView (empty items)     (PR #3 stub)
  *
  * Auth chain (design Data Flow, verified against addresses.routes.ts:33):
  *   authenticate → loadUser → onboardingGate → requireRole(CONSUMER|PRODUCER|ADMIN) → controller
  *
  * The auth chain guarantees req.user is populated before any handler runs;
  * a missing user would surface as 401/403 upstream, so handlers do not
- * re-check it.
+ * re-check it (matches judgment-day fix in PR #1 — see cart.service.ts header).
  *
  * Spec references:
  *   cart §R1–R8 — full requirement set
@@ -34,23 +34,17 @@ import type { NextFunction, Request, Response } from "express";
 
 import { NotImplementedError } from "@/shared/errors/errors";
 
-// ---------------------------------------------------------------------------
-// PR #1 stubs — throw NotImplementedError (501) so the response goes through
-// errorMiddleware and uses the RFC 7807 Problem Details envelope. Full
-// implementations arrive in PR #2 (getCart, addItem) and PR #3 (rest).
-// The middleware chain is wired NOW (in cart.routes.ts) so PR #2/#3 only
-// need to fill these handlers.
-// ---------------------------------------------------------------------------
+import * as cartService from "../services/cart.service";
 
 /**
  * GET /api/v1/carrito
  * Returns cart + items + computed isAvailable for the authenticated user.
+ * Returns the synthetic empty view (D2) when the user has no Cart row yet.
  */
-export async function getCart(_req: Request, _res: Response, next: NextFunction): Promise<void> {
+export async function getCart(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    // TODO(PR #2): implement via cartService.getCartView(req.user.id)
-    await Promise.resolve();
-    throw new NotImplementedError("GET /carrito not yet implemented");
+    const view = await cartService.getCartView(req.user!.id);
+    res.status(200).json(view);
   } catch (err) {
     next(err);
   }
@@ -59,16 +53,23 @@ export async function getCart(_req: Request, _res: Response, next: NextFunction)
 /**
  * POST /api/v1/carrito/items
  * Adds or increments a cart item with price snapshotting.
+ * STUB — implemented in the next commit (WU3-T1).
  */
 export async function addItem(_req: Request, _res: Response, next: NextFunction): Promise<void> {
   try {
-    // TODO(PR #2): validate body, call cartService.addItem(req.user.id, productId, quantity)
     await Promise.resolve();
     throw new NotImplementedError("POST /carrito/items not yet implemented");
   } catch (err) {
     next(err);
   }
 }
+
+// ---------------------------------------------------------------------------
+// PR #3 stubs — throw NotImplementedError (501) so the response goes through
+// errorMiddleware and uses the RFC 7807 Problem Details envelope. The
+// middleware chain is already wired (cart.routes.ts); PR #3 only needs to
+// fill these handlers.
+// ---------------------------------------------------------------------------
 
 /**
  * PATCH /api/v1/carrito/items/:itemId

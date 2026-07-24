@@ -1,5 +1,5 @@
 /**
- * Integration tests — cart endpoints (cycle-3/cart, PR #1 foundation harness).
+ * Integration tests — cart endpoints (cycle-3/cart).
  *
  * Strategy: mock prisma singleton and express-oauth2-jwt-bearer so tests
  * exercise the full wire contract (routing, middleware chain, request/response
@@ -22,14 +22,18 @@
  *   [C-ONBOARD-3] PATCH /carrito/items/:itemId — 403 ONBOARDING_REQUIRED when user is PENDING_ROLE
  *   [C-ONBOARD-4] DELETE /carrito/items/:itemId — 403 ONBOARDING_REQUIRED when user is PENDING_ROLE
  *   [C-ONBOARD-5] DELETE /carrito — 403 ONBOARDING_REQUIRED when user is PENDING_ROLE
- *   [C-STUB-1] GET /carrito — 501 NOT_IMPLEMENTED when auth passes (stub handler, PR #1)
  *
- * PR #2/#3 scenarios (GET behavior, POST, PATCH, DELETE handlers) are NOT tested here.
- * This file exists so PR #2/#3 can add tests immediately in the correct location.
+ * This commit's scenarios (spec §R2 GET):
+ *   [C-GET-1] GET /carrito — 200 synthetic empty view when no Cart row exists
+ *   [C-GET-2] GET /carrito — 200 populated view with computed isAvailable
+ *
+ * Next commit adds POST /carrito/items scenarios [C-POST-1..4].
+ * PR #3 scenarios (PATCH, DELETE handlers) remain stubs — NOT tested here.
  *
  * Spec references:
  *   cart §R7 "All endpoints require authenticated, onboarded users with a completed role"
  *   cart §"Scenario: Missing JWT returns 401"
+ *   cart §"Scenario: Empty cart returns 200 with empty items"
  *   cart §API Contracts — full middleware chain: authenticate → loadUser → onboardingGate → requireRole
  *   design — Data Flow, guard chain verified against addresses.routes.ts:33 precedent
  */
@@ -97,15 +101,21 @@ vi.mock("@/shared/utils/prisma", () => {
 });
 
 import type { User } from "@prisma/client";
+import { Decimal } from "@prisma/client/runtime/library";
 import { prisma } from "@/shared/utils/prisma";
 import { createApp } from "@/app";
 
 // ---------------------------------------------------------------------------
 // Typed mock helpers
+// `vi.mocked()` preserves the real Prisma delegate signatures, which are not
+// recognized as Mock instances by TS — cast at the delegate level (matches
+// tests/unit/producers.service.test.ts / sub-orders.read.service.test.ts).
 // ---------------------------------------------------------------------------
 const mockedPrisma = vi.mocked(prisma);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedUser = mockedPrisma.user as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedCart = mockedPrisma.cart as any;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -140,6 +150,77 @@ function makeUser(overrides: Partial<User> = {}): User {
 function mockLoadUser(user: User | null): void {
   const projection = user ? { id: user.id, role: user.role, email: user.email } : null;
   mockedUser.findUnique.mockResolvedValueOnce(projection);
+}
+
+function makeProducer(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "producer_cart_001",
+    userId: "user_producer_cart_001",
+    businessName: "Cart Test Producer",
+    nif: "B12345674",
+    description: "A test producer",
+    addressLine1: "Calle Test 1",
+    addressLine2: null,
+    addressCity: "Madrid",
+    addressPostalCode: "28001",
+    addressProvince: "Madrid",
+    addressCountry: "ES",
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+    deletedAt: null,
+    ...overrides,
+  };
+}
+
+function makeProduct(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "product_cart_001",
+    producerId: "producer_cart_001",
+    categoryId: "cat_cart_001",
+    name: "Aceite de Oliva",
+    description: "Aceite artesanal.",
+    price: new Decimal("12.50"),
+    stock: 10,
+    lowStockThreshold: 5,
+    isActive: true,
+    ingredients: null,
+    allergens: [],
+    weight: null,
+    presentation: null,
+    reportedAt: null,
+    moderationStatus: "OK",
+    reportReason: null,
+    deletedAt: null,
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+    producer: makeProducer(),
+    ...overrides,
+  };
+}
+
+function makeCartItem(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "item_cart_001",
+    cartId: "cart_cart_001",
+    productId: "product_cart_001",
+    quantity: 2,
+    unitPriceSnapshot: new Decimal("12.50"),
+    createdAt: new Date("2026-01-02T00:00:00Z"),
+    updatedAt: new Date("2026-01-02T00:00:00Z"),
+    product: makeProduct(),
+    ...overrides,
+  };
+}
+
+function makeCart(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "cart_cart_001",
+    userId: "cuid_cart_user_001",
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+    items: [] as unknown[],
+    ...overrides,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -275,27 +356,43 @@ describe("Cart endpoints — 403 ONBOARDING_REQUIRED for PENDING_ROLE user", () 
 });
 
 // ---------------------------------------------------------------------------
-// [C-STUB] Auth passes → 501 NOT_IMPLEMENTED via RFC 7807 envelope (PR #1 stub policy).
-// These tests prove the middleware chain is fully wired, the router is mounted,
-// and the stub response flows through errorMiddleware (application/problem+json).
-// PR #2 will replace them with real behavior assertions.
+// [C-GET] GET /carrito — real behavior (PR #2)
 // ---------------------------------------------------------------------------
 
-describe("Cart endpoints — 501 stub when auth passes (PR #1 wiring proof)", () => {
-  it("[C-STUB-1] GET /api/v1/carrito — 501 NOT_IMPLEMENTED envelope when authenticated CONSUMER", async () => {
+describe("GET /api/v1/carrito — real behavior (PR #2)", () => {
+  it("[C-GET-1] returns 200 with synthetic empty view when the user has no Cart row", async () => {
     const user = makeUser();
     mockLoadUser(user);
+    mockedCart.findUnique.mockResolvedValueOnce(null);
 
-    const res = await request
-      .get("/api/v1/carrito")
-      .set("x-test-auth", authHeader(consumerClaim()));
+    const res = await request.get("/api/v1/carrito").set("x-test-auth", authHeader(consumerClaim()));
 
-    expect(res.status).toBe(501);
-    expect(res.headers["content-type"]).toContain("application/problem+json");
-    expect(res.body).toMatchObject({
-      code: "NOT_IMPLEMENTED",
-      status: 501,
-      title: "Not implemented",
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      id: null,
+      userId: user.id,
+      items: [],
+      createdAt: null,
+      updatedAt: null,
+    });
+  });
+
+  it("[C-GET-2] returns 200 with populated items and computed isAvailable", async () => {
+    const user = makeUser();
+    mockLoadUser(user);
+    const cart = makeCart({ userId: user.id, items: [makeCartItem()] });
+    mockedCart.findUnique.mockResolvedValueOnce(cart);
+
+    const res = await request.get("/api/v1/carrito").set("x-test-auth", authHeader(consumerClaim()));
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe("cart_cart_001");
+    expect(res.body.items).toHaveLength(1);
+    expect(res.body.items[0]).toMatchObject({
+      productId: "product_cart_001",
+      quantity: 2,
+      unitPriceSnapshot: "12.50",
+      isAvailable: true,
     });
   });
 });
