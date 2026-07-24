@@ -236,7 +236,7 @@ describe("Cart endpoints — 403 ONBOARDING_REQUIRED for PENDING_ROLE user", () 
     expect(res.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
   });
 
-  it("[C-ONBOARD-3] PATCH /api/v1/carrito/items/:productId — 403 when user is PENDING_ROLE", async () => {
+  it("[C-ONBOARD-3] PATCH /api/v1/carrito/items/:itemId — 403 when user is PENDING_ROLE", async () => {
     const pendingUser = makeUser({ role: "PENDING_ROLE" });
     mockLoadUser(pendingUser);
 
@@ -249,7 +249,7 @@ describe("Cart endpoints — 403 ONBOARDING_REQUIRED for PENDING_ROLE user", () 
     expect(res.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
   });
 
-  it("[C-ONBOARD-4] DELETE /api/v1/carrito/items/:productId — 403 when user is PENDING_ROLE", async () => {
+  it("[C-ONBOARD-4] DELETE /api/v1/carrito/items/:itemId — 403 when user is PENDING_ROLE", async () => {
     const pendingUser = makeUser({ role: "PENDING_ROLE" });
     mockLoadUser(pendingUser);
 
