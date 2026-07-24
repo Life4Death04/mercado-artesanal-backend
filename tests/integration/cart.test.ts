@@ -23,17 +23,23 @@
  *   [C-ONBOARD-4] DELETE /carrito/items/:itemId — 403 ONBOARDING_REQUIRED when user is PENDING_ROLE
  *   [C-ONBOARD-5] DELETE /carrito — 403 ONBOARDING_REQUIRED when user is PENDING_ROLE
  *
- * This commit's scenarios (spec §R2 GET):
+ * PR #2 Scenarios covered (spec §R2 GET, §R1/§R3 POST):
  *   [C-GET-1] GET /carrito — 200 synthetic empty view when no Cart row exists
  *   [C-GET-2] GET /carrito — 200 populated view with computed isAvailable
+ *   [C-POST-1] POST /carrito/items — 201 on successful add (new item)
+ *   [C-POST-2] POST /carrito/items — 409 PRODUCT_INACTIVE when product is inactive
+ *   [C-POST-3] POST /carrito/items — 422 QUANTITY_EXCEEDS_STOCK when quantity > stock
+ *   [C-POST-4] POST /carrito/items — 422 VALIDATION_FAILED on malformed body (Zod)
  *
- * Next commit adds POST /carrito/items scenarios [C-POST-1..4].
  * PR #3 scenarios (PATCH, DELETE handlers) remain stubs — NOT tested here.
  *
  * Spec references:
  *   cart §R7 "All endpoints require authenticated, onboarded users with a completed role"
  *   cart §"Scenario: Missing JWT returns 401"
  *   cart §"Scenario: Empty cart returns 200 with empty items"
+ *   cart §"Scenario: Adding a new product writes the live price into snapshot"
+ *   cart §"Scenario: Adding an inactive product is rejected"
+ *   cart §"Scenario: Quantity exceeding live stock is rejected"
  *   cart §API Contracts — full middleware chain: authenticate → loadUser → onboardingGate → requireRole
  *   design — Data Flow, guard chain verified against addresses.routes.ts:33 precedent
  */
@@ -116,6 +122,10 @@ const mockedPrisma = vi.mocked(prisma);
 const mockedUser = mockedPrisma.user as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedCart = mockedPrisma.cart as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedProduct = mockedPrisma.product as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedTransaction = mockedPrisma.$transaction as any;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -394,5 +404,82 @@ describe("GET /api/v1/carrito — real behavior (PR #2)", () => {
       unitPriceSnapshot: "12.50",
       isAvailable: true,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// [C-POST] POST /carrito/items — real behavior (PR #2)
+// ---------------------------------------------------------------------------
+
+describe("POST /api/v1/carrito/items — real behavior (PR #2)", () => {
+  it("[C-POST-1] returns 201 and snapshots the live price on a successful add", async () => {
+    const user = makeUser();
+    mockLoadUser(user);
+    const product = makeProduct({ price: new Decimal("12.50"), stock: 10 });
+    mockedProduct.findUnique.mockResolvedValueOnce(product);
+
+    const cartUpsert = vi.fn().mockResolvedValue({ id: "cart_cart_001", userId: user.id });
+    const cartItemUpsert = vi
+      .fn()
+      .mockResolvedValue(makeCartItem({ quantity: 2, unitPriceSnapshot: new Decimal("12.50"), product }));
+    mockedTransaction.mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn({ cart: { upsert: cartUpsert }, cartItem: { upsert: cartItemUpsert } }),
+    );
+
+    const res = await request
+      .post("/api/v1/carrito/items")
+      .set("x-test-auth", authHeader(consumerClaim()))
+      .send({ productId: "product_cart_001", quantity: 2 });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({
+      productId: "product_cart_001",
+      quantity: 2,
+      unitPriceSnapshot: "12.50",
+    });
+  });
+
+  it("[C-POST-2] returns 409 PRODUCT_INACTIVE when the product is inactive", async () => {
+    const user = makeUser();
+    mockLoadUser(user);
+    mockedProduct.findUnique.mockResolvedValueOnce(makeProduct({ isActive: false }));
+
+    const res = await request
+      .post("/api/v1/carrito/items")
+      .set("x-test-auth", authHeader(consumerClaim()))
+      .send({ productId: "product_cart_001", quantity: 1 });
+
+    expect(res.status).toBe(409);
+    expect(res.headers["content-type"]).toContain("application/problem+json");
+    expect(res.body).toMatchObject({ code: "PRODUCT_INACTIVE" });
+  });
+
+  it("[C-POST-3] returns 422 QUANTITY_EXCEEDS_STOCK when quantity exceeds live stock", async () => {
+    const user = makeUser();
+    mockLoadUser(user);
+    mockedProduct.findUnique.mockResolvedValueOnce(makeProduct({ stock: 3, isActive: true }));
+
+    const res = await request
+      .post("/api/v1/carrito/items")
+      .set("x-test-auth", authHeader(consumerClaim()))
+      .send({ productId: "product_cart_001", quantity: 5 });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ code: "QUANTITY_EXCEEDS_STOCK" });
+  });
+
+  it("[C-POST-4] returns 422 VALIDATION_FAILED on malformed body (Zod, quantity < 1)", async () => {
+    const user = makeUser();
+    mockLoadUser(user);
+
+    const res = await request
+      .post("/api/v1/carrito/items")
+      .set("x-test-auth", authHeader(consumerClaim()))
+      .send({ productId: "product_cart_001", quantity: 0 });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ code: "VALIDATION_FAILED" });
+    // Product lookup must NOT happen — Zod validation runs before service call
+    expect(mockedProduct.findUnique).not.toHaveBeenCalled();
   });
 });

@@ -3,10 +3,10 @@
  *
  * Strategy: mock prisma singleton so no DB is required.
  * This file is the unit-test HOME for the entire cart slice.
- * PR #1 created this file as a harness. PR #2 adds behavioral suites
- * (getCartView first, addItem in the next commit) under strict TDD.
+ * PR #1 created this file as a harness. PR #2 adds the first two
+ * behavioral suites (getCartView, addItem) under strict TDD.
  *
- * This commit's scenarios (spec §R2 GET):
+ * PR #2 scenarios covered (spec §R2 GET, §R1/§R3 POST):
  *   getCartView:
  *     [G1] synthetic empty view when no Cart row exists (R2-S1, D2)
  *     [G2] populated view maps items with computed isAvailable (R2-S2)
@@ -14,14 +14,20 @@
  *          cart/cartItem/product delegate calls (NFR-1, D4)
  *     [G4] isAvailable = false when Product.isActive = false (R2-S3)
  *     [G5] isAvailable = false when Producer is soft-deleted (R2-S4)
+ *   addItem:
+ *     [A1] first add creates cart + item, snapshot = live Product.price (R1-S1, R3-S1)
+ *     [A2] re-add same product increments quantity, snapshot untouched (R3-S2)
+ *     [A3] unknown productId → NotFoundError, no $transaction opened
+ *     [A4] Product.isActive = false → ProductInactiveError (409), no $transaction opened (R3-S3)
+ *     [A5] quantity > Product.stock → QuantityExceedsStockError (422), no $transaction opened (R3-S4)
+ *     [A6] NFR-3 no find-then-create — cart.findUnique is NEVER called by addItem (upsert only)
  *
- * Next commit adds: addItem (WU3-T1) scenarios [A1]-[A6]
  * PR #3 will add: updateItemQuantity, removeItem, clearCart, getCartForCheckout
  *
  * Spec references:
- *   cart §R2 — GET /carrito availability computation
- *   design — D2 (synthetic empty view), D4 (delegate-count assertions,
- *            complementary to integration proof)
+ *   cart §R1–R3 — cart identity, GET availability, POST add-with-snapshot
+ *   design — D2 (synthetic empty view), D3 ($transaction callback form),
+ *            D4 (delegate-count assertions, complementary to integration proof)
  *   design — TDD ordering: schema+skeleton → GET/POST → PATCH/DELETE/checkout
  */
 import { Decimal } from "@prisma/client/runtime/library";
@@ -54,6 +60,7 @@ vi.mock("@/shared/utils/prisma", () => {
 });
 
 import { prisma } from "@/shared/utils/prisma";
+import { NotFoundError, ProductInactiveError, QuantityExceedsStockError } from "@/shared/errors/errors";
 // Service import — behavioral exports populated across PR #2/#3
 import * as cartService from "@/modules/cart/services/cart.service";
 
@@ -66,6 +73,8 @@ const mockedPrisma = vi.mocked(prisma);
 // matches the established pattern in producers.service.test.ts / sub-orders.read.service.test.ts.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedCartFindUnique = mockedPrisma.cart.findUnique as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedProductFindUnique = mockedPrisma.product.findUnique as any;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -266,5 +275,124 @@ describe("cartService.getCartView — availability computation [G4][G5]", () => 
     expect(view.items[0]!.isAvailable).toBe(false);
     expect(view.items[0]!.product.isActive).toBe(true);
     expect(view.items[0]!.product.producer.isActive).toBe(false);
+  });
+});
+
+// ===========================================================================
+// addItem (PR #2, WU3-T1)
+// ===========================================================================
+
+describe("cartService.addItem — first add creates cart + item with live-price snapshot [A1]", () => {
+  it("[A1] creates the cart (upsert) + item (upsert-create) and snapshots the live Product.price", async () => {
+    const product = makeProduct({ price: new Decimal("12.50"), stock: 10 });
+    mockedProductFindUnique.mockResolvedValueOnce(product);
+
+    const cartUpsert = vi.fn().mockResolvedValue({ id: "cart_001", userId: "user_001" });
+    const cartItemUpsert = vi.fn().mockResolvedValue(
+      makeCartItem({ quantity: 2, unitPriceSnapshot: new Decimal("12.50"), product }),
+    );
+    mockedPrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
+      const tx = { cart: { upsert: cartUpsert }, cartItem: { upsert: cartItemUpsert } };
+      return (fn as (tx: unknown) => Promise<unknown>)(tx);
+    });
+
+    const result = await cartService.addItem("user_001", "product_001", 2);
+
+    // Cart-level upsert keyed on userId (D3)
+    expect(cartUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { userId: "user_001" } }),
+    );
+    // Item-level upsert: CREATE branch snapshots the live price
+    expect(cartItemUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { cart_product_unique: { cartId: "cart_001", productId: "product_001" } },
+        create: expect.objectContaining({ quantity: 2, unitPriceSnapshot: product.price }),
+      }),
+    );
+    expect(result.unitPriceSnapshot).toBe("12.50");
+    expect(result.quantity).toBe(2);
+  });
+});
+
+describe("cartService.addItem — re-add preserves original snapshot [A2]", () => {
+  it("[A2] re-adding an existing product increments quantity via UPDATE branch without touching unitPriceSnapshot", async () => {
+    // Live price has drifted to 15.00, but the UPDATE branch must not reference it.
+    const product = makeProduct({ price: new Decimal("15.00"), stock: 10 });
+    mockedProductFindUnique.mockResolvedValueOnce(product);
+
+    const cartUpsert = vi.fn().mockResolvedValue({ id: "cart_001", userId: "user_001" });
+    const cartItemUpsert = vi.fn().mockResolvedValue(
+      makeCartItem({ quantity: 5, unitPriceSnapshot: new Decimal("12.50"), product }),
+    );
+    mockedPrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
+      const tx = { cart: { upsert: cartUpsert }, cartItem: { upsert: cartItemUpsert } };
+      return (fn as (tx: unknown) => Promise<unknown>)(tx);
+    });
+
+    const result = await cartService.addItem("user_001", "product_001", 3);
+
+    const call = cartItemUpsert.mock.calls[0]![0] as { update: Record<string, unknown> };
+    // UPDATE branch must NOT include unitPriceSnapshot (NFR-2 immutability)
+    expect(call.update).not.toHaveProperty("unitPriceSnapshot");
+    expect(call.update).toEqual(expect.objectContaining({ quantity: { increment: 3 } }));
+    // Result reflects the preserved (pre-drift) snapshot, not the live drifted price
+    expect(result.unitPriceSnapshot).toBe("12.50");
+  });
+});
+
+describe("cartService.addItem — validation error branches [A3][A4][A5]", () => {
+  it("[A3] unknown productId → NotFoundError, no $transaction opened", async () => {
+    mockedProductFindUnique.mockResolvedValueOnce(null);
+
+    await expect(cartService.addItem("user_001", "missing_product", 1)).rejects.toThrow(
+      NotFoundError,
+    );
+    expect(mockedPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("[A4] Product.isActive = false → ProductInactiveError (409), no $transaction opened", async () => {
+    mockedProductFindUnique.mockResolvedValueOnce(
+      makeProduct({ isActive: false }),
+    );
+
+    const err = await cartService
+      .addItem("user_001", "product_001", 1)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ProductInactiveError);
+    expect((err as ProductInactiveError).status).toBe(409);
+    expect((err as ProductInactiveError).code).toBe("PRODUCT_INACTIVE");
+    expect(mockedPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("[A5] quantity > Product.stock → QuantityExceedsStockError (422), no $transaction opened", async () => {
+    mockedProductFindUnique.mockResolvedValueOnce(
+      makeProduct({ stock: 3, isActive: true }),
+    );
+
+    const err = await cartService
+      .addItem("user_001", "product_001", 5)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(QuantityExceedsStockError);
+    expect((err as QuantityExceedsStockError).status).toBe(422);
+    expect((err as QuantityExceedsStockError).code).toBe("QUANTITY_EXCEEDS_STOCK");
+    expect(mockedPrisma.$transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("cartService.addItem — NFR-3 no find-then-create [A6]", () => {
+  it("[A6] never calls cart.findUnique — cart identity is established via upsert only", async () => {
+    const product = makeProduct({ isActive: true, stock: 10 });
+    mockedProductFindUnique.mockResolvedValueOnce(product);
+
+    const cartUpsert = vi.fn().mockResolvedValue({ id: "cart_001", userId: "user_001" });
+    const cartItemUpsert = vi.fn().mockResolvedValue(makeCartItem({ product }));
+    mockedPrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
+      const tx = { cart: { upsert: cartUpsert }, cartItem: { upsert: cartItemUpsert } };
+      return (fn as (tx: unknown) => Promise<unknown>)(tx);
+    });
+
+    await cartService.addItem("user_001", "product_001", 1);
+
+    expect(mockedPrisma.cart.findUnique).not.toHaveBeenCalled();
   });
 });

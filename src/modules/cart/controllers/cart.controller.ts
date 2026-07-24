@@ -33,7 +33,9 @@
 import type { NextFunction, Request, Response } from "express";
 
 import { NotImplementedError } from "@/shared/errors/errors";
+import { validateBody } from "@/shared/validation/zod";
 
+import { AddItemSchema } from "../dto/cart.dto";
 import * as cartService from "../services/cart.service";
 
 /**
@@ -53,12 +55,12 @@ export async function getCart(req: Request, res: Response, next: NextFunction): 
 /**
  * POST /api/v1/carrito/items
  * Adds or increments a cart item with price snapshotting.
- * STUB — implemented in the next commit (WU3-T1).
  */
-export async function addItem(_req: Request, _res: Response, next: NextFunction): Promise<void> {
+export async function addItem(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    await Promise.resolve();
-    throw new NotImplementedError("POST /carrito/items not yet implemented");
+    const body = validateBody(AddItemSchema, req.body);
+    const item = await cartService.addItem(req.user!.id, body.productId, body.quantity);
+    res.status(201).json(item);
   } catch (err) {
     next(err);
   }

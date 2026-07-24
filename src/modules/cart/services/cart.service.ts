@@ -34,6 +34,7 @@
  */
 import type { Prisma } from "@prisma/client";
 
+import { NotFoundError, ProductInactiveError, QuantityExceedsStockError } from "@/shared/errors/errors";
 import { prisma } from "@/shared/utils/prisma";
 
 // ---------------------------------------------------------------------------
@@ -191,16 +192,60 @@ export async function getCartView(userId: string): Promise<CartReadView> {
 
 /**
  * POST /carrito/items — add or increment an item with price snapshotting.
- * Creates Cart row if it doesn't exist (double-upsert pattern, D3).
- * STUB — implemented in the next commit (WU3-T1).
+ *
+ * Rules (spec §"POST /carrito/items adds or increments..."):
+ *   1. Load Product + producer; 404 if not found.
+ *   2. 409 ProductInactiveError if Product.isActive = false.
+ *   3. 422 QuantityExceedsStockError if quantity > Product.stock.
+ *   4. Double-upsert inside prisma.$transaction (D3): cart-level upsert on
+ *      Cart.userId, then item-level upsert on @@unique([cartId, productId]).
+ *      CREATE branch snapshots the live price; UPDATE branch only increments
+ *      quantity and MUST NOT touch unitPriceSnapshot (NFR-2).
+ *   5. NFR-3: no find-then-create — cart identity is established via upsert
+ *      only, never via a preceding cart.findUnique.
  */
 export async function addItem(
-  _userId: string,
-  _productId: string,
-  _quantity: number,
+  userId: string,
+  productId: string,
+  quantity: number,
 ): Promise<CartItemView> {
-  await Promise.resolve();
-  throw new Error("NOT_IMPLEMENTED");
+  const product = await prisma.product.findUnique({
+    where: { id: productId },
+    include: { producer: true },
+  });
+
+  if (!product) {
+    throw new NotFoundError("Product not found");
+  }
+  if (!product.isActive) {
+    throw new ProductInactiveError("Product is not active");
+  }
+  if (quantity > product.stock) {
+    throw new QuantityExceedsStockError("Quantity exceeds available stock");
+  }
+
+  const item = await prisma.$transaction(async (tx) => {
+    const cart = await tx.cart.upsert({
+      where: { userId },
+      create: { userId },
+      update: {},
+    });
+
+    return tx.cartItem.upsert({
+      where: { cart_product_unique: { cartId: cart.id, productId } },
+      create: {
+        cartId: cart.id,
+        productId,
+        quantity,
+        unitPriceSnapshot: product.price,
+      },
+      update: {
+        quantity: { increment: quantity },
+      },
+    });
+  });
+
+  return mapCartItemView({ ...item, product });
 }
 
 /**
