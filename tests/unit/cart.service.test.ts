@@ -276,6 +276,25 @@ describe("cartService.getCartView — availability computation [G4][G5]", () => 
     expect(view.items[0]!.product.isActive).toBe(true);
     expect(view.items[0]!.product.producer.isActive).toBe(false);
   });
+
+  it("[G6] isAvailable = false when Product is soft-deleted, even if Product.isActive remains true", async () => {
+    const cart = makeCart({
+      items: [
+        makeCartItem({
+          product: makeProduct({
+            isActive: true,
+            deletedAt: new Date("2026-02-01T00:00:00Z"),
+          }),
+        }),
+      ],
+    });
+    mockedCartFindUnique.mockResolvedValueOnce(cart);
+
+    const view = await cartService.getCartView("user_001");
+
+    expect(view.items[0]!.isAvailable).toBe(false);
+    expect(view.items[0]!.product.isActive).toBe(true);
+  });
 });
 
 // ===========================================================================
@@ -288,11 +307,15 @@ describe("cartService.addItem — first add creates cart + item with live-price 
     mockedProductFindUnique.mockResolvedValueOnce(product);
 
     const cartUpsert = vi.fn().mockResolvedValue({ id: "cart_001", userId: "user_001" });
+    const cartItemFindUnique = vi.fn().mockResolvedValue(null);
     const cartItemUpsert = vi.fn().mockResolvedValue(
       makeCartItem({ quantity: 2, unitPriceSnapshot: new Decimal("12.50"), product }),
     );
     mockedPrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
-      const tx = { cart: { upsert: cartUpsert }, cartItem: { upsert: cartItemUpsert } };
+      const tx = {
+        cart: { upsert: cartUpsert },
+        cartItem: { findUnique: cartItemFindUnique, upsert: cartItemUpsert },
+      };
       return (fn as (tx: unknown) => Promise<unknown>)(tx);
     });
 
@@ -321,11 +344,15 @@ describe("cartService.addItem — re-add preserves original snapshot [A2]", () =
     mockedProductFindUnique.mockResolvedValueOnce(product);
 
     const cartUpsert = vi.fn().mockResolvedValue({ id: "cart_001", userId: "user_001" });
+    const cartItemFindUnique = vi.fn().mockResolvedValue(makeCartItem({ quantity: 2, product }));
     const cartItemUpsert = vi.fn().mockResolvedValue(
       makeCartItem({ quantity: 5, unitPriceSnapshot: new Decimal("12.50"), product }),
     );
     mockedPrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
-      const tx = { cart: { upsert: cartUpsert }, cartItem: { upsert: cartItemUpsert } };
+      const tx = {
+        cart: { upsert: cartUpsert },
+        cartItem: { findUnique: cartItemFindUnique, upsert: cartItemUpsert },
+      };
       return (fn as (tx: unknown) => Promise<unknown>)(tx);
     });
 
@@ -385,14 +412,78 @@ describe("cartService.addItem — NFR-3 no find-then-create [A6]", () => {
     mockedProductFindUnique.mockResolvedValueOnce(product);
 
     const cartUpsert = vi.fn().mockResolvedValue({ id: "cart_001", userId: "user_001" });
+    const cartItemFindUnique = vi.fn().mockResolvedValue(null);
     const cartItemUpsert = vi.fn().mockResolvedValue(makeCartItem({ product }));
     mockedPrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
-      const tx = { cart: { upsert: cartUpsert }, cartItem: { upsert: cartItemUpsert } };
+      const tx = {
+        cart: { upsert: cartUpsert },
+        cartItem: { findUnique: cartItemFindUnique, upsert: cartItemUpsert },
+      };
       return (fn as (tx: unknown) => Promise<unknown>)(tx);
     });
 
     await cartService.addItem("user_001", "product_001", 1);
 
     expect(mockedPrisma.cart.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+describe("cartService.addItem — soft-delete excluded from write path [A7][A8]", () => {
+  it("[A7] product.findUnique is scoped with deletedAt: null; a soft-deleted product (query returns null) → NotFoundError, no $transaction opened", async () => {
+    // Simulates the real DB excluding a soft-deleted product from the query result.
+    mockedProductFindUnique.mockResolvedValueOnce(null);
+
+    await expect(cartService.addItem("user_001", "product_001", 1)).rejects.toThrow(
+      NotFoundError,
+    );
+    expect(mockedProductFindUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "product_001", deletedAt: null }),
+      }),
+    );
+    expect(mockedPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("[A8] product.findUnique is scoped to exclude soft-deleted producers; a product whose producer is soft-deleted (query returns null) → NotFoundError, no $transaction opened", async () => {
+    // Simulates the real DB excluding a product whose producer is soft-deleted.
+    mockedProductFindUnique.mockResolvedValueOnce(null);
+
+    await expect(cartService.addItem("user_001", "product_001", 1)).rejects.toThrow(
+      NotFoundError,
+    );
+    expect(mockedProductFindUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          producer: expect.objectContaining({ deletedAt: null }),
+        }),
+      }),
+    );
+    expect(mockedPrisma.$transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("cartService.addItem — cumulative stock validation [A9]", () => {
+  it("[A9] resulting total (existing quantity + increment) exceeding stock throws QuantityExceedsStockError inside the transaction", async () => {
+    // stock=1: existing cart item already has quantity=1, a second add of 1 more
+    // would push the total to 2 > stock(1). Neither add alone exceeds stock,
+    // so this must be caught by validating the RESULTING total, not the increment.
+    const product = makeProduct({ stock: 1, isActive: true });
+    mockedProductFindUnique.mockResolvedValueOnce(product);
+
+    const cartUpsert = vi.fn().mockResolvedValue({ id: "cart_001", userId: "user_001" });
+    const cartItemFindUnique = vi.fn().mockResolvedValue(makeCartItem({ quantity: 1, product }));
+    const cartItemUpsert = vi.fn();
+    mockedPrisma.$transaction.mockImplementationOnce(async (fn: unknown) => {
+      const tx = {
+        cart: { upsert: cartUpsert },
+        cartItem: { findUnique: cartItemFindUnique, upsert: cartItemUpsert },
+      };
+      return (fn as (tx: unknown) => Promise<unknown>)(tx);
+    });
+
+    await expect(cartService.addItem("user_001", "product_001", 1)).rejects.toThrow(
+      QuantityExceedsStockError,
+    );
+    expect(cartItemUpsert).not.toHaveBeenCalled();
   });
 });

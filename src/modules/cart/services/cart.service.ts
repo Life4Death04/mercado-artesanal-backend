@@ -106,6 +106,7 @@ type ProductRow = {
   price: Prisma.Decimal;
   stock: number;
   isActive: boolean;
+  deletedAt: Date | null;
   producer: ProducerRow;
 };
 type CartItemRow = {
@@ -119,11 +120,12 @@ type CartItemRow = {
 };
 
 /**
- * Computes item availability: product is active AND its producer is not
- * soft-deleted. See file header note on the producer.isActive derivation.
+ * Computes item availability: product is not soft-deleted, is active, AND
+ * its producer is not soft-deleted. See file header note on the
+ * producer.isActive derivation.
  */
 function computeIsAvailable(product: ProductRow): boolean {
-  return product.isActive && product.producer.deletedAt === null;
+  return product.deletedAt === null && product.isActive && product.producer.deletedAt === null;
 }
 
 /** Maps a Prisma CartItem row (with nested product+producer) to the wire shape. */
@@ -161,12 +163,18 @@ function mapCartItemView(item: CartItemRow): CartItemView {
  * GET /carrito — return cart + computed availability for each item.
  * Returns synthetic empty view when user has no Cart row (D2).
  *
- * NFR-1: issues exactly ONE Prisma query — a single `cart.findUnique` with a
- * nested `include` (no N+1, no second round trip for items/product/producer).
+ * NFR-1: issues exactly ONE SQL query — a single `cart.findUnique` with a
+ * nested `include`, forced to lower to a single Postgres `LEFT JOIN` query
+ * via `relationLoadStrategy: "join"` (requires the `relationJoins` preview
+ * feature, see prisma/schema.prisma generator block). Without this, Prisma's
+ * default strategy batches nested includes into separate queries per relation
+ * level (verified empirically: 4 queries for this exact shape — see
+ * tests/integration/cart.query-count.test.ts, the authoritative NFR-1 proof).
  */
 export async function getCartView(userId: string): Promise<CartReadView> {
   const cart = await prisma.cart.findUnique({
     where: { userId },
+    relationLoadStrategy: "join",
     include: {
       items: {
         include: {
@@ -194,15 +202,39 @@ export async function getCartView(userId: string): Promise<CartReadView> {
  * POST /carrito/items — add or increment an item with price snapshotting.
  *
  * Rules (spec §"POST /carrito/items adds or increments..."):
- *   1. Load Product + producer; 404 if not found.
+ *   1. Load Product + producer, scoped to `deletedAt: null` on BOTH the
+ *      product and its producer; 404 (same not-found path as an unknown
+ *      productId) when it does not resolve — a soft-deleted product/producer
+ *      is NOT FOUND, never a self-contradicting `isAvailable:false` 201.
  *   2. 409 ProductInactiveError if Product.isActive = false.
- *   3. 422 QuantityExceedsStockError if quantity > Product.stock.
+ *   3. 422 QuantityExceedsStockError if the requested quantity alone already
+ *      exceeds Product.stock (fast-fail, no transaction opened).
  *   4. Double-upsert inside prisma.$transaction (D3): cart-level upsert on
  *      Cart.userId, then item-level upsert on @@unique([cartId, productId]).
  *      CREATE branch snapshots the live price; UPDATE branch only increments
  *      quantity and MUST NOT touch unitPriceSnapshot (NFR-2).
+ *      Inside the transaction, the RESULTING total quantity (existing
+ *      cart-item quantity + requested increment) is re-validated against
+ *      Product.stock — 422 QuantityExceedsStockError if it would be
+ *      exceeded. This closes the gap where repeated valid increments (each
+ *      individually within stock) could otherwise push CartItem.quantity
+ *      above Product.stock (e.g. stock=1, add 1 twice → quantity 2).
  *   5. NFR-3: no find-then-create — cart identity is established via upsert
- *      only, never via a preceding cart.findUnique.
+ *      only, never via a preceding cart.findUnique. Prisma's `upsert` is NOT
+ *      atomic against concurrent inserts under READ COMMITTED inside an
+ *      interactive transaction (select-then-insert, not a native
+ *      INSERT ... ON CONFLICT): two concurrent first-adds for the same user
+ *      can both take the create path and one hits P2002 on `Cart.userId`.
+ *      Postgres aborts the ENTIRE transaction on that error (a transaction
+ *      cannot keep running further statements once one has failed — error
+ *      25P02 "current transaction is aborted"), so the recovery cannot be a
+ *      same-transaction catch-and-continue. Instead, the whole
+ *      `prisma.$transaction` call is retried ONCE on P2002: by the time the
+ *      retry starts, the winning transaction has already committed its cart
+ *      row, so the retried upsert takes the UPDATE branch and succeeds. This
+ *      is a catch-and-retry of an already-failed create, not a pre-emptive
+ *      find-then-create, so NFR-3's intent (no speculative read before
+ *      attempting the write) is preserved.
  */
 export async function addItem(
   userId: string,
@@ -210,7 +242,7 @@ export async function addItem(
   quantity: number,
 ): Promise<CartItemView> {
   const product = await prisma.product.findUnique({
-    where: { id: productId },
+    where: { id: productId, deletedAt: null, producer: { deletedAt: null } },
     include: { producer: true },
   });
 
@@ -224,26 +256,50 @@ export async function addItem(
     throw new QuantityExceedsStockError("Quantity exceeds available stock");
   }
 
-  const item = await prisma.$transaction(async (tx) => {
-    const cart = await tx.cart.upsert({
-      where: { userId },
-      create: { userId },
-      update: {},
+  const runTransaction = () =>
+    prisma.$transaction(async (tx) => {
+      const cart = await tx.cart.upsert({
+        where: { userId },
+        create: { userId },
+        update: {},
+      });
+
+      const existingItem = await tx.cartItem.findUnique({
+        where: { cart_product_unique: { cartId: cart.id, productId } },
+      });
+      const totalQuantity = (existingItem?.quantity ?? 0) + quantity;
+      if (totalQuantity > product.stock) {
+        throw new QuantityExceedsStockError("Quantity exceeds available stock");
+      }
+
+      return tx.cartItem.upsert({
+        where: { cart_product_unique: { cartId: cart.id, productId } },
+        create: {
+          cartId: cart.id,
+          productId,
+          quantity,
+          unitPriceSnapshot: product.price,
+        },
+        update: {
+          quantity: { increment: quantity },
+        },
+      });
     });
 
-    return tx.cartItem.upsert({
-      where: { cart_product_unique: { cartId: cart.id, productId } },
-      create: {
-        cartId: cart.id,
-        productId,
-        quantity,
-        unitPriceSnapshot: product.price,
-      },
-      update: {
-        quantity: { increment: quantity },
-      },
-    });
-  });
+  let item;
+  try {
+    item = await runTransaction();
+  } catch (err: unknown) {
+    const isCartUserIdConflict =
+      typeof err === "object" && err !== null && (err as { code?: string }).code === "P2002";
+    if (!isCartUserIdConflict) {
+      throw err;
+    }
+    // Retry once: the transaction that just aborted lost a concurrent race
+    // on `Cart.userId`; the winner has fully committed by now, so this
+    // retry's cart.upsert takes the UPDATE branch and succeeds.
+    item = await runTransaction();
+  }
 
   return mapCartItemView({ ...item, product });
 }

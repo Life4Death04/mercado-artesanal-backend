@@ -3,7 +3,8 @@
 // Any change requires a new migration via `prisma migrate dev`.
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["relationJoins"]
 }
 
 datasource db {

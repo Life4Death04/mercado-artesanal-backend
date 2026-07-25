@@ -106,6 +106,7 @@ vi.mock("@/shared/utils/prisma", () => {
   };
 });
 
+
 import type { User } from "@prisma/client";
 import { Decimal } from "@prisma/client/runtime/library";
 import { prisma } from "@/shared/utils/prisma";
@@ -419,11 +420,15 @@ describe("POST /api/v1/carrito/items — real behavior (PR #2)", () => {
     mockedProduct.findUnique.mockResolvedValueOnce(product);
 
     const cartUpsert = vi.fn().mockResolvedValue({ id: "cart_cart_001", userId: user.id });
+    const cartItemFindUnique = vi.fn().mockResolvedValue(null);
     const cartItemUpsert = vi
       .fn()
       .mockResolvedValue(makeCartItem({ quantity: 2, unitPriceSnapshot: new Decimal("12.50"), product }));
     mockedTransaction.mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) =>
-      fn({ cart: { upsert: cartUpsert }, cartItem: { upsert: cartItemUpsert } }),
+      fn({
+        cart: { upsert: cartUpsert },
+        cartItem: { findUnique: cartItemFindUnique, upsert: cartItemUpsert },
+      }),
     );
 
     const res = await request
@@ -481,5 +486,23 @@ describe("POST /api/v1/carrito/items — real behavior (PR #2)", () => {
     expect(res.body).toMatchObject({ code: "VALIDATION_FAILED" });
     // Product lookup must NOT happen — Zod validation runs before service call
     expect(mockedProduct.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("[C-POST-5] returns 404 NOT_FOUND when productId does not resolve (unknown, or soft-deleted product/producer)", async () => {
+    const user = makeUser();
+    mockLoadUser(user);
+    // Simulates the real DB query (scoped to deletedAt: null on product + producer)
+    // returning no row — covers unknown productId AND soft-deleted product/producer.
+    mockedProduct.findUnique.mockResolvedValueOnce(null);
+
+    const res = await request
+      .post("/api/v1/carrito/items")
+      .set("x-test-auth", authHeader(consumerClaim()))
+      .send({ productId: "does-not-exist", quantity: 1 });
+
+    expect(res.status).toBe(404);
+    expect(res.headers["content-type"]).toContain("application/problem+json");
+    expect(res.body).toMatchObject({ code: "NOT_FOUND" });
+    expect(mockedTransaction).not.toHaveBeenCalled();
   });
 });
