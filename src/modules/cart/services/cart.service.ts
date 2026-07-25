@@ -153,6 +153,33 @@ function mapCartItemView(item: CartItemRow): CartItemView {
   };
 }
 
+/**
+ * Maps a Prisma CartItem row (with nested product+producer) to the frozen
+ * checkout wire shape (spec §"CartItemForCheckout — Read Contract"). Reuses
+ * `computeIsAvailable` so the checkout gate matches GET exactly (D4 note).
+ */
+function mapCartItemForCheckout(item: CartItemRow): CartItemForCheckout {
+  const { product } = item;
+  return {
+    cartItemId: item.id,
+    productId: item.productId,
+    producerId: product.producer.id,
+    quantity: item.quantity,
+    unitPriceSnapshot: item.unitPriceSnapshot.toFixed(2),
+    isAvailable: computeIsAvailable(product),
+    product: {
+      id: product.id,
+      name: product.name,
+      stock: product.stock,
+      isActive: product.isActive,
+      producer: {
+        id: product.producer.id,
+        isActive: product.producer.deletedAt === null,
+      },
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Service functions
 // PR #2 implements: getCartView, addItem
@@ -186,7 +213,7 @@ export async function getCartView(userId: string): Promise<CartReadView> {
 
   if (!cart) {
     // D2 — synthetic empty view, no lazy-create on read.
-    return { id: null, userId, items: [], createdAt: null, updatedAt: null };
+    return emptyCartView(userId);
   }
 
   return {
@@ -196,6 +223,11 @@ export async function getCartView(userId: string): Promise<CartReadView> {
     createdAt: cart.createdAt.toISOString(),
     updatedAt: cart.updatedAt.toISOString(),
   };
+}
+
+/** Synthetic empty view (D2) — shared by getCartView and clearCart's no-cart-row path. */
+function emptyCartView(userId: string): CartReadView {
+  return { id: null, userId, items: [], createdAt: null, updatedAt: null };
 }
 
 /**
@@ -306,43 +338,124 @@ export async function addItem(
 
 /**
  * PATCH /carrito/items/:itemId — update quantity only.
- * Preserves unitPriceSnapshot (NFR-2).
- * STUB in PR #1 — implemented in PR #3.
+ * Preserves unitPriceSnapshot (NFR-2, never included in the write).
+ *
+ * Rules (spec §"PATCH /carrito/items/:itemId updates quantity only"):
+ *   1. Load the CartItem scoped to ownership (`cart: { userId }`); 404 if the
+ *      item does not exist or belongs to a different user (NFR-6 — no-leak,
+ *      same status for "unknown" and "unowned").
+ *   2. Re-validate `quantity` against the freshly-loaded `Product.stock`
+ *      (nested in the same query — no separate product lookup needed).
+ *   3. Update `quantity` only; the write payload never references
+ *      `unitPriceSnapshot`.
  */
 export async function updateItemQuantity(
-  _userId: string,
-  _itemId: string,
-  _quantity: number,
+  userId: string,
+  itemId: string,
+  quantity: number,
 ): Promise<CartItemView> {
-  await Promise.resolve();
-  throw new Error("NOT_IMPLEMENTED");
+  const item = await prisma.cartItem.findFirst({
+    where: { id: itemId, cart: { userId } },
+    include: { product: { include: { producer: true } } },
+  });
+
+  if (!item) {
+    throw new NotFoundError("Cart item not found");
+  }
+  if (quantity > item.product.stock) {
+    throw new QuantityExceedsStockError("Quantity exceeds available stock");
+  }
+
+  const updated = await prisma.cartItem.update({
+    where: { id: itemId },
+    data: { quantity },
+    include: { product: { include: { producer: true } } },
+  });
+
+  return mapCartItemView(updated);
 }
 
 /**
  * DELETE /carrito/items/:itemId — remove a single item.
- * Ownership-enforced 404 (NFR-6).
- * STUB in PR #1 — implemented in PR #3.
+ * Ownership-enforced 404 (NFR-6): the ownership lookup happens before the
+ * delete, so an unowned/unknown itemId never reaches `prisma.cartItem.delete`.
  */
-export async function removeItem(_userId: string, _itemId: string): Promise<void> {
-  await Promise.resolve();
-  throw new Error("NOT_IMPLEMENTED");
+export async function removeItem(userId: string, itemId: string): Promise<void> {
+  const item = await prisma.cartItem.findFirst({
+    where: { id: itemId, cart: { userId } },
+    select: { id: true },
+  });
+
+  if (!item) {
+    throw new NotFoundError("Cart item not found");
+  }
+
+  await prisma.cartItem.delete({ where: { id: itemId } });
 }
 
 /**
- * DELETE /carrito — clear all items, preserve Cart row identity.
- * STUB in PR #1 — implemented in PR #3.
+ * DELETE /carrito — clear all items, preserve Cart row identity (spec
+ * §"DELETE /carrito clears items and preserves cart identity").
+ *
+ * - No Cart row exists: no-op success — returns the synthetic empty view
+ *   (shared with getCartView, D2) without touching CartItem at all.
+ * - Cart row exists (with or without items): deletes every CartItem for the
+ *   cart, then returns the view with the SAME cart id/timestamps — the Cart
+ *   row itself is never deleted or re-written, so identity stays stable.
  */
-export async function clearCart(_userId: string): Promise<CartReadView> {
-  await Promise.resolve();
-  throw new Error("NOT_IMPLEMENTED");
+export async function clearCart(userId: string): Promise<CartReadView> {
+  const cart = await prisma.cart.findUnique({ where: { userId } });
+
+  if (!cart) {
+    return emptyCartView(userId);
+  }
+
+  await prisma.cartItem.deleteMany({ where: { cartId: cart.id } });
+
+  return {
+    id: cart.id,
+    userId: cart.userId,
+    items: [],
+    createdAt: cart.createdAt.toISOString(),
+    updatedAt: cart.updatedAt.toISOString(),
+  };
 }
 
 /**
  * Internal — read cart in the frozen CartForCheckout shape for the orders slice.
  * Frozen contract: shape MUST NOT change without a new proposal (ADR-003).
- * STUB in PR #1 — implemented in PR #3.
+ *
+ * Unlike the public `getCartView` (D2 synthetic empty view for browsing),
+ * `CartForCheckout.cartId` is a non-nullable `string` in the frozen contract
+ * — checkout is only meaningful against an EXISTING cart. A user with no
+ * Cart row throws `NotFoundError`; callers (orders/payments slices) MUST
+ * establish a cart (via `POST /carrito/items`) before invoking checkout.
+ *
+ * Availability reuses `computeIsAvailable` — the SAME deletedAt-based gate
+ * as `getCartView` (product not soft-deleted, `isActive`, producer not
+ * soft-deleted). See file header note on the producer.isActive derivation;
+ * this keeps the checkout gate consistent with the merged GET/POST contract
+ * rather than the spec's stale `producer.isActive` field reference.
  */
-export async function getCartForCheckout(_userId: string): Promise<CartForCheckout> {
-  await Promise.resolve();
-  throw new Error("NOT_IMPLEMENTED");
+export async function getCartForCheckout(userId: string): Promise<CartForCheckout> {
+  const cart = await prisma.cart.findUnique({
+    where: { userId },
+    include: {
+      items: {
+        include: {
+          product: { include: { producer: true } },
+        },
+      },
+    },
+  });
+
+  if (!cart) {
+    throw new NotFoundError("Cart not found");
+  }
+
+  return {
+    cartId: cart.id,
+    userId: cart.userId,
+    items: cart.items.map((item) => mapCartItemForCheckout(item as CartItemRow)),
+  };
 }

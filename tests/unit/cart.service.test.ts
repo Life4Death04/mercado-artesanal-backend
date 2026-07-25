@@ -22,10 +22,26 @@
  *     [A5] quantity > Product.stock → QuantityExceedsStockError (422), no $transaction opened (R3-S4)
  *     [A6] NFR-3 no find-then-create — cart.findUnique is NEVER called by addItem (upsert only)
  *
- * PR #3 will add: updateItemQuantity, removeItem, clearCart, getCartForCheckout
+ * PR #3 scenarios covered (spec §R4 PATCH, §R5 DELETE item, §R6 DELETE cart, §R8 checkout):
+ *   updateItemQuantity:
+ *     [P1] update within stock succeeds, unitPriceSnapshot preserved (R4-S1)
+ *     [P2] update exceeding stock → QuantityExceedsStockError, no update() call (R4-S2)
+ *     [P3] unowned/unknown item → NotFoundError, no update() call (R4-S3, NFR-6)
+ *   removeItem:
+ *     [R1] owner delete calls cartItem.delete with the item id (R5-S1)
+ *     [R2] unowned/unknown item → NotFoundError, no delete() call (R5-S2, NFR-6)
+ *   clearCart:
+ *     [CL1] clears items, cart id/timestamps preserved (R6-S1)
+ *     [CL2] empty cart clear is idempotent — deleteMany still called (R6-S2)
+ *     [CL3] no Cart row → synthetic empty view, deleteMany NOT called (R6-S3)
+ *   getCartForCheckout:
+ *     [CO1] checkout view resolves producerId per item from product.producer.id (R8-S1)
+ *     [CO2] checkout view returns the frozen snapshot, not the live drifted price (R8-S2)
+ *     [CO3] no Cart row → NotFoundError (checkout requires an existing cart; cartId is non-nullable
+ *           in the frozen CartForCheckout contract, unlike the public CartReadView)
  *
  * Spec references:
- *   cart §R1–R3 — cart identity, GET availability, POST add-with-snapshot
+ *   cart §R1–R8 — cart identity, GET availability, POST/PATCH/DELETE, checkout view
  *   design — D2 (synthetic empty view), D3 ($transaction callback form),
  *            D4 (delegate-count assertions, complementary to integration proof)
  *   design — TDD ordering: schema+skeleton → GET/POST → PATCH/DELETE/checkout
@@ -47,6 +63,7 @@ vi.mock("@/shared/utils/prisma", () => {
       },
       cartItem: {
         findUnique: vi.fn(),
+        findFirst: vi.fn(),
         upsert: vi.fn(),
         update: vi.fn(),
         delete: vi.fn(),
@@ -75,6 +92,14 @@ const mockedPrisma = vi.mocked(prisma);
 const mockedCartFindUnique = mockedPrisma.cart.findUnique as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedProductFindUnique = mockedPrisma.product.findUnique as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedCartItemFindFirst = mockedPrisma.cartItem.findFirst as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedCartItemUpdate = mockedPrisma.cartItem.update as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedCartItemDelete = mockedPrisma.cartItem.delete as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedCartItemDeleteMany = mockedPrisma.cartItem.deleteMany as any;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -485,5 +510,183 @@ describe("cartService.addItem — cumulative stock validation [A9]", () => {
       QuantityExceedsStockError,
     );
     expect(cartItemUpsert).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// updateItemQuantity (PR #3, WU4-T1)
+// ===========================================================================
+
+describe("cartService.updateItemQuantity — update within stock [P1]", () => {
+  it("[P1] updates quantity when within stock and preserves unitPriceSnapshot", async () => {
+    const owned = makeCartItem({ quantity: 2, unitPriceSnapshot: new Decimal("12.50") });
+    mockedCartItemFindFirst.mockResolvedValueOnce(owned);
+    mockedCartItemUpdate.mockResolvedValueOnce(
+      makeCartItem({ quantity: 4, unitPriceSnapshot: new Decimal("12.50") }),
+    );
+
+    const result = await cartService.updateItemQuantity("user_001", "item_001", 4);
+
+    expect(mockedCartItemFindFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "item_001", cart: { userId: "user_001" } },
+      }),
+    );
+    expect(mockedCartItemUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "item_001" }, data: { quantity: 4 } }),
+    );
+    expect(result.quantity).toBe(4);
+    expect(result.unitPriceSnapshot).toBe("12.50");
+  });
+});
+
+describe("cartService.updateItemQuantity — quantity exceeds stock [P2]", () => {
+  it("[P2] rejects with QuantityExceedsStockError and never calls update()", async () => {
+    const owned = makeCartItem({ quantity: 2, product: makeProduct({ stock: 3 }) });
+    mockedCartItemFindFirst.mockResolvedValueOnce(owned);
+
+    await expect(cartService.updateItemQuantity("user_001", "item_001", 5)).rejects.toThrow(
+      QuantityExceedsStockError,
+    );
+    expect(mockedCartItemUpdate).not.toHaveBeenCalled();
+  });
+});
+
+describe("cartService.updateItemQuantity — ownership 404 [P3]", () => {
+  it("[P3] unowned or unknown item → NotFoundError, no update() call (NFR-6)", async () => {
+    mockedCartItemFindFirst.mockResolvedValueOnce(null);
+
+    await expect(cartService.updateItemQuantity("user_001", "item_999", 1)).rejects.toThrow(
+      NotFoundError,
+    );
+    expect(mockedCartItemUpdate).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// removeItem (PR #3, WU5-T1)
+// ===========================================================================
+
+describe("cartService.removeItem — owner delete [R1]", () => {
+  it("[R1] deletes the item by id after confirming ownership", async () => {
+    mockedCartItemFindFirst.mockResolvedValueOnce({ id: "item_001" });
+    mockedCartItemDelete.mockResolvedValueOnce(makeCartItem());
+
+    await cartService.removeItem("user_001", "item_001");
+
+    expect(mockedCartItemFindFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "item_001", cart: { userId: "user_001" } },
+      }),
+    );
+    expect(mockedCartItemDelete).toHaveBeenCalledWith({ where: { id: "item_001" } });
+  });
+});
+
+describe("cartService.removeItem — ownership 404 [R2]", () => {
+  it("[R2] unowned or unknown item → NotFoundError, no delete() call (NFR-6)", async () => {
+    mockedCartItemFindFirst.mockResolvedValueOnce(null);
+
+    await expect(cartService.removeItem("user_001", "item_999")).rejects.toThrow(NotFoundError);
+    expect(mockedCartItemDelete).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// clearCart (PR #3, WU6-T1)
+// ===========================================================================
+
+describe("cartService.clearCart — clears items, keeps cart identity [CL1]", () => {
+  it("[CL1] deletes all items for the cart and returns the view with items: [] and the same cart id", async () => {
+    const cart = makeCart();
+    mockedCartFindUnique.mockResolvedValueOnce(cart);
+    mockedCartItemDeleteMany.mockResolvedValueOnce({ count: 3 });
+
+    const view = await cartService.clearCart("user_001");
+
+    expect(mockedCartItemDeleteMany).toHaveBeenCalledWith({ where: { cartId: "cart_001" } });
+    expect(view).toEqual({
+      id: "cart_001",
+      userId: "user_001",
+      items: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+  });
+});
+
+describe("cartService.clearCart — empty cart is idempotent [CL2]", () => {
+  it("[CL2] cart with zero items still calls deleteMany and returns the same shape", async () => {
+    const cart = makeCart({ items: [] });
+    mockedCartFindUnique.mockResolvedValueOnce(cart);
+    mockedCartItemDeleteMany.mockResolvedValueOnce({ count: 0 });
+
+    const view = await cartService.clearCart("user_001");
+
+    expect(mockedCartItemDeleteMany).toHaveBeenCalledOnce();
+    expect(view.id).toBe("cart_001");
+    expect(view.items).toEqual([]);
+  });
+});
+
+describe("cartService.clearCart — no Cart row is a no-op success [CL3]", () => {
+  it("[CL3] returns the synthetic empty view and never calls deleteMany", async () => {
+    mockedCartFindUnique.mockResolvedValueOnce(null);
+
+    const view = await cartService.clearCart("user_001");
+
+    expect(view).toEqual({ id: null, userId: "user_001", items: [], createdAt: null, updatedAt: null });
+    expect(mockedCartItemDeleteMany).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// getCartForCheckout (PR #3, WU7-T1) — internal, frozen contract for `orders`
+// ===========================================================================
+
+describe("cartService.getCartForCheckout — producerId resolution [CO1]", () => {
+  it("[CO1] every item includes producerId resolved from product.producer.id", async () => {
+    const producerA = makeProducer({ id: "producer_A" });
+    const producerB = makeProducer({ id: "producer_B" });
+    const cart = makeCart({
+      items: [
+        makeCartItem({ id: "item_A", product: makeProduct({ id: "product_A", producer: producerA }) }),
+        makeCartItem({ id: "item_B", product: makeProduct({ id: "product_B", producer: producerB }) }),
+      ],
+    });
+    mockedCartFindUnique.mockResolvedValueOnce(cart);
+
+    const view = await cartService.getCartForCheckout("user_001");
+
+    expect(view.cartId).toBe("cart_001");
+    expect(view.items).toHaveLength(2);
+    expect(view.items[0]!.producerId).toBe("producer_A");
+    expect(view.items[1]!.producerId).toBe("producer_B");
+  });
+});
+
+describe("cartService.getCartForCheckout — frozen snapshot, not live price [CO2]", () => {
+  it("[CO2] returns the frozen unitPriceSnapshot even when Product.price has drifted", async () => {
+    const cart = makeCart({
+      items: [
+        makeCartItem({
+          unitPriceSnapshot: new Decimal("12.50"),
+          product: makeProduct({ price: new Decimal("15.00") }),
+        }),
+      ],
+    });
+    mockedCartFindUnique.mockResolvedValueOnce(cart);
+
+    const view = await cartService.getCartForCheckout("user_001");
+
+    expect(view.items[0]!.unitPriceSnapshot).toBe("12.50");
+  });
+});
+
+describe("cartService.getCartForCheckout — no Cart row [CO3]", () => {
+  it("[CO3] throws NotFoundError when the user has no Cart row (checkout requires an existing cart)", async () => {
+    mockedCartFindUnique.mockResolvedValueOnce(null);
+
+    await expect(cartService.getCartForCheckout("user_001")).rejects.toThrow(NotFoundError);
   });
 });
