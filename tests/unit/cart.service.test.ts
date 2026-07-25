@@ -22,10 +22,18 @@
  *     [A5] quantity > Product.stock → QuantityExceedsStockError (422), no $transaction opened (R3-S4)
  *     [A6] NFR-3 no find-then-create — cart.findUnique is NEVER called by addItem (upsert only)
  *
- * PR #3 will add: updateItemQuantity, removeItem, clearCart, getCartForCheckout
+ * PR #3 scenarios covered so far (spec §R4 PATCH, §R5 DELETE item; WU4-T1, WU5-T1):
+ *   updateItemQuantity:
+ *     [P1] update within stock succeeds, unitPriceSnapshot preserved (R4-S1)
+ *     [P2] update exceeding stock → QuantityExceedsStockError, no update() call (R4-S2)
+ *     [P3] unowned/unknown item → NotFoundError, no update() call (R4-S3, NFR-6)
+ *   removeItem:
+ *     [R1] owner delete calls cartItem.delete with the item id (R5-S1)
+ *     [R2] unowned/unknown item → NotFoundError, no delete() call (R5-S2, NFR-6)
+ * PR #3 will also add: clearCart, getCartForCheckout (WU6-T1, WU7-T1)
  *
  * Spec references:
- *   cart §R1–R3 — cart identity, GET availability, POST add-with-snapshot
+ *   cart §R1–R5 — cart identity, GET availability, POST/PATCH/DELETE item
  *   design — D2 (synthetic empty view), D3 ($transaction callback form),
  *            D4 (delegate-count assertions, complementary to integration proof)
  *   design — TDD ordering: schema+skeleton → GET/POST → PATCH/DELETE/checkout
@@ -47,6 +55,7 @@ vi.mock("@/shared/utils/prisma", () => {
       },
       cartItem: {
         findUnique: vi.fn(),
+        findFirst: vi.fn(),
         upsert: vi.fn(),
         update: vi.fn(),
         delete: vi.fn(),
@@ -75,6 +84,12 @@ const mockedPrisma = vi.mocked(prisma);
 const mockedCartFindUnique = mockedPrisma.cart.findUnique as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedProductFindUnique = mockedPrisma.product.findUnique as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedCartItemFindFirst = mockedPrisma.cartItem.findFirst as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedCartItemUpdate = mockedPrisma.cartItem.update as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedCartItemDelete = mockedPrisma.cartItem.delete as any;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -485,5 +500,84 @@ describe("cartService.addItem — cumulative stock validation [A9]", () => {
       QuantityExceedsStockError,
     );
     expect(cartItemUpsert).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// updateItemQuantity (PR #3, WU4-T1)
+// ===========================================================================
+
+describe("cartService.updateItemQuantity — update within stock [P1]", () => {
+  it("[P1] updates quantity when within stock and preserves unitPriceSnapshot", async () => {
+    const owned = makeCartItem({ quantity: 2, unitPriceSnapshot: new Decimal("12.50") });
+    mockedCartItemFindFirst.mockResolvedValueOnce(owned);
+    mockedCartItemUpdate.mockResolvedValueOnce(
+      makeCartItem({ quantity: 4, unitPriceSnapshot: new Decimal("12.50") }),
+    );
+
+    const result = await cartService.updateItemQuantity("user_001", "item_001", 4);
+
+    expect(mockedCartItemFindFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "item_001", cart: { userId: "user_001" } },
+      }),
+    );
+    expect(mockedCartItemUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "item_001" }, data: { quantity: 4 } }),
+    );
+    expect(result.quantity).toBe(4);
+    expect(result.unitPriceSnapshot).toBe("12.50");
+  });
+});
+
+describe("cartService.updateItemQuantity — quantity exceeds stock [P2]", () => {
+  it("[P2] rejects with QuantityExceedsStockError and never calls update()", async () => {
+    const owned = makeCartItem({ quantity: 2, product: makeProduct({ stock: 3 }) });
+    mockedCartItemFindFirst.mockResolvedValueOnce(owned);
+
+    await expect(cartService.updateItemQuantity("user_001", "item_001", 5)).rejects.toThrow(
+      QuantityExceedsStockError,
+    );
+    expect(mockedCartItemUpdate).not.toHaveBeenCalled();
+  });
+});
+
+describe("cartService.updateItemQuantity — ownership 404 [P3]", () => {
+  it("[P3] unowned or unknown item → NotFoundError, no update() call (NFR-6)", async () => {
+    mockedCartItemFindFirst.mockResolvedValueOnce(null);
+
+    await expect(cartService.updateItemQuantity("user_001", "item_999", 1)).rejects.toThrow(
+      NotFoundError,
+    );
+    expect(mockedCartItemUpdate).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// removeItem (PR #3, WU5-T1)
+// ===========================================================================
+
+describe("cartService.removeItem — owner delete [R1]", () => {
+  it("[R1] deletes the item by id after confirming ownership", async () => {
+    mockedCartItemFindFirst.mockResolvedValueOnce({ id: "item_001" });
+    mockedCartItemDelete.mockResolvedValueOnce(makeCartItem());
+
+    await cartService.removeItem("user_001", "item_001");
+
+    expect(mockedCartItemFindFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "item_001", cart: { userId: "user_001" } },
+      }),
+    );
+    expect(mockedCartItemDelete).toHaveBeenCalledWith({ where: { id: "item_001" } });
+  });
+});
+
+describe("cartService.removeItem — ownership 404 [R2]", () => {
+  it("[R2] unowned or unknown item → NotFoundError, no delete() call (NFR-6)", async () => {
+    mockedCartItemFindFirst.mockResolvedValueOnce(null);
+
+    await expect(cartService.removeItem("user_001", "item_999")).rejects.toThrow(NotFoundError);
+    expect(mockedCartItemDelete).not.toHaveBeenCalled();
   });
 });

@@ -6,16 +6,16 @@
  * and caught by the central errorMiddleware (RFC 7807).
  *
  * PR #2 implements: getCart, addItem (real behavior).
- * PR #3 will implement: updateItem, removeItem, clearCart. Those three
- * remain PR #1 stubs — they throw NotImplementedError (501) so the
+ * PR #3 implements: updateItem, removeItem (real behavior). clearCart
+ * remains a PR #1 stub — it throws NotImplementedError (501) so the
  * response still goes through errorMiddleware and uses the canonical
  * application/problem+json envelope.
  *
  * Response codes:
  *   GET  /carrito               → 200 CartReadView                  (PR #2)
  *   POST /carrito/items         → 201 CartItemView                  (PR #2)
- *   PATCH /carrito/items/:id    → 200 CartItemView                  (PR #3 stub)
- *   DELETE /carrito/items/:id   → 204 No Content                    (PR #3 stub)
+ *   PATCH /carrito/items/:id    → 200 CartItemView                  (PR #3)
+ *   DELETE /carrito/items/:id   → 204 No Content                    (PR #3)
  *   DELETE /carrito             → 200 CartReadView (empty items)     (PR #3 stub)
  *
  * Auth chain (design Data Flow, verified against addresses.routes.ts:33):
@@ -35,7 +35,7 @@ import type { NextFunction, Request, Response } from "express";
 import { NotImplementedError } from "@/shared/errors/errors";
 import { validateBody } from "@/shared/validation/zod";
 
-import { AddItemSchema } from "../dto/cart.dto";
+import { AddItemSchema, UpdateItemSchema } from "../dto/cart.dto";
 import * as cartService from "../services/cart.service";
 
 /**
@@ -67,21 +67,21 @@ export async function addItem(req: Request, res: Response, next: NextFunction): 
 }
 
 // ---------------------------------------------------------------------------
-// PR #3 stubs — throw NotImplementedError (501) so the response goes through
-// errorMiddleware and uses the RFC 7807 Problem Details envelope. The
-// middleware chain is already wired (cart.routes.ts); PR #3 only needs to
-// fill these handlers.
+// PR #3 — real behavior for updateItem/removeItem. clearCart is still a
+// stub (throws NotImplementedError → 501) so the response goes through
+// errorMiddleware and uses the RFC 7807 Problem Details envelope.
 // ---------------------------------------------------------------------------
 
 /**
  * PATCH /api/v1/carrito/items/:itemId
  * Updates quantity of a specific cart item (preserves unitPriceSnapshot).
  */
-export async function updateItem(_req: Request, _res: Response, next: NextFunction): Promise<void> {
+export async function updateItem(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    // TODO(PR #3): validate body, call cartService.updateItemQuantity(req.user.id, itemId, quantity)
-    await Promise.resolve();
-    throw new NotImplementedError("PATCH /carrito/items/:itemId not yet implemented");
+    const { itemId } = req.params as { itemId: string };
+    const body = validateBody(UpdateItemSchema, req.body);
+    const item = await cartService.updateItemQuantity(req.user!.id, itemId, body.quantity);
+    res.status(200).json(item);
   } catch (err) {
     next(err);
   }
@@ -91,11 +91,11 @@ export async function updateItem(_req: Request, _res: Response, next: NextFuncti
  * DELETE /api/v1/carrito/items/:itemId
  * Removes a single cart item (ownership-enforced).
  */
-export async function removeItem(_req: Request, _res: Response, next: NextFunction): Promise<void> {
+export async function removeItem(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    // TODO(PR #3): call cartService.removeItem(req.user.id, itemId)
-    await Promise.resolve();
-    throw new NotImplementedError("DELETE /carrito/items/:itemId not yet implemented");
+    const { itemId } = req.params as { itemId: string };
+    await cartService.removeItem(req.user!.id, itemId);
+    res.status(204).send();
   } catch (err) {
     next(err);
   }

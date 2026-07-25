@@ -306,26 +306,59 @@ export async function addItem(
 
 /**
  * PATCH /carrito/items/:itemId — update quantity only.
- * Preserves unitPriceSnapshot (NFR-2).
- * STUB in PR #1 — implemented in PR #3.
+ * Preserves unitPriceSnapshot (NFR-2, never included in the write).
+ *
+ * Rules (spec §"PATCH /carrito/items/:itemId updates quantity only"):
+ *   1. Load the CartItem scoped to ownership (`cart: { userId }`); 404 if the
+ *      item does not exist or belongs to a different user (NFR-6 — no-leak,
+ *      same status for "unknown" and "unowned").
+ *   2. Re-validate `quantity` against the freshly-loaded `Product.stock`
+ *      (nested in the same query — no separate product lookup needed).
+ *   3. Update `quantity` only; the write payload never references
+ *      `unitPriceSnapshot`.
  */
 export async function updateItemQuantity(
-  _userId: string,
-  _itemId: string,
-  _quantity: number,
+  userId: string,
+  itemId: string,
+  quantity: number,
 ): Promise<CartItemView> {
-  await Promise.resolve();
-  throw new Error("NOT_IMPLEMENTED");
+  const item = await prisma.cartItem.findFirst({
+    where: { id: itemId, cart: { userId } },
+    include: { product: { include: { producer: true } } },
+  });
+
+  if (!item) {
+    throw new NotFoundError("Cart item not found");
+  }
+  if (quantity > item.product.stock) {
+    throw new QuantityExceedsStockError("Quantity exceeds available stock");
+  }
+
+  const updated = await prisma.cartItem.update({
+    where: { id: itemId },
+    data: { quantity },
+    include: { product: { include: { producer: true } } },
+  });
+
+  return mapCartItemView(updated);
 }
 
 /**
  * DELETE /carrito/items/:itemId — remove a single item.
- * Ownership-enforced 404 (NFR-6).
- * STUB in PR #1 — implemented in PR #3.
+ * Ownership-enforced 404 (NFR-6): the ownership lookup happens before the
+ * delete, so an unowned/unknown itemId never reaches `prisma.cartItem.delete`.
  */
-export async function removeItem(_userId: string, _itemId: string): Promise<void> {
-  await Promise.resolve();
-  throw new Error("NOT_IMPLEMENTED");
+export async function removeItem(userId: string, itemId: string): Promise<void> {
+  const item = await prisma.cartItem.findFirst({
+    where: { id: itemId, cart: { userId } },
+    select: { id: true },
+  });
+
+  if (!item) {
+    throw new NotFoundError("Cart item not found");
+  }
+
+  await prisma.cartItem.delete({ where: { id: itemId } });
 }
 
 /**
