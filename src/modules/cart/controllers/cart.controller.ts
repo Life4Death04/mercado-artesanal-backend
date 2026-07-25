@@ -6,17 +6,14 @@
  * and caught by the central errorMiddleware (RFC 7807).
  *
  * PR #2 implements: getCart, addItem (real behavior).
- * PR #3 implements: updateItem, removeItem (real behavior). clearCart
- * remains a PR #1 stub — it throws NotImplementedError (501) so the
- * response still goes through errorMiddleware and uses the canonical
- * application/problem+json envelope.
+ * PR #3 implements: updateItem, removeItem, clearCart (real behavior).
  *
  * Response codes:
  *   GET  /carrito               → 200 CartReadView                  (PR #2)
  *   POST /carrito/items         → 201 CartItemView                  (PR #2)
  *   PATCH /carrito/items/:id    → 200 CartItemView                  (PR #3)
  *   DELETE /carrito/items/:id   → 204 No Content                    (PR #3)
- *   DELETE /carrito             → 200 CartReadView (empty items)     (PR #3 stub)
+ *   DELETE /carrito             → 200 CartReadView (empty items)     (PR #3)
  *
  * Auth chain (design Data Flow, verified against addresses.routes.ts:33):
  *   authenticate → loadUser → onboardingGate → requireRole(CONSUMER|PRODUCER|ADMIN) → controller
@@ -32,7 +29,6 @@
  */
 import type { NextFunction, Request, Response } from "express";
 
-import { NotImplementedError } from "@/shared/errors/errors";
 import { validateBody } from "@/shared/validation/zod";
 
 import { AddItemSchema, UpdateItemSchema } from "../dto/cart.dto";
@@ -67,9 +63,7 @@ export async function addItem(req: Request, res: Response, next: NextFunction): 
 }
 
 // ---------------------------------------------------------------------------
-// PR #3 — real behavior for updateItem/removeItem. clearCart is still a
-// stub (throws NotImplementedError → 501) so the response goes through
-// errorMiddleware and uses the RFC 7807 Problem Details envelope.
+// PR #3 — real behavior for updateItem/removeItem/clearCart.
 // ---------------------------------------------------------------------------
 
 /**
@@ -105,11 +99,10 @@ export async function removeItem(req: Request, res: Response, next: NextFunction
  * DELETE /api/v1/carrito
  * Clears all items but preserves the Cart row identity.
  */
-export async function clearCart(_req: Request, _res: Response, next: NextFunction): Promise<void> {
+export async function clearCart(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    // TODO(PR #3): call cartService.clearCart(req.user.id)
-    await Promise.resolve();
-    throw new NotImplementedError("DELETE /carrito not yet implemented");
+    const view = await cartService.clearCart(req.user!.id);
+    res.status(200).json(view);
   } catch (err) {
     next(err);
   }

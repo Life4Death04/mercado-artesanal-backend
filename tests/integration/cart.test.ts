@@ -31,13 +31,17 @@
  *   [C-POST-3] POST /carrito/items — 422 QUANTITY_EXCEEDS_STOCK when quantity > stock
  *   [C-POST-4] POST /carrito/items — 422 VALIDATION_FAILED on malformed body (Zod)
  *
- * PR #3 scenarios covered so far (spec §R4 PATCH, §R5 DELETE item; WU4-T1, WU5-T1):
+ * PR #3 scenarios covered (spec §R4 PATCH, §R5 DELETE item, §R6 DELETE cart):
  *   [C-PATCH-1] PATCH /carrito/items/:itemId — 200 on successful update
  *   [C-PATCH-2] PATCH /carrito/items/:itemId — 422 QUANTITY_EXCEEDS_STOCK
  *   [C-PATCH-3] PATCH /carrito/items/:itemId — 404 unowned/unknown item
  *   [C-DELITEM-1] DELETE /carrito/items/:itemId — 204 no body on success
  *   [C-DELITEM-2] DELETE /carrito/items/:itemId — 404 unowned/unknown item
- * PR #3 will also add: DELETE /carrito (WU6-T1) — remains a stub for now.
+ *   [C-DELCART-1] DELETE /carrito — 200 clears items, keeps cart id stable
+ *   [C-DELCART-2] DELETE /carrito — 200 synthetic empty view when no Cart row exists
+ *
+ * getCartForCheckout (WU7-T1) has no HTTP endpoint — internal contract for the
+ * `orders` slice; covered by unit tests only (tests/unit/cart.service.test.ts).
  *
  * Spec references:
  *   cart §R7 "All endpoints require authenticated, onboarded users with a completed role"
@@ -617,5 +621,40 @@ describe("DELETE /api/v1/carrito/items/:itemId — real behavior (PR #3)", () =>
     expect(res.status).toBe(404);
     expect(res.headers["content-type"]).toContain("application/problem+json");
     expect(res.body).toMatchObject({ code: "NOT_FOUND" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// [C-DELCART] DELETE /carrito — real behavior (PR #3)
+// ---------------------------------------------------------------------------
+
+describe("DELETE /api/v1/carrito — real behavior (PR #3)", () => {
+  it("[C-DELCART-1] returns 200, clears items, and keeps the cart id stable", async () => {
+    const user = makeUser();
+    mockLoadUser(user);
+    const cart = makeCart({ userId: user.id });
+    mockedCart.findUnique.mockResolvedValueOnce(cart);
+    mockedCartItem.deleteMany.mockResolvedValueOnce({ count: 2 });
+
+    const res = await request
+      .delete("/api/v1/carrito")
+      .set("x-test-auth", authHeader(consumerClaim()));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ id: "cart_cart_001", items: [] });
+  });
+
+  it("[C-DELCART-2] returns 200 with the synthetic empty view when the user has no Cart row", async () => {
+    const user = makeUser();
+    mockLoadUser(user);
+    mockedCart.findUnique.mockResolvedValueOnce(null);
+
+    const res = await request
+      .delete("/api/v1/carrito")
+      .set("x-test-auth", authHeader(consumerClaim()));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ id: null, userId: user.id, items: [], createdAt: null, updatedAt: null });
+    expect(mockedCartItem.deleteMany).not.toHaveBeenCalled();
   });
 });
