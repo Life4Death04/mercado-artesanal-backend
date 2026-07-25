@@ -21,6 +21,7 @@
  *   deliveryModesRouter  — Cycle 2: producer-scoped CRUD under /producers/me/delivery-modes[/:id]
  *   subOrdersRouter      — Cycle 2: producer-scoped read + state-machine PATCH under /producers/me/sub-orders[/:id]
  *   statisticsRouter     — Cycle 2: GET /producers/me/stats/{revenue,order-count,low-stock} (producer)
+ *   cartRouter           — Cycle 3: consumer cart CRUD under /carrito (cart-foundation PR #1)
  *
  * Mount order: public routers (categoriesRouter, producersRouter GET /:id) are registered
  * BEFORE auth-gated routers so they are reachable without any auth header.
@@ -32,6 +33,7 @@ import { Router } from "express";
 
 import { addressesRouter } from "./addresses/routes/addresses.routes";
 import { authRouter } from "./auth/routes/auth.routes";
+import { cartRouter } from "./cart/routes/cart.routes";
 import { categoriesRouter } from "./categories/routes/categories.routes";
 import { deliveryModesRouter } from "./delivery-modes/routes/delivery-modes.routes";
 import { imagesRouter } from "./images/routes/images.routes";
@@ -60,3 +62,4 @@ apiRouter.use(imagesRouter);
 apiRouter.use(deliveryModesRouter);
 apiRouter.use(subOrdersRouter);
 apiRouter.use(statisticsRouter);
+apiRouter.use(cartRouter);
