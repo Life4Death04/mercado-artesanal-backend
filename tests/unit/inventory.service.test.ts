@@ -1,9 +1,10 @@
 /**
- * Unit tests — inventory.service (Slice 5 TDD, RED phase + CORRECTIVE-RED patch).
+ * Unit tests — inventory.service (Slice 5 TDD, RED phase + CORRECTIVE-RED patch;
+ * Cycle 4 orders WU1 adds restockProduct coverage).
  *
  * Strategy: mock prisma singleton so no DB is required.
  * Tests exercise service-level business logic: quantity validation,
- * ownership enforcement, stock decrement invariants, tx delegation,
+ * ownership enforcement, stock decrement/increment invariants, tx delegation,
  * low-stock query filtering/pagination, and the frozen Cycle 3 type contract.
  *
  * CORRECTIVE-RED note: findLowStock now uses $queryRaw (not findMany) to enforce
@@ -20,6 +21,13 @@
  *   - post-decrement stock < 0 → InsufficientStockError (409) with tx rollback path
  *   - with caller tx provided: runs on caller's tx (no self-tx opened)
  *   - without tx: opens own $transaction (called exactly once)
+ *
+ * restockProduct (Cycle 4 orders WU1, design Decision 1 — mirrors decrementStock EXACTLY):
+ *   - quantity = 0 rejected synchronously (no DB touch — $transaction not called)
+ *   - quantity = -1 rejected synchronously (no DB touch — $transaction not called)
+ *   - with caller tx provided: runs on caller's tx (no self-tx opened), applies { stock: { increment } }
+ *   - without tx: opens own $transaction (called exactly once)
+ *   - unknown productId (P2025) → ProductNotFoundError
  *
  * findLowStock:
  *   - delegates to $queryRaw (raw SQL path — not findMany)
@@ -38,6 +46,7 @@
  *             §"Soft-deleted or inactive product excluded",
  *             §"Low-stock query"
  *   design    Decision #7 (dual tx mode), ADR-003 (no repositories/ layer)
+ *   orders design Decision 1 (restock primitive, mirrors decrementStock)
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Prisma } from "@prisma/client";
@@ -313,6 +322,103 @@ describe("inventoryService.findLowStock — pagination", () => {
     // $queryRaw called once — offset=30 embedded in the SQL template
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((mockedPrisma as any).$queryRaw).toHaveBeenCalledOnce();
+  });
+});
+
+// ===========================================================================
+// restockProduct — synchronous validation (Cycle 4 orders WU1)
+// ===========================================================================
+
+describe("inventoryService.restockProduct — synchronous validation", () => {
+  it("rejects quantity = 0 synchronously before any DB touch", async () => {
+    await expect(inventoryService.restockProduct("product_001", 0)).rejects.toThrow(
+      ValidationFailedError,
+    );
+    // $transaction must NOT have been called — validation is pre-DB
+    expect(mockedPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("rejects quantity = -1 synchronously before any DB touch", async () => {
+    await expect(inventoryService.restockProduct("product_001", -1)).rejects.toThrow(
+      ValidationFailedError,
+    );
+    expect(mockedPrisma.$transaction).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// restockProduct — unknown product (P2025 → ProductNotFoundError)
+// ===========================================================================
+
+describe("inventoryService.restockProduct — unknown product", () => {
+  it("throws ProductNotFoundError when productId does not exist (P2025)", async () => {
+    // GIVEN: $transaction runs the callback and tx.product.update rejects with P2025
+    const p2025 = Object.assign(new Error("Record to update not found."), { code: "P2025" });
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const fakeTx = {
+          product: {
+            update: vi.fn().mockRejectedValue(p2025),
+          },
+        };
+        return fn(fakeTx as unknown as typeof prisma);
+      },
+    );
+
+    await expect(inventoryService.restockProduct("p_missing", 1)).rejects.toThrow(
+      ProductNotFoundError,
+    );
+  });
+});
+
+// ===========================================================================
+// restockProduct — self-managed transaction (no caller tx)
+// ===========================================================================
+
+describe("inventoryService.restockProduct — self-managed transaction", () => {
+  it("opens its own $transaction when tx is not provided", async () => {
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const fakeTx = {
+          product: {
+            update: vi.fn().mockResolvedValue(makeProduct({ stock: 11 })),
+          },
+        };
+        return fn(fakeTx as unknown as typeof prisma);
+      },
+    );
+
+    await inventoryService.restockProduct("product_001", 1);
+
+    // THEN: the service opened exactly one self-managed transaction
+    expect(mockedPrisma.$transaction).toHaveBeenCalledOnce();
+  });
+});
+
+// ===========================================================================
+// restockProduct — caller-provided tx: applies { stock: { increment } }
+// ===========================================================================
+
+describe("inventoryService.restockProduct — caller-provided transaction", () => {
+  it("runs on caller's tx, does NOT open a new $transaction, and increments stock", async () => {
+    // GIVEN: a fake caller tx object
+    const updateMock = vi.fn().mockResolvedValue(makeProduct({ stock: 12 }));
+    const callerTx = {
+      product: {
+        update: updateMock,
+      },
+    } as unknown as Prisma.TransactionClient;
+
+    // WHEN: restockProduct receives the caller's tx
+    await inventoryService.restockProduct("product_001", 2, callerTx);
+
+    // THEN: the service does NOT open its own $transaction
+    expect(mockedPrisma.$transaction).not.toHaveBeenCalled();
+    // AND: the caller tx's product.update was called with { stock: { increment: quantity } }
+    expect(updateMock).toHaveBeenCalledWith({
+      where: { id: "product_001" },
+      data: { stock: { increment: 2 } },
+    });
   });
 });
 

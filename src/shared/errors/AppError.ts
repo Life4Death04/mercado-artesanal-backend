@@ -41,7 +41,10 @@ export type ErrorCode =
   // Cycle 3 additions
   | "PRODUCT_INACTIVE"
   | "QUANTITY_EXCEEDS_STOCK"
-  | "NOT_IMPLEMENTED";
+  | "NOT_IMPLEMENTED"
+  // Cycle 4 additions — orders slice (consumer-purchase-flow 2/3)
+  | "EMPTY_CART_CHECKOUT"
+  | "CART_ITEM_NOT_AVAILABLE";
 
 export interface ProblemDetails {
   type: string;
