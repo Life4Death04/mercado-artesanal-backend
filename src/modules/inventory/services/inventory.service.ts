@@ -17,6 +17,9 @@
  *     which causes the surrounding $transaction to roll back.
  *   - decrementStock: accepts optional caller tx (Cycle 3 composition) —
  *     if tx is provided, runs on it; if undefined, opens own $transaction.
+ *   - restockProduct (Cycle 4 orders WU1, NEW sibling export): mirrors
+ *     decrementStock EXACTLY but increments instead of decrements. Used by
+ *     orders `cancelOrder` to restore stock. decrementStock stays byte-unchanged.
  *   - findLowStock: enforces stock <= lowStockThreshold (cross-column, via $queryRaw)
  *     AND deletedAt IS NULL AND isActive = true; ordered stock ASC, name ASC;
  *     paginated (default 20, cap 100); no HTTP route (owned by sales-stats Slice 10).
@@ -200,6 +203,81 @@ async function _decrementStockInTx(
     throw new InsufficientStockError(
       `Insufficient stock: attempted to decrement by ${quantity} but stock would become ${updated.stock}`,
     );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// restockProduct — Cycle 4 orders WU1 addition (NEW sibling export)
+// ---------------------------------------------------------------------------
+
+/**
+ * Atomically restock a product's stock by `quantity` — the inverse of
+ * `decrementStock`. Added for the orders slice `cancelOrder` flow (design
+ * Decision 1): mirrors `decrementStock` EXACTLY except for the direction of
+ * the stock update. The frozen `decrementStock` above is byte-unchanged.
+ *
+ * Behavior:
+ *   1. Reject quantity <= 0 SYNCHRONOUSLY before any DB touch (ValidationFailedError 422).
+ *   2. If `tx` is provided, run the operation on the caller's transaction.
+ *      If `tx` is undefined, open a self-managed $transaction.
+ *   3. Apply Prisma `{ stock: { increment: quantity } }`.
+ *   4. If the product row does not exist (Prisma P2025) → ProductNotFoundError (404).
+ *
+ * No upper-bound check: restock cannot violate the non-negative stock invariant
+ * (RNF-13) — incrementing stock only ever moves it further from zero.
+ *
+ * Spec: orders design Decision 1 (restock primitive)
+ */
+export async function restockProduct(
+  productId: string,
+  quantity: number,
+  tx?: PrismaTx,
+): Promise<void> {
+  // Step 1: synchronous validation — no DB touch at all
+  if (quantity <= 0) {
+    throw new ValidationFailedError(
+      [{ path: "quantity", message: "Quantity must be greater than zero" }],
+      "Invalid quantity for stock restock",
+    );
+  }
+
+  // Step 2: choose transaction context
+  if (tx) {
+    // Caller provided a transaction — run on it directly (no nested tx)
+    await _restockProductInTx(productId, quantity, tx);
+  } else {
+    // No tx provided — open self-managed $transaction
+    await prisma.$transaction(async (innerTx) => {
+      await _restockProductInTx(productId, quantity, innerTx);
+    });
+  }
+}
+
+/**
+ * Internal implementation that runs inside a transaction context.
+ * Called either with the caller's tx or with the service's own inner tx.
+ */
+async function _restockProductInTx(
+  productId: string,
+  quantity: number,
+  tx: PrismaTx,
+): Promise<void> {
+  // Step 3: apply the increment — Prisma update on missing id throws P2025
+  try {
+    await tx.product.update({
+      where: { id: productId },
+      data: { stock: { increment: quantity } },
+    });
+  } catch (err) {
+    // Prisma error P2025: record to update not found
+    if (
+      err instanceof Error &&
+      "code" in err &&
+      (err as { code: string }).code === "P2025"
+    ) {
+      throw new ProductNotFoundError(`Product not found: ${productId}`);
+    }
+    throw err;
   }
 }
 

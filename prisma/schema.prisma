@@ -297,12 +297,16 @@ model DeliveryMode {
 /// Payment record. STUB in Cycle 2 — providerRef is nullable and will be filled
 /// by Cycle 3 Stripe integration (zero additional migration required).
 /// Fields match Stripe PaymentIntent shape: providerRef ↔ PI id, amount, currency.
+/// providerRef is @unique (Cycle 4 orders WU1, design Decision 4) — the webhook
+/// idempotency backstop: a second createOrderFromPayment call for the same
+/// Stripe intent rejects with P2002 on tx.payment.create, letting the caller's
+/// fresh-transaction retry recover idempotently via the providerRef pre-check.
 model Payment {
   id          String        @id @default(cuid())
   status      PaymentStatus @default(PENDING)
   amount      Decimal       @db.Decimal(10, 2)
   currency    String        @default("EUR")
-  providerRef String?       @map("provider_ref")
+  providerRef String?       @unique @map("provider_ref")
   createdAt   DateTime      @default(now()) @map("created_at")
   updatedAt   DateTime      @updatedAt @map("updated_at")
 
@@ -319,6 +323,10 @@ model Order {
   userId      String      @map("user_id")
   paymentId   String      @unique @map("payment_id")
   totalAmount Decimal     @map("total_amount") @db.Decimal(10, 2)
+  /// Derived at read-time via deriveOrderStatus(); the stored value is NOT
+  /// maintained — do NOT filter, sort, index, or report on this column at
+  /// the DB level. (orders design Decision 2 — compute-on-read, sole authority
+  /// is the deriveOrderStatus() function applied on every list/detail/cancel read.)
   status      OrderStatus @default(PENDING)
   createdAt   DateTime    @default(now()) @map("created_at")
   updatedAt   DateTime    @updatedAt @map("updated_at")
@@ -400,7 +408,7 @@ model CartItem {
   productId         String   @map("product_id")
   product           Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
   quantity          Int
-  unitPriceSnapshot Decimal  @db.Decimal(10, 2) @map("unit_price_snapshot")
+  unitPriceSnapshot Decimal  @map("unit_price_snapshot") @db.Decimal(10, 2)
   createdAt         DateTime @default(now()) @map("created_at")
   updatedAt         DateTime @updatedAt @map("updated_at")
 
