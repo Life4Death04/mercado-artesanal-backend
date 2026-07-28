@@ -66,6 +66,8 @@
  * false-greens. The CI pipeline MUST start the postgres container before
  * running `pnpm test`.
  */
+import { randomUUID } from "node:crypto";
+
 import { PrismaClient } from "@prisma/client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -99,18 +101,38 @@ async function isDbReachable(): Promise<boolean> {
 // branch actually fires (i.e. a real P2002 was caught) — [O5] below uses it
 // as a deterministic, non-flaky proof that the recovery path executed,
 // instead of inferring it indirectly from settlement order.
+//
+// `applicationNameTag`, when provided, is applied via `SET LOCAL
+// application_name` as the FIRST statement inside each attempt's
+// transaction — [O5]'s `waitForLockWait` uses this tag to identify THIS
+// call's own Postgres backend specifically, instead of matching ANY backend
+// blocked on ANY lock. `SET LOCAL` is transaction-scoped: it is
+// automatically reset at COMMIT/ROLLBACK, so it cannot leak onto the pooled
+// connection for unrelated queries once this attempt's transaction ends.
 // ---------------------------------------------------------------------------
 async function invokeWithP2002Recovery(
   stripeIntentId: string,
   cartView: Awaited<ReturnType<typeof cartService.getCartForCheckout>>,
   deliverySelections: { producerId: string; deliveryModeId: string }[],
-  onRecovery?: () => void,
+  options?: { onRecovery?: () => void; applicationNameTag?: string },
 ): Promise<ordersService.OrderDetailView> {
-  try {
-    return await prisma.$transaction(
-      (tx) => ordersService.createOrderFromPayment(stripeIntentId, cartView, deliverySelections, tx),
+  const { onRecovery, applicationNameTag } = options ?? {};
+
+  const attempt = () =>
+    prisma.$transaction(
+      async (tx) => {
+        if (applicationNameTag) {
+          // SET does not accept bind parameters in Postgres — safe here
+          // because the tag is a test-generated constant, never user input.
+          await tx.$executeRawUnsafe(`SET LOCAL application_name = '${applicationNameTag}'`);
+        }
+        return ordersService.createOrderFromPayment(stripeIntentId, cartView, deliverySelections, tx);
+      },
       { timeout: 20000, maxWait: 20000 },
     );
+
+  try {
+    return await attempt();
   } catch (err: unknown) {
     const isProviderRefConflict =
       typeof err === "object" && err !== null && (err as { code?: string }).code === "P2002";
@@ -118,22 +140,29 @@ async function invokeWithP2002Recovery(
       throw err;
     }
     onRecovery?.();
-    return prisma.$transaction(
-      (tx) => ordersService.createOrderFromPayment(stripeIntentId, cartView, deliverySelections, tx),
-      { timeout: 20000, maxWait: 20000 },
-    );
+    return attempt();
   }
 }
 
 /**
- * Resolves once some other backend in this database is genuinely BLOCKED
- * waiting on a lock (`pg_stat_activity.wait_event_type = 'Lock'`) — used by
- * [O5] to confirm, via real DB state rather than a timing guess, that a
- * concurrent transaction has reached and is stuck on a conflicting INSERT
- * before we allow the lock-holder to commit. Throws (test fails LOUDLY,
- * never silently passes) if no such block appears within `timeoutMs`.
+ * Resolves once the backend tagged with `applicationNameTag` (via `SET
+ * LOCAL application_name` — see `invokeWithP2002Recovery`) is genuinely
+ * BLOCKED waiting on a lock (`pg_stat_activity.wait_event_type = 'Lock'`) —
+ * used by [O5] to confirm, via real DB state rather than a timing guess,
+ * that Call B SPECIFICALLY has reached and is stuck on its conflicting
+ * INSERT before we allow Call A's held transaction to commit.
+ *
+ * Scoping to `applicationNameTag` (rather than "any backend blocked on any
+ * lock") matters under parallel vitest integration files: an UNRELATED
+ * concurrent lock wait in a different test file could otherwise satisfy an
+ * unscoped predicate, releasing Call A prematurely and letting Call B's
+ * step-0 idempotency pre-check no-op — silently defeating the race this
+ * test exists to prove.
+ *
+ * Throws (test fails LOUDLY, never silently passes) if no such block from
+ * the tagged backend appears within `timeoutMs`.
  */
-async function waitForLockWait(dbClient: PrismaClient, timeoutMs: number): Promise<void> {
+async function waitForLockWait(dbClient: PrismaClient, timeoutMs: number, applicationNameTag: string): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const rows = await dbClient.$queryRaw<{ count: bigint }[]>`
@@ -141,6 +170,7 @@ async function waitForLockWait(dbClient: PrismaClient, timeoutMs: number): Promi
       FROM pg_stat_activity
       WHERE datname = current_database()
         AND wait_event_type = 'Lock'
+        AND application_name = ${applicationNameTag}
         AND pid <> pg_backend_pid()
     `;
     if (Number(rows[0]?.count ?? 0) > 0) {
@@ -149,7 +179,7 @@ async function waitForLockWait(dbClient: PrismaClient, timeoutMs: number): Promi
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(
-    "waitForLockWait: timed out waiting for a blocked backend — the forced overlapping race did not materialize",
+    `waitForLockWait: timed out waiting for backend tagged "${applicationNameTag}" to block on a lock — the forced overlapping race did not materialize`,
   );
 }
 
@@ -634,27 +664,63 @@ describe("createOrderFromPayment — duplicate webhook recovers via real P2002 [
       // SAME `providerRef`, which BLOCKS on the unique-index entry A's still-
       // open transaction holds (Postgres row-level lock wait, not an
       // immediate error).
+      //
+      // Call B's own transaction is tagged with a per-run-unique
+      // `application_name` (via `invokeWithP2002Recovery`'s `SET LOCAL`) so
+      // `waitForLockWait` below can confirm SPECIFICALLY Call B is blocked —
+      // not an unrelated backend from a parallel test file.
       let recoveryFired = false;
-      const bPromise = invokeWithP2002Recovery(intentId, cartView, selections, () => {
-        recoveryFired = true;
+      const callBTag = `orders_test_o5_call_b_${randomUUID()}`;
+      const bPromise = invokeWithP2002Recovery(intentId, cartView, selections, {
+        onRecovery: () => {
+          recoveryFired = true;
+        },
+        applicationNameTag: callBTag,
       });
 
-      // Confirm B is genuinely blocked on that lock (via real DB state, not a
-      // timing guess) before releasing A. This removes the last source of
-      // non-determinism: we only proceed once Postgres itself reports a
-      // backend waiting on a lock.
-      await waitForLockWait(db, 5000);
+      // Confirm Call B specifically is genuinely blocked on that lock (via
+      // real DB state, not a timing guess) before releasing A. This removes
+      // the last source of non-determinism: we only proceed once Postgres
+      // itself reports Call B's own backend waiting on a lock.
+      //
+      // `releaseA.resolve()` MUST run on every exit path from here — even if
+      // `waitForLockWait` throws (bounded 5s timeout) — otherwise Call A's
+      // interactive transaction stays open until Prisma's 20s tx timeout,
+      // potentially leaking locks into later tests/teardown. The try/finally
+      // guarantees that; `Promise.allSettled` afterwards guarantees BOTH
+      // Call A's and Call B's promises are fully drained/settled before this
+      // test exits on every path, so no transaction is left dangling.
+      let lockWaitError: unknown;
+      try {
+        await waitForLockWait(db, 5000, callBTag);
+      } catch (err) {
+        lockWaitError = err;
+      } finally {
+        // Release A -> A commits -> Postgres immediately fails B's blocked
+        // INSERT with a REAL unique_violation (P2002), which bubbles out of
+        // B's `tx` UNCAUGHT (design Decision 4, "Recovery is a CALLER
+        // contract, not an in-tx catch") and is caught by
+        // `invokeWithP2002Recovery`, which retries with a FRESH
+        // `$transaction` — that retry's step-0 pre-check now finds A's
+        // committed row and recovers idempotently. If the lock wait timed
+        // out instead, this release still prevents A's transaction from
+        // leaking past this test.
+        releaseA.resolve();
+      }
 
-      // Release A -> A commits -> Postgres immediately fails B's blocked
-      // INSERT with a REAL unique_violation (P2002), which bubbles out of
-      // B's `tx` UNCAUGHT (design Decision 4, "Recovery is a CALLER
-      // contract, not an in-tx catch") and is caught by
-      // `invokeWithP2002Recovery`, which retries with a FRESH `$transaction`
-      // — that retry's step-0 pre-check now finds A's committed row and
-      // recovers idempotently.
-      releaseA.resolve();
+      const [aSettled, bSettled] = await Promise.allSettled([aPromise, bPromise]);
 
-      const [aResult, bResult] = await Promise.all([aPromise, bPromise]);
+      if (lockWaitError) {
+        throw lockWaitError;
+      }
+      if (aSettled.status === "rejected") {
+        throw aSettled.reason;
+      }
+      if (bSettled.status === "rejected") {
+        throw bSettled.reason;
+      }
+      const aResult = aSettled.value;
+      const bResult = bSettled.value;
 
       // Deterministic proof the RECOVERY PATH fired — not just that both
       // calls happened to settle to the same order (which a purely
