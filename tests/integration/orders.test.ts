@@ -38,14 +38,22 @@
  *     THEN A and B are deleted but C SURVIVES (delete is id-scoped, not
  *     cart-scoped)
  *
- *   [O5] Duplicate-intent fresh-$transaction recovery (real P2002)
- *     GIVEN two concurrent calls to createOrderFromPayment for the SAME
- *     stripeIntentId (simulating a replayed webhook racing the original)
- *     WHEN the loser's payment.create hits the real `providerRef @unique`
- *     constraint (P2002) and bubbles out uncaught
+ *   [O5] Duplicate-intent fresh-$transaction recovery (real P2002, FORCED overlap)
+ *     GIVEN two calls to createOrderFromPayment for the SAME stripeIntentId
+ *     (simulating a replayed webhook racing the original), where the FIRST
+ *     call is deliberately held open (uncommitted) via a barrier after its
+ *     writes complete, and the SECOND is only released past its lock-wait
+ *     once `pg_stat_activity` confirms it is genuinely blocked — this
+ *     guarantees a real overlap instead of hoping the event loop races two
+ *     unconstrained calls (which can validly no-op via the step-0 pre-check
+ *     with zero P2002 ever occurring)
+ *     WHEN the loser's payment.create BLOCKS on the winner's still-open
+ *     transaction, then hits the real `providerRef @unique` constraint
+ *     (P2002) once the winner commits, and bubbles out uncaught
  *     THEN a CALLER-level fresh-$transaction retry (mirroring the payments
  *     webhook handler contract) recovers idempotently via the step-0
- *     pre-check, and exactly ONE Order/Payment row exists for that intent
+ *     pre-check — proven via a deterministic `recoveryFired` flag, not just
+ *     outcome inference — and exactly ONE Order/Payment row exists
  *
  * Spec references:
  *   orders §"createOrderFromPayment writes the order aggregate atomically"
@@ -86,15 +94,22 @@ async function isDbReachable(): Promise<boolean> {
 // Caller-level recovery wrapper — mirrors the payments webhook handler
 // contract (design Decision 4, "Recovery is a CALLER contract, not an
 // in-tx catch"): open a FRESH $transaction on P2002 and retry.
+//
+// `onRecovery` is an optional test-only hook invoked exactly when the catch
+// branch actually fires (i.e. a real P2002 was caught) — [O5] below uses it
+// as a deterministic, non-flaky proof that the recovery path executed,
+// instead of inferring it indirectly from settlement order.
 // ---------------------------------------------------------------------------
 async function invokeWithP2002Recovery(
   stripeIntentId: string,
   cartView: Awaited<ReturnType<typeof cartService.getCartForCheckout>>,
   deliverySelections: { producerId: string; deliveryModeId: string }[],
+  onRecovery?: () => void,
 ): Promise<ordersService.OrderDetailView> {
   try {
-    return await prisma.$transaction((tx) =>
-      ordersService.createOrderFromPayment(stripeIntentId, cartView, deliverySelections, tx),
+    return await prisma.$transaction(
+      (tx) => ordersService.createOrderFromPayment(stripeIntentId, cartView, deliverySelections, tx),
+      { timeout: 20000, maxWait: 20000 },
     );
   } catch (err: unknown) {
     const isProviderRefConflict =
@@ -102,10 +117,52 @@ async function invokeWithP2002Recovery(
     if (!isProviderRefConflict) {
       throw err;
     }
-    return prisma.$transaction((tx) =>
-      ordersService.createOrderFromPayment(stripeIntentId, cartView, deliverySelections, tx),
+    onRecovery?.();
+    return prisma.$transaction(
+      (tx) => ordersService.createOrderFromPayment(stripeIntentId, cartView, deliverySelections, tx),
+      { timeout: 20000, maxWait: 20000 },
     );
   }
+}
+
+/**
+ * Resolves once some other backend in this database is genuinely BLOCKED
+ * waiting on a lock (`pg_stat_activity.wait_event_type = 'Lock'`) — used by
+ * [O5] to confirm, via real DB state rather than a timing guess, that a
+ * concurrent transaction has reached and is stuck on a conflicting INSERT
+ * before we allow the lock-holder to commit. Throws (test fails LOUDLY,
+ * never silently passes) if no such block appears within `timeoutMs`.
+ */
+async function waitForLockWait(dbClient: PrismaClient, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const rows = await dbClient.$queryRaw<{ count: bigint }[]>`
+      SELECT count(*)::bigint AS count
+      FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND wait_event_type = 'Lock'
+        AND pid <> pg_backend_pid()
+    `;
+    if (Number(rows[0]?.count ?? 0) > 0) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(
+    "waitForLockWait: timed out waiting for a blocked backend — the forced overlapping race did not materialize",
+  );
+}
+
+/** Deferred promise — used to hold a transaction open until explicitly released. */
+function createDeferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
 }
 
 // ---------------------------------------------------------------------------
@@ -324,11 +381,27 @@ describe("createOrderFromPayment — full rollback on decrementStock failure [O2
       const cartView = await cartService.getCartForCheckout(consumer.id);
       expect(cartView.items).toHaveLength(2);
 
+      // `getCartForCheckout` has NO `orderBy` (cart.service.ts:440-459) —
+      // Postgres/Prisma give no ordering guarantee on `cartView.items`. If the
+      // SHORT line happened to come first, `createOrderFromPayment` would
+      // throw on step 8's FIRST iteration, before the healthy line's
+      // `decrementStock` ever ran — in that case `freshHealthy.stock === 10`
+      // below would pass TRIVIALLY (nothing was ever touched), proving
+      // nothing about rollback. Force the healthy line to be processed FIRST
+      // so its decrement is GUARANTEED to happen (and be visible only inside
+      // the still-open tx) before the short line's throw, making the
+      // post-rollback assertion an unambiguous proof of atomicity.
+      const healthyItem = cartView.items.find((item) => item.productId === productHealthy.id)!;
+      const shortItem = cartView.items.find((item) => item.productId === productShort.id)!;
+      expect(healthyItem).toBeDefined();
+      expect(shortItem).toBeDefined();
+      const orderedCartView = { ...cartView, items: [healthyItem, shortItem] };
+
       await expect(
         prisma.$transaction((tx) =>
           ordersService.createOrderFromPayment(
             "pi_o2_rollback",
-            cartView,
+            orderedCartView,
             [{ producerId: producer.id, deliveryModeId: dm.id }],
             tx,
           ),
@@ -339,7 +412,10 @@ describe("createOrderFromPayment — full rollback on decrementStock failure [O2
       expect(payment).toBeNull();
 
       const freshHealthy = await db.product.findUniqueOrThrow({ where: { id: productHealthy.id } });
-      expect(freshHealthy.stock).toBe(10); // untouched — proves the FIRST line's decrement rolled back too
+      // Healthy is FORCED (see orderedCartView above) to be decremented before the
+      // short line throws, so stock===10 here is an unambiguous proof of rollback —
+      // not a coincidence of an early throw that never touched this row.
+      expect(freshHealthy.stock).toBe(10);
 
       const remainingCartItems = await db.cartItem.count({ where: { cart: { userId: consumer.id } } });
       expect(remainingCartItems).toBe(2); // cart clear also rolled back
@@ -519,24 +595,78 @@ describe("createOrderFromPayment — duplicate webhook recovers via real P2002 [
       const intentId = "pi_o5_duplicate_webhook";
       const selections = [{ producerId: producer.id, deliveryModeId: dm.id }];
 
-      const [r1, r2] = await Promise.allSettled([
-        invokeWithP2002Recovery(intentId, cartView, selections),
-        invokeWithP2002Recovery(intentId, cartView, selections),
-      ]);
+      // ---------------------------------------------------------------------
+      // Force a GENUINE, deterministic overlap instead of hoping the event
+      // loop interleaves two `Promise.allSettled` calls into a real race.
+      // (A naive `expect(recoveryCount).toBeGreaterThan(0)` on an
+      // unconstrained race would FLAKE: a valid scheduling has the second
+      // call's step-0 pre-check see the first call's already-committed
+      // Payment and no-op WITHOUT ever reaching `payment.create` — zero
+      // P2002, zero recovery, yet the outcome assertions would still pass.)
+      //
+      // Call A runs `createOrderFromPayment` to completion inside its own
+      // `$transaction`, then HOLDS that transaction open (uncommitted) on a
+      // barrier before returning. Its `Payment` row is written but NOT YET
+      // COMMITTED, so under Postgres READ COMMITTED it stays invisible to
+      // every other transaction.
+      // ---------------------------------------------------------------------
+      const releaseA = createDeferred();
+      const aWritesDone = createDeferred();
 
-      // Both calls recover to a fulfilled result (the winner commits directly;
-      // the loser's fresh-transaction retry finds the winner's row via step 0).
-      expect(r1.status).toBe("fulfilled");
-      expect(r2.status).toBe("fulfilled");
-      const orderId1 = (r1 as PromiseFulfilledResult<ordersService.OrderDetailView>).value.id;
-      const orderId2 = (r2 as PromiseFulfilledResult<ordersService.OrderDetailView>).value.id;
-      expect(orderId1).toBe(orderId2);
+      const aPromise = prisma.$transaction(
+        async (tx) => {
+          const result = await ordersService.createOrderFromPayment(intentId, cartView, selections, tx);
+          aWritesDone.resolve();
+          await releaseA.promise;
+          return result;
+        },
+        { timeout: 20000, maxWait: 20000 },
+      );
+
+      // Wait until A's payment.create has actually executed (still uncommitted).
+      await aWritesDone.promise;
+
+      // Call B starts a FRESH transaction. Because A has not committed yet,
+      // B's step-0 idempotency pre-check is GUARANTEED to see no existing
+      // Payment row (A's insert is invisible pre-commit) — this is what makes
+      // the race deterministic rather than incidental. B therefore proceeds
+      // through every step and reaches its OWN `payment.create` with the
+      // SAME `providerRef`, which BLOCKS on the unique-index entry A's still-
+      // open transaction holds (Postgres row-level lock wait, not an
+      // immediate error).
+      let recoveryFired = false;
+      const bPromise = invokeWithP2002Recovery(intentId, cartView, selections, () => {
+        recoveryFired = true;
+      });
+
+      // Confirm B is genuinely blocked on that lock (via real DB state, not a
+      // timing guess) before releasing A. This removes the last source of
+      // non-determinism: we only proceed once Postgres itself reports a
+      // backend waiting on a lock.
+      await waitForLockWait(db, 5000);
+
+      // Release A -> A commits -> Postgres immediately fails B's blocked
+      // INSERT with a REAL unique_violation (P2002), which bubbles out of
+      // B's `tx` UNCAUGHT (design Decision 4, "Recovery is a CALLER
+      // contract, not an in-tx catch") and is caught by
+      // `invokeWithP2002Recovery`, which retries with a FRESH `$transaction`
+      // — that retry's step-0 pre-check now finds A's committed row and
+      // recovers idempotently.
+      releaseA.resolve();
+
+      const [aResult, bResult] = await Promise.all([aPromise, bPromise]);
+
+      // Deterministic proof the RECOVERY PATH fired — not just that both
+      // calls happened to settle to the same order (which a purely
+      // sequential idempotent no-op would also satisfy).
+      expect(recoveryFired).toBe(true);
+      expect(aResult.id).toBe(bResult.id);
 
       const paymentCount = await db.payment.count({ where: { providerRef: intentId } });
       expect(paymentCount).toBe(1);
       const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
       expect(orderCount).toBe(1);
     },
-    20000,
+    25000,
   );
 });
