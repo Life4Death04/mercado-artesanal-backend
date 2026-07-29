@@ -52,6 +52,10 @@ vi.mock("@/shared/utils/prisma", () => {
   return {
     prisma: {
       $transaction: vi.fn(),
+      order: {
+        findMany: vi.fn(),
+        findFirst: vi.fn(),
+      },
     },
   };
 });
@@ -68,13 +72,17 @@ import { decrementStock } from "@/modules/inventory/services/inventory.service";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
+  NotFoundError,
   ValidationFailedError,
 } from "@/shared/errors/errors";
 import type { CartForCheckout, CartItemForCheckout } from "@/modules/cart/services/cart.service";
 // Service import — behavioral exports populated by WU2
 import * as ordersService from "@/modules/orders/services/orders.service";
+import { prisma } from "@/shared/utils/prisma";
 
 const mockedDecrementStock = vi.mocked(decrementStock);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedOrder = vi.mocked(prisma).order as any;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -731,5 +739,147 @@ describe("ordersService.createOrderFromPayment — P2002 bubbles uncaught [CO-P2
     expect(tx.order.create).not.toHaveBeenCalled();
     expect(tx.subOrder.create).not.toHaveBeenCalled();
     expect(mockedDecrementStock).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// listOrders — GET /pedidos owner-scoped summary history (design Data Flow,
+// orders WU3, spec §"GET /pedidos returns owner-scoped summary history")
+// ===========================================================================
+
+describe("ordersService.listOrders", () => {
+  it("[LO-SCOPE] queries prisma.order.findMany scoped to userId, newest first", async () => {
+    mockedOrder.findMany.mockResolvedValueOnce([]);
+
+    await ordersService.listOrders("user_001");
+
+    expect(mockedOrder.findMany).toHaveBeenCalledTimes(1);
+    const call = mockedOrder.findMany.mock.calls[0]![0];
+    expect(call.where).toEqual({ userId: "user_001" });
+    expect(call.orderBy).toEqual({ createdAt: "desc" });
+  });
+
+  it("[LO-EMPTY] no orders for the user -> returns []", async () => {
+    mockedOrder.findMany.mockResolvedValueOnce([]);
+
+    const result = await ordersService.listOrders("user_001");
+
+    expect(result).toEqual([]);
+  });
+
+  it("[LO-MAP] maps each row to OrderSummaryView with derived status and producerCount = subOrders.length", async () => {
+    mockedOrder.findMany.mockResolvedValueOnce([
+      {
+        id: "order_A",
+        createdAt: new Date("2026-07-28T10:00:00.000Z"),
+        totalAmount: new Prisma.Decimal("24.00"),
+        subOrders: [{ status: "pending" }, { status: "pending" }],
+      },
+      {
+        id: "order_B",
+        createdAt: new Date("2026-07-20T10:00:00.000Z"),
+        totalAmount: new Prisma.Decimal("9.50"),
+        subOrders: [{ status: "delivered" }],
+      },
+    ]);
+
+    const result = await ordersService.listOrders("user_001");
+
+    expect(result).toEqual([
+      {
+        id: "order_A",
+        createdAt: "2026-07-28T10:00:00.000Z",
+        totalAmount: "24.00",
+        status: "PENDING",
+        producerCount: 2,
+      },
+      {
+        id: "order_B",
+        createdAt: "2026-07-20T10:00:00.000Z",
+        totalAmount: "9.50",
+        status: "FULFILLED",
+        producerCount: 1,
+      },
+    ]);
+  });
+});
+
+// ===========================================================================
+// getOrderDetail — GET /pedidos/:id nested detail with no-leak 404 (design
+// Data Flow, orders WU3, spec §"GET /pedidos/:id returns nested detail with
+// no-leak 404")
+// ===========================================================================
+
+describe("ordersService.getOrderDetail", () => {
+  it("[GOD-SCOPE] queries prisma.order.findFirst scoped to id AND userId (ownership, no-leak)", async () => {
+    mockedOrder.findFirst.mockResolvedValueOnce({
+      id: "order_001",
+      createdAt: new Date("2026-07-28T10:00:00.000Z"),
+      totalAmount: new Prisma.Decimal("10.00"),
+      payment: { status: "SUCCEEDED" },
+      subOrders: [],
+    });
+
+    await ordersService.getOrderDetail("user_001", "order_001").catch(() => undefined);
+
+    expect(mockedOrder.findFirst).toHaveBeenCalledTimes(1);
+    const call = mockedOrder.findFirst.mock.calls[0]![0];
+    expect(call.where).toEqual({ id: "order_001", userId: "user_001" });
+  });
+
+  it("[GOD-404] unknown or unowned id -> NotFoundError (never leaks existence)", async () => {
+    mockedOrder.findFirst.mockResolvedValueOnce(null);
+
+    await expect(ordersService.getOrderDetail("user_001", "bogus-id")).rejects.toBeInstanceOf(
+      NotFoundError,
+    );
+  });
+
+  it("[GOD-MAP] maps a found row to the full OrderDetailView — nested payment/subOrders/orderLines, derived status", async () => {
+    mockedOrder.findFirst.mockResolvedValueOnce({
+      id: "order_001",
+      createdAt: new Date("2026-07-28T10:00:00.000Z"),
+      totalAmount: new Prisma.Decimal("15.00"),
+      payment: { status: "SUCCEEDED" },
+      subOrders: [
+        {
+          id: "subOrder_A",
+          producerId: "producer_A",
+          status: "pending",
+          shippingCostSnapshot: new Prisma.Decimal("2.00"),
+          deliveryModeId: "dm_A",
+          orderLines: [
+            {
+              id: "line_1",
+              productId: "product_A",
+              quantity: 2,
+              unitPriceSnapshot: new Prisma.Decimal("5.00"),
+            },
+          ],
+        },
+      ],
+    });
+
+    const result = await ordersService.getOrderDetail("user_001", "order_001");
+
+    expect(result).toEqual({
+      id: "order_001",
+      createdAt: "2026-07-28T10:00:00.000Z",
+      totalAmount: "15.00",
+      status: "PENDING",
+      payment: { status: "SUCCEEDED" },
+      subOrders: [
+        {
+          id: "subOrder_A",
+          producerId: "producer_A",
+          status: "pending",
+          shippingCostSnapshot: "2.00",
+          deliveryModeId: "dm_A",
+          orderLines: [
+            { id: "line_1", productId: "product_A", quantity: 2, unitPriceSnapshot: "5.00" },
+          ],
+        },
+      ],
+    });
   });
 });
