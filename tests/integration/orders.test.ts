@@ -29,6 +29,9 @@
  *           fewer rows) -> CartItemNotAvailableError, no writes
  *     [O3b] a product deactivated after the snapshot was taken (snapshot said
  *           isAvailable=true) -> CartItemNotAvailableError, no writes
+ *     [O3c] a producer soft-deleted (`producer.deletedAt` set) on ONE item of
+ *           a 2-item multi-producer cart -> CartItemNotAvailableError, no
+ *           writes, no stock decrement on EITHER line (all-or-nothing)
  *
  *   [O4] Snapshot-scoped cart clear — items added mid-window survive
  *     GIVEN a snapshot of items [A, B] and a NEW item C added to the SAME
@@ -55,6 +58,18 @@
  *     pre-check — proven via a deterministic `recoveryFired` flag, not just
  *     outcome inference — and exactly ONE Order/Payment row exists
  *
+ *   [O6] Delivery-cost snapshot immutability after a LATER DeliveryMode update
+ *     GIVEN a SubOrder created with `shippingCostSnapshot` from the
+ *     DeliveryMode's cost at checkout time
+ *     WHEN that DeliveryMode's live `cost` is updated AFTER order creation
+ *     THEN the already-created SubOrder's `shippingCostSnapshot` is UNCHANGED
+ *     (never re-read from the live DeliveryMode row)
+ *
+ * [O1] above is also the runtime proof for the "Cart is cleared after
+ * successful creation" scenario's SECOND clause: the Cart ROW itself
+ * (its `id`) is preserved across the snapshot-scoped clear — only CartItem
+ * rows are deleted, the parent Cart entity is never deleted/recreated.
+ *
  * WU3 (Read Surface, HTTP) additions below use real Postgres AND Supertest
  * together — a deliberate deviation from the repo's usual "Supertest =
  * mocked prisma" convention (cart.test.ts, addresses.test.ts, etc.). Real
@@ -73,6 +88,10 @@
  *   [OH5] GET /pedidos/:id — unknown id returns 404
  *   [OH6] GET /pedidos — 401 unauthenticated
  *   [OH7] GET /pedidos — 403 ONBOARDING_REQUIRED for a PENDING_ROLE user
+ *   [OH3-EXACT] GET /pedidos/:id — the spec-mandated exact fixture: an order
+ *          with 2 SubOrders and 3 OrderLines total (spec scenario "Owner
+ *          reads fully nested detail"). [OH3] proves the shape with 2
+ *          SubOrders/2 lines only; this proves the exact 3-line aggregate.
  *
  * WU4 (Cancellation, real Postgres + Supertest, design Decision 3) additions:
  *
@@ -456,6 +475,8 @@ describe("createOrderFromPayment — two-producer create [O1]", () => {
       const cartView = await cartService.getCartForCheckout(consumer.id);
       expect(cartView.items).toHaveLength(3);
 
+      const cartBeforeCheckout = await db.cart.findUniqueOrThrow({ where: { userId: consumer.id } });
+
       const result = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment(
           "pi_o1_two_producer",
@@ -497,6 +518,14 @@ describe("createOrderFromPayment — two-producer create [O1]", () => {
 
       const remainingCartItems = await db.cartItem.count({ where: { cart: { userId: consumer.id } } });
       expect(remainingCartItems).toBe(0);
+
+      // Cart ROW identity preserved (spec "Cart is cleared after successful
+      // creation": items removed, but the Cart entity itself is NOT
+      // deleted/recreated) — the snapshot-scoped delete (design Decision 4
+      // step 9) targets CartItem rows only, never the parent Cart row.
+      const cartAfterCheckout = await db.cart.findUnique({ where: { userId: consumer.id } });
+      expect(cartAfterCheckout).not.toBeNull();
+      expect(cartAfterCheckout!.id).toBe(cartBeforeCheckout.id);
     },
     20000,
   );
@@ -670,6 +699,78 @@ describe("createOrderFromPayment — live re-check overrides a stale snapshot [O
 
       const remainingCartItems = await db.cartItem.count({ where: { cart: { userId: consumer.id } } });
       expect(remainingCartItems).toBe(1); // not cleared — the whole write path aborted
+    },
+    20000,
+  );
+
+  it(
+    "[O3c] a soft-deleted producer on one item in a multi-producer cart fails the WHOLE order -> CartItemNotAvailableError, no writes, no stock decrement on any line",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer: producerA, category } = await seedProducer("o3c-a", "B10000033");
+      const { producer: producerB } = await seedProducer("o3c-b", "B10000034");
+      const consumer = await seedConsumer("o3c");
+      const dmA = await db.deliveryMode.create({
+        data: { producerId: producerA.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const dmB = await db.deliveryMode.create({
+        data: { producerId: producerB.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const productA = await db.product.create({
+        data: { producerId: producerA.id, categoryId: category.id, name: "O3c Product A", description: "d", price: 2.0, stock: 10, isActive: true },
+      });
+      const productB = await db.product.create({
+        data: { producerId: producerB.id, categoryId: category.id, name: "O3c Product B", description: "d", price: 3.0, stock: 10, isActive: true },
+      });
+
+      await cartService.addItem(consumer.id, productA.id, 1);
+      await cartService.addItem(consumer.id, productB.id, 1);
+      const cartView = await cartService.getCartForCheckout(consumer.id);
+      expect(cartView.items).toHaveLength(2);
+
+      // Simulate producer B being soft-deleted AFTER the snapshot was taken
+      // (spec: "producer.deletedAt set" is an all-or-nothing availability failure,
+      // distinct from the O3b product.isActive=false path).
+      await db.producer.update({ where: { id: producerB.id }, data: { deletedAt: new Date() } });
+
+      await expect(
+        prisma.$transaction((tx) =>
+          ordersService.createOrderFromPayment(
+            "pi_o3c_soft_deleted_producer",
+            cartView,
+            [
+              { producerId: producerA.id, deliveryModeId: dmA.id },
+              { producerId: producerB.id, deliveryModeId: dmB.id },
+            ],
+            tx,
+          ),
+        ),
+      ).rejects.toMatchObject({ code: "CART_ITEM_NOT_AVAILABLE" });
+
+      const payment = await db.payment.findUnique({ where: { providerRef: "pi_o3c_soft_deleted_producer" } });
+      expect(payment).toBeNull();
+
+      const order = await db.order.findFirst({ where: { userId: consumer.id } });
+      expect(order).toBeNull();
+
+      const subOrderCount = await db.subOrder.count({
+        where: { producerId: { in: [producerA.id, producerB.id] } },
+      });
+      expect(subOrderCount).toBe(0);
+
+      // NO stock decrement on EITHER line — including producer A's item,
+      // which was individually available; all-or-nothing means the whole
+      // cart is rejected before any decrementStock call.
+      const [freshA, freshB] = await Promise.all([
+        db.product.findUniqueOrThrow({ where: { id: productA.id } }),
+        db.product.findUniqueOrThrow({ where: { id: productB.id } }),
+      ]);
+      expect(freshA.stock).toBe(10);
+      expect(freshB.stock).toBe(10);
     },
     20000,
   );
@@ -869,6 +970,57 @@ describe("createOrderFromPayment — duplicate webhook recovers via real P2002 [
 });
 
 // ===========================================================================
+// [O6] Delivery-cost snapshot immutability after a later DeliveryMode update
+// ===========================================================================
+
+describe("createOrderFromPayment — delivery-cost snapshot stays frozen after a later DeliveryMode.cost update [O6]", () => {
+  it(
+    "[O6] SubOrder.shippingCostSnapshot keeps the checkout-time cost; a LATER DeliveryMode.cost change does not alter the stored snapshot",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("o6", "B10000042");
+      const consumer = await seedConsumer("o6");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 4.0, isActive: true },
+      });
+      const product = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "O6 Product", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+
+      await cartService.addItem(consumer.id, product.id, 1);
+      const cartView = await cartService.getCartForCheckout(consumer.id);
+
+      const created = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_o6_delivery_cost_snapshot",
+          cartView,
+          [{ producerId: producer.id, deliveryModeId: dm.id }],
+          tx,
+        ),
+      );
+
+      const subOrderId = created.subOrders[0]!.id;
+      const beforeUpdate = await db.subOrder.findUniqueOrThrow({ where: { id: subOrderId } });
+      expect(beforeUpdate.shippingCostSnapshot.toFixed(2)).toBe("4.00");
+
+      // A LATER change to the DeliveryMode's live cost — spec §"Order snapshots
+      // are immutable at creation" requires the already-created SubOrder's
+      // shippingCostSnapshot to be unaffected.
+      await db.deliveryMode.update({ where: { id: dm.id }, data: { cost: 9.99 } });
+
+      const afterUpdate = await db.subOrder.findUniqueOrThrow({ where: { id: subOrderId } });
+      expect(afterUpdate.shippingCostSnapshot.toFixed(2)).toBe("4.00");
+      expect(afterUpdate.shippingCostSnapshot.toFixed(2)).not.toBe("9.99");
+    },
+    20000,
+  );
+});
+
+// ===========================================================================
 // WU3 (Read Surface, HTTP) — real Postgres + Supertest
 // ===========================================================================
 
@@ -999,6 +1151,87 @@ describe("GET /api/v1/pedidos and /api/v1/pedidos/:id — real Postgres + Supert
       const onboardingRes = await request.get("/api/v1/pedidos").set("x-test-auth", pendingAuth);
       expect(onboardingRes.status).toBe(403);
       expect(onboardingRes.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
+    },
+    30000,
+  );
+});
+
+// ===========================================================================
+// [OH3-EXACT] Nested detail — the spec-mandated exact fixture: 2 SubOrders,
+// 3 OrderLines total (spec §"GET /pedidos/:id returns nested detail with
+// no-leak 404", scenario "Owner reads fully nested detail": "U owns order O
+// with 2 SubOrders and 3 OrderLines total, payment SUCCEEDED"). [OH3] above
+// proves the shape with 2 SubOrders / 2 OrderLines only — this test proves
+// the EXACT 3-line aggregate the spec scenario specifies.
+// ===========================================================================
+
+describe("GET /api/v1/pedidos/:id — exact spec fixture: 2 SubOrders, 3 OrderLines total [OH3-EXACT]", () => {
+  it(
+    "[OH3-EXACT] returns nested detail for an order with 2 SubOrders and 3 OrderLines total, each SubOrder status alongside the derived Order.status, and payment.status SUCCEEDED",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer: producerA, category } = await seedProducer("oh3x-a", "B10000081");
+      const { producer: producerB } = await seedProducer("oh3x-b", "B10000082");
+      const owner = await seedConsumer("oh3x-owner");
+
+      const dmA = await db.deliveryMode.create({
+        data: { producerId: producerA.id, type: "SHIPPING_FLAT_RATE", cost: 2.0, isActive: true },
+      });
+      const dmB = await db.deliveryMode.create({
+        data: { producerId: producerB.id, type: "SHIPPING_FLAT_RATE", cost: 4.0, isActive: true },
+      });
+
+      const productA1 = await db.product.create({
+        data: { producerId: producerA.id, categoryId: category.id, name: "OH3X Product A1", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+      const productA2 = await db.product.create({
+        data: { producerId: producerA.id, categoryId: category.id, name: "OH3X Product A2", description: "d", price: 3.0, stock: 10, isActive: true },
+      });
+      const productB1 = await db.product.create({
+        data: { producerId: producerB.id, categoryId: category.id, name: "OH3X Product B1", description: "d", price: 10.0, stock: 5, isActive: true },
+      });
+
+      await cartService.addItem(owner.id, productA1.id, 1);
+      await cartService.addItem(owner.id, productA2.id, 1);
+      await cartService.addItem(owner.id, productB1.id, 1);
+      const cartView = await cartService.getCartForCheckout(owner.id);
+      expect(cartView.items).toHaveLength(3);
+
+      const created = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_oh3x_three_line_detail",
+          cartView,
+          [
+            { producerId: producerA.id, deliveryModeId: dmA.id },
+            { producerId: producerB.id, deliveryModeId: dmB.id },
+          ],
+          tx,
+        ),
+      );
+
+      const ownerAuth = authHeader({ sub: owner.auth0Sub });
+      const detailRes = await request
+        .get(`/api/v1/pedidos/${created.id}`)
+        .set("x-test-auth", ownerAuth);
+
+      expect(detailRes.status).toBe(200);
+      expect(detailRes.body).toMatchObject({
+        id: created.id,
+        status: "PENDING",
+        payment: { status: "SUCCEEDED" },
+      });
+      expect(detailRes.body.subOrders).toHaveLength(2);
+      for (const subOrder of detailRes.body.subOrders as Array<{ status: string }>) {
+        expect(subOrder.status).toBe("pending");
+      }
+      const allLines = (detailRes.body.subOrders as Array<{ orderLines: unknown[] }>).flatMap(
+        (s) => s.orderLines,
+      );
+      expect(allLines).toHaveLength(3);
     },
     30000,
   );
@@ -1194,11 +1427,19 @@ describe("cancelOrder — producer-wins count-guard: concurrent transition rejec
       const releaseProducer = createDeferred();
       const producerUpdateDone = createDeferred();
 
-      const producerTxPromise = db.$transaction(async (tx) => {
-        await tx.subOrder.update({ where: { id: subOrderId }, data: { status: "preparing" } });
-        producerUpdateDone.resolve();
-        await releaseProducer.promise;
-      });
+      const producerTxPromise = db.$transaction(
+        async (tx) => {
+          await tx.subOrder.update({ where: { id: subOrderId }, data: { status: "preparing" } });
+          producerUpdateDone.resolve();
+          await releaseProducer.promise;
+        },
+        // Explicit { timeout, maxWait } hardening (mirrors [O5]'s
+        // invokeWithP2002Recovery) — Prisma's 5000ms default interactive-tx
+        // timeout raced against this test's own 5000ms waitForBlockedSubOrderUpdate
+        // poll window; widening both removes that coincidental-timing risk
+        // (previously deferred as a FOLLOW-UP in the verify report).
+        { timeout: 20000, maxWait: 20000 },
+      );
 
       // Guarantee the producer's UPDATE has executed (row lock acquired,
       // uncommitted) before cancel's read runs.
