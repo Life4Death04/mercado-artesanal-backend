@@ -55,10 +55,11 @@ import type { Prisma } from "@prisma/client";
 import { Prisma as PrismaValue } from "@prisma/client";
 
 import type { CartForCheckout, CartItemForCheckout } from "@/modules/cart/services/cart.service";
-import { decrementStock } from "@/modules/inventory/services/inventory.service";
+import { decrementStock, restockProduct } from "@/modules/inventory/services/inventory.service";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
+  InvalidOrderTransitionError,
   NotFoundError,
   ValidationFailedError,
 } from "@/shared/errors/errors";
@@ -549,4 +550,108 @@ export async function getOrderDetail(userId: string, orderId: string): Promise<O
   }
 
   return mapExistingOrderDetailView(order, order.payment.status);
+}
+
+// ---------------------------------------------------------------------------
+// cancelOrder — WU4 (Cancellation), design Decision 3 (TOCTOU guard)
+// ---------------------------------------------------------------------------
+
+/**
+ * PATCH /pedidos/:id/cancelar — cancels a consumer order ONLY when it is
+ * still `PENDING`, restoring stock per `OrderLine` inside the same
+ * transaction as the cancellation write.
+ *
+ * Step order (design Decision 3, MUST NOT be reordered):
+ *   1. In-tx read, ownership-scoped: `tx.order.findFirst({ where: { id, userId } })` ->
+ *      no-leak `NotFoundError` (404) if null (same as `getOrderDetail`).
+ *   2. Cheap pre-check: derive status from the just-read `SubOrder[].status`
+ *      via the SOLE `deriveOrderStatus` authority -> `InvalidOrderTransitionError`
+ *      (409) if not `PENDING`. This is a fast-fail optimization ONLY — it
+ *      does NOT provide the actual concurrency guarantee (see step 4).
+ *   3. Restock every `OrderLine` via `restockProduct(productId, quantity, tx)`
+ *      (frozen sibling of `decrementStock`) — runs BEFORE step 4 so a later
+ *      guard failure rolls back the restock too (same tx, any throw reverts
+ *      all writes).
+ *   4. CONDITIONAL claim + count guard — the ACTUAL atomic guard:
+ *      `tx.subOrder.updateMany({ where: { orderId, status: "pending" }, data: { status: "cancelled" } })`.
+ *      Assert `count === subOrders.length` (captured in step 1) — a mismatch
+ *      means a concurrent producer `transition()` flipped a row away from
+ *      `pending` between step 1's read and this write (the classic TOCTOU
+ *      race: a plain SELECT under Postgres READ COMMITTED takes no row
+ *      lock). On mismatch, throw `InvalidOrderTransitionError` (409) and let
+ *      the transaction roll back (reverting the step-3 restock too).
+ *
+ * ACCEPTED, DOCUMENTED RESIDUAL RACE (design Decision 3, "Known constraint"):
+ * this guard makes cancel's OWN update correct against a concurrent producer
+ * `transition()`, but the FROZEN `sub-orders.transition()` performs an
+ * UNCONDITIONAL `update({ where: { id } })` with no status predicate. If a
+ * consumer's cancel commits FIRST and a producer's `transition()` call was
+ * already mid-flight against the pre-cancel status, that `transition()` will
+ * still unconditionally overwrite the row after cancel committed — an
+ * orphaned restock (stock was returned, but the SubOrder is active again).
+ * This is NOT fixable from within `orders` without modifying the frozen
+ * `sub-orders` module, which is explicitly out of scope here (maintainer
+ * decision) — see design Decision 3 for the full analysis. This function
+ * makes NO attempt to eliminate that reverse-direction race.
+ *
+ * `Order.status` is NEVER written here (or anywhere in this slice, design
+ * Decision 2) — the response below reflects the now-`cancelled` SubOrders
+ * purely via `deriveOrderStatus`, reusing `mapExistingOrderDetailView`.
+ *
+ * Spec: orders §"PATCH /pedidos/:id/cancelar cancels only at PENDING and restores stock"
+ * Design: Decision 3
+ */
+export async function cancelOrder(userId: string, orderId: string): Promise<OrderDetailView> {
+  return prisma.$transaction(async (tx) => {
+    // Step 1: in-tx read, ownership-scoped (no-leak — same predicate as getOrderDetail).
+    const order = await tx.order.findFirst({
+      where: { id: orderId, userId },
+      include: {
+        payment: { select: { status: true } },
+        subOrders: { include: { orderLines: true } },
+      },
+    });
+
+    if (!order) {
+      throw new NotFoundError("Order not found");
+    }
+
+    // Step 2: cheap pre-check via the SOLE deriveOrderStatus authority — a
+    // fast-fail short-circuit only, NOT the concurrency guard (see step 4).
+    const statuses = order.subOrders.map((s) => s.status);
+    if (deriveOrderStatus(statuses) !== "PENDING") {
+      throw new InvalidOrderTransitionError("Order is not in a cancellable state");
+    }
+
+    // Step 3: restock every line, BEFORE the guarded claim — if step 4 fails,
+    // the surrounding transaction rolls back this restock too (any throw
+    // reverts the whole tx).
+    for (const subOrder of order.subOrders) {
+      for (const line of subOrder.orderLines) {
+        await restockProduct(line.productId, line.quantity, tx);
+      }
+    }
+
+    // Step 4: the ACTUAL atomic guard — conditional claim + count assertion.
+    // Only rows still "pending" at write time are claimed; a concurrent
+    // producer transition() already moved a row away from "pending" is
+    // excluded from this UPDATE, producing a count mismatch below.
+    const { count } = await tx.subOrder.updateMany({
+      where: { orderId, status: "pending" },
+      data: { status: "cancelled" },
+    });
+
+    if (count !== order.subOrders.length) {
+      throw new InvalidOrderTransitionError("Order is not in a cancellable state");
+    }
+
+    // Order.status is NEVER written (design Decision 2) — map the response
+    // via deriveOrderStatus over the now-cancelled SubOrders in memory.
+    const cancelledOrder: ExistingOrderRow = {
+      ...order,
+      subOrders: order.subOrders.map((s) => ({ ...s, status: "cancelled" })),
+    };
+
+    return mapExistingOrderDetailView(cancelledOrder, order.payment.status);
+  });
 }

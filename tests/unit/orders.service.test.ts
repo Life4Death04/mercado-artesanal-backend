@@ -33,12 +33,22 @@
  *               OrderLine.subOrderId resolves via the step-6 subOrderIdByProducer map
  *     [CO-SNAPSHOT-LINE] OrderLine.unitPriceSnapshot copied AS-IS from cartView.items, not live price
  *     [CO-P2002] payment.create throws P2002 -> bubbles UNCAUGHT, order.create never called
+ *   cancelOrder (Cycle 4 orders WU4, design Decision 3 — TOCTOU guard via count-guarded updateMany):
+ *     [CX-INTX-READ] reads via tx.order.findFirst scoped to { id, userId } inside prisma.$transaction
+ *     [CX-404] order not found (unknown or unowned) -> NotFoundError, no restock/updateMany issued
+ *     [CX-PRECHECK] derived status != PENDING (fast-fail) -> InvalidOrderTransitionError, no restock issued
+ *     [CX-RESTOCK] restockProduct(productId, quantity, tx) called once per OrderLine, on the SAME tx
+ *     [CX-UPDATEMANY] tx.subOrder.updateMany called with where:{orderId, status:"pending"}, data:{status:"cancelled"}
+ *     [CX-COUNT-MISMATCH] updateMany count != subOrders.length (race) -> InvalidOrderTransitionError
+ *     [CX-NO-STATUS-WRITE] tx.order.update is NEVER called — Order.status is never written by this slice
+ *     [CX-SUCCESS] returns OrderDetailView with every SubOrder "cancelled", Order.status derives CANCELLED
  *
  * Spec references:
  *   orders §"createOrderFromPayment writes the order aggregate atomically"
  *   orders §"Checkout enforces all-or-nothing availability"
  *   orders §"Order.status is derived, never set directly"
- *   design Decision 2 (deriveOrderStatus), Decision 4 (createOrderFromPayment internals)
+ *   orders §"PATCH /pedidos/:id/cancelar cancels only at PENDING and restores stock"
+ *   design Decision 2 (deriveOrderStatus), Decision 3 (cancel TOCTOU guard), Decision 4 (createOrderFromPayment internals)
  */
 import { Prisma } from "@prisma/client";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -61,17 +71,19 @@ vi.mock("@/shared/utils/prisma", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Mock inventory service — decrementStock is a pure spy (frozen contract,
-// design Testing Strategy: "spy restockProduct/decrementStock").
+// Mock inventory service — decrementStock/restockProduct are pure spies
+// (frozen contract, design Testing Strategy: "spy restockProduct/decrementStock").
 // ---------------------------------------------------------------------------
 vi.mock("@/modules/inventory/services/inventory.service", () => ({
   decrementStock: vi.fn(),
+  restockProduct: vi.fn(),
 }));
 
-import { decrementStock } from "@/modules/inventory/services/inventory.service";
+import { decrementStock, restockProduct } from "@/modules/inventory/services/inventory.service";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
+  InvalidOrderTransitionError,
   NotFoundError,
   ValidationFailedError,
 } from "@/shared/errors/errors";
@@ -81,8 +93,11 @@ import * as ordersService from "@/modules/orders/services/orders.service";
 import { prisma } from "@/shared/utils/prisma";
 
 const mockedDecrementStock = vi.mocked(decrementStock);
+const mockedRestockProduct = vi.mocked(restockProduct);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedOrder = vi.mocked(prisma).order as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedTransaction = vi.mocked(prisma).$transaction as any;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -881,5 +896,232 @@ describe("ordersService.getOrderDetail", () => {
         },
       ],
     });
+  });
+});
+
+// ===========================================================================
+// cancelOrder — PATCH /pedidos/:id/cancelar (design Decision 3, orders WU4,
+// spec §"PATCH /pedidos/:id/cancelar cancels only at PENDING and restores stock")
+// ===========================================================================
+
+function makeCancelSubOrderRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "subOrder_A",
+    producerId: "producer_A",
+    status: "pending",
+    shippingCostSnapshot: new Prisma.Decimal("2.00"),
+    deliveryModeId: "dm_A",
+    orderLines: [
+      {
+        id: "line_1",
+        productId: "product_A",
+        quantity: 2,
+        unitPriceSnapshot: new Prisma.Decimal("5.00"),
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function makeCancelOrderRow(
+  subOrders: ReturnType<typeof makeCancelSubOrderRow>[] = [makeCancelSubOrderRow()],
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    id: "order_001",
+    createdAt: new Date("2026-07-29T10:00:00.000Z"),
+    totalAmount: new Prisma.Decimal("12.00"),
+    payment: { status: "SUCCEEDED" },
+    subOrders,
+    ...overrides,
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function makeCancelMockTx(overrides: Record<string, any> = {}) {
+  return {
+    order: {
+      findFirst: vi.fn().mockResolvedValue(makeCancelOrderRow()),
+      update: vi.fn(),
+    },
+    subOrder: {
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    ...overrides,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+}
+
+/** Wires prisma.$transaction to invoke its callback with the given fake tx. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function stubTransaction(tx: any) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  mockedTransaction.mockImplementationOnce(async (fn: (tx: any) => Promise<unknown>) => fn(tx));
+}
+
+describe("ordersService.cancelOrder — in-tx read + ownership [CX-INTX-READ][CX-404]", () => {
+  it("[CX-INTX-READ] reads via tx.order.findFirst scoped to { id, userId } inside prisma.$transaction", async () => {
+    const tx = makeCancelMockTx();
+    stubTransaction(tx);
+
+    await ordersService.cancelOrder("user_001", "order_001");
+
+    expect(mockedTransaction).toHaveBeenCalledTimes(1);
+    expect(tx.order.findFirst).toHaveBeenCalledTimes(1);
+    const call = tx.order.findFirst.mock.calls[0]![0];
+    expect(call.where).toEqual({ id: "order_001", userId: "user_001" });
+  });
+
+  it("[CX-404] unknown or unowned id -> NotFoundError, no restock/updateMany issued", async () => {
+    const tx = makeCancelMockTx({ order: { findFirst: vi.fn().mockResolvedValue(null), update: vi.fn() } });
+    stubTransaction(tx);
+
+    await expect(ordersService.cancelOrder("user_001", "bogus-id")).rejects.toBeInstanceOf(
+      NotFoundError,
+    );
+    expect(mockedRestockProduct).not.toHaveBeenCalled();
+    expect(tx.subOrder.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("ordersService.cancelOrder — derived-PENDING pre-check [CX-PRECHECK]", () => {
+  it("[CX-PRECHECK] a non-pending SubOrder (derived status != PENDING) fast-fails with InvalidOrderTransitionError, no restock issued", async () => {
+    const tx = makeCancelMockTx({
+      order: {
+        findFirst: vi.fn().mockResolvedValue(
+          makeCancelOrderRow([makeCancelSubOrderRow({ status: "preparing" })]),
+        ),
+        update: vi.fn(),
+      },
+    });
+    stubTransaction(tx);
+
+    await expect(ordersService.cancelOrder("user_001", "order_001")).rejects.toBeInstanceOf(
+      InvalidOrderTransitionError,
+    );
+    expect(mockedRestockProduct).not.toHaveBeenCalled();
+    expect(tx.subOrder.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("[CX-PRECHECK-CANCELLED] an already-CANCELLED order fast-fails with InvalidOrderTransitionError (no silent no-op)", async () => {
+    const tx = makeCancelMockTx({
+      order: {
+        findFirst: vi.fn().mockResolvedValue(
+          makeCancelOrderRow([makeCancelSubOrderRow({ status: "cancelled" })]),
+        ),
+        update: vi.fn(),
+      },
+    });
+    stubTransaction(tx);
+
+    await expect(ordersService.cancelOrder("user_001", "order_001")).rejects.toBeInstanceOf(
+      InvalidOrderTransitionError,
+    );
+    expect(mockedRestockProduct).not.toHaveBeenCalled();
+  });
+});
+
+describe("ordersService.cancelOrder — restockProduct per line [CX-RESTOCK]", () => {
+  it("[CX-RESTOCK] calls restockProduct(productId, quantity, tx) once per OrderLine across all SubOrders, on the SAME tx", async () => {
+    const subOrders = [
+      makeCancelSubOrderRow({
+        id: "subOrder_A",
+        producerId: "producer_A",
+        orderLines: [
+          { id: "line_1", productId: "product_A1", quantity: 2, unitPriceSnapshot: new Prisma.Decimal("5.00") },
+          { id: "line_2", productId: "product_A2", quantity: 1, unitPriceSnapshot: new Prisma.Decimal("3.00") },
+        ],
+      }),
+      makeCancelSubOrderRow({
+        id: "subOrder_B",
+        producerId: "producer_B",
+        orderLines: [
+          { id: "line_3", productId: "product_B1", quantity: 4, unitPriceSnapshot: new Prisma.Decimal("1.00") },
+        ],
+      }),
+    ];
+    const tx = makeCancelMockTx({
+      order: { findFirst: vi.fn().mockResolvedValue(makeCancelOrderRow(subOrders)), update: vi.fn() },
+      subOrder: { updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
+    });
+    stubTransaction(tx);
+
+    await ordersService.cancelOrder("user_001", "order_001");
+
+    expect(mockedRestockProduct).toHaveBeenCalledTimes(3);
+    expect(mockedRestockProduct).toHaveBeenCalledWith("product_A1", 2, tx);
+    expect(mockedRestockProduct).toHaveBeenCalledWith("product_A2", 1, tx);
+    expect(mockedRestockProduct).toHaveBeenCalledWith("product_B1", 4, tx);
+  });
+});
+
+describe("ordersService.cancelOrder — guarded updateMany [CX-UPDATEMANY][CX-COUNT-MISMATCH]", () => {
+  it("[CX-UPDATEMANY] calls tx.subOrder.updateMany with where:{orderId, status:'pending'}, data:{status:'cancelled'}", async () => {
+    const tx = makeCancelMockTx();
+    stubTransaction(tx);
+
+    await ordersService.cancelOrder("user_001", "order_001");
+
+    expect(tx.subOrder.updateMany).toHaveBeenCalledTimes(1);
+    const call = tx.subOrder.updateMany.mock.calls[0]![0];
+    expect(call.where).toEqual({ orderId: "order_001", status: "pending" });
+    expect(call.data).toEqual({ status: "cancelled" });
+  });
+
+  it("[CX-COUNT-MISMATCH] updateMany count != subOrders.length (concurrent producer transition) -> InvalidOrderTransitionError", async () => {
+    const subOrders = [
+      makeCancelSubOrderRow({ id: "subOrder_A", producerId: "producer_A" }),
+      makeCancelSubOrderRow({ id: "subOrder_B", producerId: "producer_B", orderLines: [] }),
+    ];
+    const tx = makeCancelMockTx({
+      order: { findFirst: vi.fn().mockResolvedValue(makeCancelOrderRow(subOrders)), update: vi.fn() },
+      // Only 1 row matched the conditional WHERE — a concurrent producer transition
+      // flipped the other SubOrder away from "pending" between the pre-check and this write.
+      subOrder: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    });
+    stubTransaction(tx);
+
+    await expect(ordersService.cancelOrder("user_001", "order_001")).rejects.toBeInstanceOf(
+      InvalidOrderTransitionError,
+    );
+  });
+});
+
+describe("ordersService.cancelOrder — Order.status is never written [CX-NO-STATUS-WRITE]", () => {
+  it("[CX-NO-STATUS-WRITE] tx.order.update is NEVER called on the success path — Order.status stays derived-only", async () => {
+    const tx = makeCancelMockTx();
+    stubTransaction(tx);
+
+    await ordersService.cancelOrder("user_001", "order_001");
+
+    expect(tx.order.update).not.toHaveBeenCalled();
+  });
+});
+
+describe("ordersService.cancelOrder — success mapping [CX-SUCCESS]", () => {
+  it("[CX-SUCCESS] returns OrderDetailView with every SubOrder cancelled and Order.status deriving CANCELLED", async () => {
+    const subOrders = [
+      makeCancelSubOrderRow({ id: "subOrder_A", producerId: "producer_A", status: "pending" }),
+      makeCancelSubOrderRow({
+        id: "subOrder_B",
+        producerId: "producer_B",
+        status: "pending",
+        orderLines: [
+          { id: "line_2", productId: "product_B", quantity: 1, unitPriceSnapshot: new Prisma.Decimal("10.00") },
+        ],
+      }),
+    ];
+    const tx = makeCancelMockTx({
+      order: { findFirst: vi.fn().mockResolvedValue(makeCancelOrderRow(subOrders)), update: vi.fn() },
+      subOrder: { updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
+    });
+    stubTransaction(tx);
+
+    const result = await ordersService.cancelOrder("user_001", "order_001");
+
+    expect(result.status).toBe("CANCELLED");
+    expect(result.subOrders).toHaveLength(2);
+    expect(result.subOrders.every((s) => s.status === "cancelled")).toBe(true);
+    expect(result.payment.status).toBe("SUCCEEDED");
   });
 });
