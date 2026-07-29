@@ -74,13 +74,35 @@
  *   [OH6] GET /pedidos — 401 unauthenticated
  *   [OH7] GET /pedidos — 403 ONBOARDING_REQUIRED for a PENDING_ROLE user
  *
+ * WU4 (Cancellation, real Postgres + Supertest, design Decision 3) additions:
+ *
+ *   [CXH1] PATCH /pedidos/:id/cancelar — success: every SubOrder -> cancelled,
+ *          Order.status derives CANCELLED, stock restored EXACTLY (inverse of
+ *          the checkout decrement)
+ *   [CXH2] PATCH /pedidos/:id/cancelar — non-owner returns 404 (no-leak), the
+ *          order is left completely unchanged
+ *   [CXH3] PATCH /pedidos/:id/cancelar — a non-PENDING order (one SubOrder
+ *          already "preparing", no race involved) returns 409
+ *          INVALID_ORDER_TRANSITION, no SubOrder changes, no stock restored
+ *   [CX-RACE] cancelOrder (direct service call, precise DB-state control) —
+ *          PRODUCER-WINS interleaving: a producer transition() that commits
+ *          strictly BETWEEN cancel's step-1 read and its guarded updateMany
+ *          causes the count-guard to reject with 409
+ *          INVALID_ORDER_TRANSITION, and the WHOLE cancel transaction
+ *          (including the step-3 restock) rolls back — proving restock is
+ *          never left committed without cancel actually taking effect. Does
+ *          NOT cover the reverse CANCEL-WINS residual race (design Decision 3
+ *          "Known constraint") — that direction is an ACCEPTED, documented
+ *          limitation, not exercised here.
+ *
  * Spec references:
  *   orders §"createOrderFromPayment writes the order aggregate atomically"
  *   orders §"Checkout enforces all-or-nothing availability"
  *   orders §"Duplicate webhook must not double-create an order"
  *   orders §"GET /pedidos returns owner-scoped summary history"
  *   orders §"GET /pedidos/:id returns nested detail with no-leak 404"
- *   design Decision 4 (internals, atomic step order, idempotency backstop)
+ *   orders §"PATCH /pedidos/:id/cancelar cancels only at PENDING and restores stock"
+ *   design Decision 3 (cancel TOCTOU guard), Decision 4 (internals, atomic step order, idempotency backstop)
  *   design Decision 6 (guard chain, owner = req.user.id, no-leak 404)
  *
  * SKIP POLICY: When the database is unreachable, each test calls `ctx.skip()`
@@ -244,6 +266,51 @@ async function waitForLockWait(dbClient: PrismaClient, timeoutMs: number, applic
   }
   throw new Error(
     `waitForLockWait: timed out waiting for backend tagged "${applicationNameTag}" to block on a lock — the forced overlapping race did not materialize`,
+  );
+}
+
+/**
+ * Resolves once ANY backend other than the caller's own polling connection is
+ * genuinely BLOCKED waiting on a lock while running a query that touches
+ * `sub_orders` — used by [CX-RACE] to confirm, via real DB state rather than a
+ * fixed delay, that cancel's guarded `updateMany` has reached and is stuck on
+ * the row lock held by the still-open producer transaction before that
+ * transaction is released.
+ *
+ * Unlike `waitForLockWait` (used by [O5]), this cannot scope to an
+ * `application_name` tag on the BLOCKED backend: `cancelOrder` self-manages
+ * its own `prisma.$transaction` internally (design Decision 3 — no caller-tx
+ * parameter, unlike `createOrderFromPayment`) and has no test-only
+ * instrumentation hook to tag its own connection. Scoping by `query ILIKE
+ * '%sub_orders%'` combined with `wait_event_type = 'Lock'` is deliberately
+ * narrow: only an UPDATE/DELETE (or a locking SELECT) against that specific
+ * table can report this wait state, which in this test's controlled fixture
+ * data can only be cancel's own guarded `updateMany`. As with [O5], an
+ * unrelated concurrent lock wait touching `sub_orders` from a different
+ * parallel test file is a theoretical (documented) risk, not something this
+ * helper can fully eliminate without a production instrumentation hook.
+ *
+ * Throws (test fails LOUDLY, never silently passes) if no such block appears
+ * within `timeoutMs`.
+ */
+async function waitForBlockedSubOrderUpdate(dbClient: PrismaClient, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const rows = await dbClient.$queryRaw<{ count: bigint }[]>`
+      SELECT count(*)::bigint AS count
+      FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND wait_event_type = 'Lock'
+        AND pid <> pg_backend_pid()
+        AND query ILIKE '%sub_orders%'
+    `;
+    if (Number(rows[0]?.count ?? 0) > 0) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(
+    "waitForBlockedSubOrderUpdate: timed out waiting for a blocked sub_orders UPDATE — the forced overlapping race did not materialize",
   );
 }
 
@@ -934,5 +1001,252 @@ describe("GET /api/v1/pedidos and /api/v1/pedidos/:id — real Postgres + Supert
       expect(onboardingRes.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
     },
     30000,
+  );
+});
+
+// ===========================================================================
+// WU4 (Cancellation, real Postgres + Supertest) — design Decision 3
+// ===========================================================================
+
+describe("PATCH /api/v1/pedidos/:id/cancelar — success, restores stock exactly [CXH1]", () => {
+  it(
+    "[CXH1] cancels a PENDING order: every SubOrder -> cancelled, Order.status derives CANCELLED, stock restored exactly",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("cxh1", "B10000071");
+      const consumer = await seedConsumer("cxh1");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const product = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "CXH1 Product", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+
+      await cartService.addItem(consumer.id, product.id, 2);
+      const cartView = await cartService.getCartForCheckout(consumer.id);
+      const created = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment("pi_cxh1_cancel_success", cartView, [
+          { producerId: producer.id, deliveryModeId: dm.id },
+        ], tx),
+      );
+
+      const freshAfterCheckout = await db.product.findUniqueOrThrow({ where: { id: product.id } });
+      expect(freshAfterCheckout.stock).toBe(8); // 10 - 2
+
+      const consumerAuth = authHeader({ sub: consumer.auth0Sub });
+      const cancelRes = await request
+        .patch(`/api/v1/pedidos/${created.id}/cancelar`)
+        .set("x-test-auth", consumerAuth);
+
+      expect(cancelRes.status).toBe(200);
+      expect(cancelRes.body).toMatchObject({ id: created.id, status: "CANCELLED" });
+      expect(cancelRes.body.subOrders).toHaveLength(1);
+      expect(
+        (cancelRes.body.subOrders as Array<{ status: string }>).every((s) => s.status === "cancelled"),
+      ).toBe(true);
+
+      const freshAfterCancel = await db.product.findUniqueOrThrow({ where: { id: product.id } });
+      expect(freshAfterCancel.stock).toBe(10); // restored to the pre-checkout level
+
+      const subOrders = await db.subOrder.findMany({ where: { orderId: created.id } });
+      expect(subOrders.every((s) => s.status === "cancelled")).toBe(true);
+    },
+    20000,
+  );
+});
+
+describe("PATCH /api/v1/pedidos/:id/cancelar — non-owner returns 404 no-leak [CXH2]", () => {
+  it(
+    "[CXH2] a stranger cancelling the owner's order gets 404, and the order is left completely unchanged",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("cxh2", "B10000072");
+      const owner = await seedConsumer("cxh2-owner");
+      const stranger = await seedConsumer("cxh2-stranger");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const product = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "CXH2 Product", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+
+      await cartService.addItem(owner.id, product.id, 1);
+      const cartView = await cartService.getCartForCheckout(owner.id);
+      const created = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment("pi_cxh2_non_owner", cartView, [
+          { producerId: producer.id, deliveryModeId: dm.id },
+        ], tx),
+      );
+
+      const strangerAuth = authHeader({ sub: stranger.auth0Sub });
+      const cancelRes = await request
+        .patch(`/api/v1/pedidos/${created.id}/cancelar`)
+        .set("x-test-auth", strangerAuth);
+
+      expect(cancelRes.status).toBe(404);
+      expect(cancelRes.body).toMatchObject({ code: "NOT_FOUND" });
+
+      const subOrders = await db.subOrder.findMany({ where: { orderId: created.id } });
+      expect(subOrders.every((s) => s.status === "pending")).toBe(true);
+      const freshProduct = await db.product.findUniqueOrThrow({ where: { id: product.id } });
+      expect(freshProduct.stock).toBe(9); // unchanged — 10 - 1, never restored
+    },
+    20000,
+  );
+});
+
+describe("PATCH /api/v1/pedidos/:id/cancelar — non-PENDING order returns 409 [CXH3]", () => {
+  it(
+    "[CXH3] an order with one SubOrder already 'preparing' (no race) returns 409 INVALID_ORDER_TRANSITION, no SubOrder changes, no stock restored",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("cxh3", "B10000073");
+      const consumer = await seedConsumer("cxh3");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const product = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "CXH3 Product", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+
+      await cartService.addItem(consumer.id, product.id, 3);
+      const cartView = await cartService.getCartForCheckout(consumer.id);
+      const created = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment("pi_cxh3_non_pending", cartView, [
+          { producerId: producer.id, deliveryModeId: dm.id },
+        ], tx),
+      );
+
+      // Producer moves the SubOrder to "preparing" BEFORE the cancel attempt —
+      // a straightforward, non-racing precondition (no concurrency involved).
+      await db.subOrder.update({
+        where: { id: created.subOrders[0]!.id },
+        data: { status: "preparing" },
+      });
+
+      const consumerAuth = authHeader({ sub: consumer.auth0Sub });
+      const cancelRes = await request
+        .patch(`/api/v1/pedidos/${created.id}/cancelar`)
+        .set("x-test-auth", consumerAuth);
+
+      expect(cancelRes.status).toBe(409);
+      expect(cancelRes.body).toMatchObject({ code: "INVALID_ORDER_TRANSITION" });
+
+      const subOrder = await db.subOrder.findUniqueOrThrow({ where: { id: created.subOrders[0]!.id } });
+      expect(subOrder.status).toBe("preparing"); // unchanged by the rejected cancel
+      const freshProduct = await db.product.findUniqueOrThrow({ where: { id: product.id } });
+      expect(freshProduct.stock).toBe(7); // 10 - 3, never restored
+    },
+    20000,
+  );
+});
+
+describe("cancelOrder — producer-wins count-guard: concurrent transition rejects cancel [CX-RACE]", () => {
+  it(
+    "[CX-RACE] a producer transition that commits strictly between cancel's read and its guarded updateMany causes a 409 rejection, and the WHOLE cancel transaction (including restock) rolls back",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("cxrace", "B10000091");
+      const consumer = await seedConsumer("cxrace");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const product = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "CXRace Product", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+
+      await cartService.addItem(consumer.id, product.id, 2);
+      const cartView = await cartService.getCartForCheckout(consumer.id);
+      const created = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment("pi_cxrace_producer_wins", cartView, [
+          { producerId: producer.id, deliveryModeId: dm.id },
+        ], tx),
+      );
+      const subOrderId = created.subOrders[0]!.id;
+
+      // ---------------------------------------------------------------------
+      // Force a GENUINE, deterministic interleave (mirrors [O5]'s approach,
+      // adapted for cancel): a raw producer-transition-shaped transaction is
+      // opened directly (NOT via the frozen sub-orders service, which self-
+      // commits immediately and offers no barrier hook) and HELD OPEN
+      // (uncommitted) after its UPDATE executes. Because cancel's step-1 read
+      // is a plain SELECT under Postgres READ COMMITTED, a NEW transaction
+      // started while this producer transaction is still uncommitted will see
+      // the OLD "pending" value — exactly the TOCTOU window design Decision 3
+      // describes.
+      // ---------------------------------------------------------------------
+      const releaseProducer = createDeferred();
+      const producerUpdateDone = createDeferred();
+
+      const producerTxPromise = db.$transaction(async (tx) => {
+        await tx.subOrder.update({ where: { id: subOrderId }, data: { status: "preparing" } });
+        producerUpdateDone.resolve();
+        await releaseProducer.promise;
+      });
+
+      // Guarantee the producer's UPDATE has executed (row lock acquired,
+      // uncommitted) before cancel's read runs.
+      await producerUpdateDone.promise;
+
+      // Kick off cancel WITHOUT awaiting — its step-1 read is guaranteed to
+      // see "pending" (producer's update is invisible pre-commit), so the
+      // step-2 pre-check passes and cancel proceeds to restock and then its
+      // guarded updateMany, which will BLOCK on the row lock producer holds.
+      const cancelPromise = ordersService.cancelOrder(consumer.id, created.id);
+
+      let lockWaitError: unknown;
+      try {
+        await waitForBlockedSubOrderUpdate(db, 5000);
+      } catch (err) {
+        lockWaitError = err;
+      } finally {
+        // Release producer -> it commits ("preparing") -> cancel's blocked
+        // updateMany resumes, re-evaluates WHERE status='pending' against the
+        // NOW-committed "preparing" row, excludes it, and the count mismatch
+        // (0 matched vs 1 expected) throws InvalidOrderTransitionError,
+        // rolling back the ENTIRE cancel transaction (including the restock
+        // that already ran in step 3).
+        releaseProducer.resolve();
+      }
+
+      const [cancelSettled, producerSettled] = await Promise.allSettled([cancelPromise, producerTxPromise]);
+
+      if (lockWaitError) {
+        throw lockWaitError;
+      }
+      if (producerSettled.status === "rejected") {
+        throw producerSettled.reason;
+      }
+
+      expect(cancelSettled.status).toBe("rejected");
+      if (cancelSettled.status === "rejected") {
+        expect(cancelSettled.reason).toMatchObject({ code: "INVALID_ORDER_TRANSITION" });
+      }
+
+      // Whole cancel tx rolled back — the step-3 restock never took effect.
+      const freshProduct = await db.product.findUniqueOrThrow({ where: { id: product.id } });
+      expect(freshProduct.stock).toBe(8); // still 10 - 2, restock reverted
+
+      // Producer's committed transition stands untouched by cancel's rollback.
+      const freshSubOrder = await db.subOrder.findUniqueOrThrow({ where: { id: subOrderId } });
+      expect(freshSubOrder.status).toBe("preparing");
+    },
+    20000,
   );
 });
