@@ -55,11 +55,33 @@
  *     pre-check — proven via a deterministic `recoveryFired` flag, not just
  *     outcome inference — and exactly ONE Order/Payment row exists
  *
+ * WU3 (Read Surface, HTTP) additions below use real Postgres AND Supertest
+ * together — a deliberate deviation from the repo's usual "Supertest =
+ * mocked prisma" convention (cart.test.ts, addresses.test.ts, etc.). Real
+ * rows with nested payment/subOrders/orderLines are far cheaper to SEED via
+ * the real service layer than to hand-construct as a deeply nested Prisma
+ * mock, and this is the only way to prove the real ownership-scoped SQL
+ * query (`where: { id, userId }`) actually no-leaks against a second real
+ * user — mirroring the cart.authz.test.ts precedent for that specific
+ * concern, but wired through the real HTTP layer (routes + middleware
+ * chain) instead of calling the service directly.
+ *
+ *   [OH1] GET /pedidos — owner-scoped summary history
+ *   [OH2] GET /pedidos — empty list for a user with zero orders
+ *   [OH3] GET /pedidos/:id — nested detail (payment/subOrders/orderLines)
+ *   [OH4] GET /pedidos/:id — non-owned order returns 404 (no-leak)
+ *   [OH5] GET /pedidos/:id — unknown id returns 404
+ *   [OH6] GET /pedidos — 401 unauthenticated
+ *   [OH7] GET /pedidos — 403 ONBOARDING_REQUIRED for a PENDING_ROLE user
+ *
  * Spec references:
  *   orders §"createOrderFromPayment writes the order aggregate atomically"
  *   orders §"Checkout enforces all-or-nothing availability"
  *   orders §"Duplicate webhook must not double-create an order"
+ *   orders §"GET /pedidos returns owner-scoped summary history"
+ *   orders §"GET /pedidos/:id returns nested detail with no-leak 404"
  *   design Decision 4 (internals, atomic step order, idempotency backstop)
+ *   design Decision 6 (guard chain, owner = req.user.id, no-leak 404)
  *
  * SKIP POLICY: When the database is unreachable, each test calls `ctx.skip()`
  * so Vitest reports it as SKIPPED (not passed). This prevents silent
@@ -69,12 +91,54 @@
 import { randomUUID } from "node:crypto";
 
 import { PrismaClient } from "@prisma/client";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import supertest from "supertest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { InsufficientStockError } from "@/shared/errors/errors";
 import * as cartService from "@/modules/cart/services/cart.service";
 import * as ordersService from "@/modules/orders/services/orders.service";
 import { prisma } from "@/shared/utils/prisma";
+
+// ---------------------------------------------------------------------------
+// Mock: express-oauth2-jwt-bearer ONLY — same test double as cart.test.ts /
+// addresses.test.ts. `@/shared/utils/prisma` is intentionally NOT mocked
+// here (see file header WU3 note): loadUser and orders.service both hit the
+// REAL Postgres test database through the real singleton.
+// ---------------------------------------------------------------------------
+vi.mock("express-oauth2-jwt-bearer", () => ({
+  auth: () =>
+    (
+      req: import("express").Request,
+      _res: import("express").Response,
+      next: import("express").NextFunction,
+    ): void => {
+      const header = req.headers["x-test-auth"] as string | undefined;
+      if (!header) {
+        next({ status: 401, name: "UnauthorizedError" });
+        return;
+      }
+      try {
+        const payload = JSON.parse(Buffer.from(header, "base64").toString("utf8")) as Record<
+          string,
+          unknown
+        >;
+        req.auth = { payload: payload as never, header: {}, token: "test-token" };
+        next();
+      } catch {
+        next({ status: 401, name: "UnauthorizedError" });
+      }
+    },
+}));
+
+// eslint-disable-next-line import/first
+import { createApp } from "@/app";
+
+function authHeader(claims: Record<string, unknown>): string {
+  return Buffer.from(JSON.stringify(claims)).toString("base64");
+}
+
+const app = createApp();
+const request = supertest(app);
 
 // ---------------------------------------------------------------------------
 // Real Prisma client for setup/teardown — not the singleton under test.
@@ -734,5 +798,141 @@ describe("createOrderFromPayment — duplicate webhook recovers via real P2002 [
       expect(orderCount).toBe(1);
     },
     25000,
+  );
+});
+
+// ===========================================================================
+// WU3 (Read Surface, HTTP) — real Postgres + Supertest
+// ===========================================================================
+
+describe("GET /api/v1/pedidos and /api/v1/pedidos/:id — real Postgres + Supertest [OH]", () => {
+  it(
+    "[OH1][OH2][OH3][OH4][OH5][OH6][OH7] owner-scoped history, nested detail, no-leak 404, 401, and onboarding 403",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer: producerA, category } = await seedProducer("oh1a", "B10000061");
+      const { producer: producerB } = await seedProducer("oh1b", "B10000062");
+      const owner = await seedConsumer("oh-owner");
+      const stranger = await seedConsumer("oh-stranger");
+
+      const pendingUser = await db.user.upsert({
+        where: { auth0Sub: "test-orders-oh-pending-user" },
+        create: {
+          auth0Sub: "test-orders-oh-pending-user",
+          email: "orders-oh-pending@test.local",
+          role: "PENDING_ROLE",
+        },
+        update: { role: "PENDING_ROLE" },
+      });
+      cleanupUserIds.push(pendingUser.id);
+
+      const dmA = await db.deliveryMode.create({
+        data: { producerId: producerA.id, type: "SHIPPING_FLAT_RATE", cost: 2.0, isActive: true },
+      });
+      const dmB = await db.deliveryMode.create({
+        data: { producerId: producerB.id, type: "SHIPPING_FLAT_RATE", cost: 4.0, isActive: true },
+      });
+      const productA = await db.product.create({
+        data: { producerId: producerA.id, categoryId: category.id, name: "OH1 Product A", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+      const productB = await db.product.create({
+        data: { producerId: producerB.id, categoryId: category.id, name: "OH1 Product B", description: "d", price: 10.0, stock: 5, isActive: true },
+      });
+
+      // Owner: one two-producer order (2 SubOrders, 2 OrderLines) via the real service.
+      await cartService.addItem(owner.id, productA.id, 1);
+      await cartService.addItem(owner.id, productB.id, 1);
+      const ownerCartView = await cartService.getCartForCheckout(owner.id);
+      const createdOrder = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_oh1_owner_order",
+          ownerCartView,
+          [
+            { producerId: producerA.id, deliveryModeId: dmA.id },
+            { producerId: producerB.id, deliveryModeId: dmB.id },
+          ],
+          tx,
+        ),
+      );
+
+      // Stranger: their OWN separate order — must never leak into owner's list/detail.
+      await cartService.addItem(stranger.id, productA.id, 1);
+      const strangerCartView = await cartService.getCartForCheckout(stranger.id);
+      const strangerOrder = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_oh1_stranger_order",
+          strangerCartView,
+          [{ producerId: producerA.id, deliveryModeId: dmA.id }],
+          tx,
+        ),
+      );
+
+      const ownerAuth = authHeader({ sub: owner.auth0Sub });
+      const strangerAuth = authHeader({ sub: stranger.auth0Sub });
+      const pendingAuth = authHeader({ sub: pendingUser.auth0Sub });
+
+      // [OH1] owner-scoped summary history — only the owner's order appears.
+      const listRes = await request.get("/api/v1/pedidos").set("x-test-auth", ownerAuth);
+      expect(listRes.status).toBe(200);
+      expect(listRes.body).toHaveLength(1);
+      expect(listRes.body[0]).toMatchObject({
+        id: createdOrder.id,
+        status: "PENDING",
+        producerCount: 2,
+      });
+      const listedIds = (listRes.body as Array<{ id: string }>).map((o) => o.id);
+      expect(listedIds).not.toContain(strangerOrder.id);
+
+      // [OH2] a brand-new consumer with zero orders gets an empty list.
+      const emptyConsumer = await seedConsumer("oh2-empty");
+      const emptyAuth = authHeader({ sub: emptyConsumer.auth0Sub });
+      const emptyListRes = await request.get("/api/v1/pedidos").set("x-test-auth", emptyAuth);
+      expect(emptyListRes.status).toBe(200);
+      expect(emptyListRes.body).toEqual([]);
+
+      // [OH3] nested detail — payment/subOrders/orderLines all present.
+      const detailRes = await request
+        .get(`/api/v1/pedidos/${createdOrder.id}`)
+        .set("x-test-auth", ownerAuth);
+      expect(detailRes.status).toBe(200);
+      expect(detailRes.body).toMatchObject({
+        id: createdOrder.id,
+        status: "PENDING",
+        payment: { status: "SUCCEEDED" },
+      });
+      expect(detailRes.body.subOrders).toHaveLength(2);
+      const allLines = (detailRes.body.subOrders as Array<{ orderLines: unknown[] }>).flatMap(
+        (s) => s.orderLines,
+      );
+      expect(allLines).toHaveLength(2);
+
+      // [OH4] the STRANGER cannot read the OWNER's order — 404, no-leak (never 403).
+      const crossUserRes = await request
+        .get(`/api/v1/pedidos/${createdOrder.id}`)
+        .set("x-test-auth", strangerAuth);
+      expect(crossUserRes.status).toBe(404);
+      expect(crossUserRes.body).toMatchObject({ code: "NOT_FOUND" });
+
+      // [OH5] an unknown id also returns 404 (same status as unowned — no-leak).
+      const unknownRes = await request
+        .get("/api/v1/pedidos/bogus-order-id")
+        .set("x-test-auth", ownerAuth);
+      expect(unknownRes.status).toBe(404);
+      expect(unknownRes.body).toMatchObject({ code: "NOT_FOUND" });
+
+      // [OH6] no Authorization header -> 401.
+      const unauthRes = await request.get("/api/v1/pedidos");
+      expect(unauthRes.status).toBe(401);
+
+      // [OH7] PENDING_ROLE user is blocked by onboardingGate -> 403 ONBOARDING_REQUIRED.
+      const onboardingRes = await request.get("/api/v1/pedidos").set("x-test-auth", pendingAuth);
+      expect(onboardingRes.status).toBe(403);
+      expect(onboardingRes.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
+    },
+    30000,
   );
 });

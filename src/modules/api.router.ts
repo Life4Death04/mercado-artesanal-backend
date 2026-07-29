@@ -22,6 +22,7 @@
  *   subOrdersRouter      — Cycle 2: producer-scoped read + state-machine PATCH under /producers/me/sub-orders[/:id]
  *   statisticsRouter     — Cycle 2: GET /producers/me/stats/{revenue,order-count,low-stock} (producer)
  *   cartRouter           — Cycle 3: consumer cart CRUD under /carrito (cart-foundation PR #1)
+ *   ordersRouter         — Cycle 4: consumer order read surface under /pedidos (orders WU3)
  *
  * Mount order: public routers (categoriesRouter, producersRouter GET /:id) are registered
  * BEFORE auth-gated routers so they are reachable without any auth header.
@@ -38,6 +39,7 @@ import { categoriesRouter } from "./categories/routes/categories.routes";
 import { deliveryModesRouter } from "./delivery-modes/routes/delivery-modes.routes";
 import { imagesRouter } from "./images/routes/images.routes";
 import { onboardingRouter } from "./onboarding/routes/onboarding.routes";
+import { ordersRouter } from "./orders/routes/orders.routes";
 import { producersRouter } from "./producers/routes/producers.routes";
 import { productsRouter } from "./products/routes/products.routes";
 import { statisticsRouter } from "./statistics/routes/statistics.routes";
@@ -63,3 +65,4 @@ apiRouter.use(deliveryModesRouter);
 apiRouter.use(subOrdersRouter);
 apiRouter.use(statisticsRouter);
 apiRouter.use(cartRouter);
+apiRouter.use(ordersRouter);

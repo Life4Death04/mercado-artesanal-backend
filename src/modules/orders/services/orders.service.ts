@@ -6,7 +6,9 @@
  *   `import * as ordersService from "@/modules/orders/services/orders.service"`.
  *
  * WU2 (Checkout Write Contract) implements: `deriveOrderStatus`, `createOrderFromPayment`.
- * WU3 (Read Surface) will add `listOrders`/`getOrderDetail` in this same file.
+ * WU3 (Read Surface) implements: `listOrders`, `getOrderDetail`. `listOrders`
+ * delegates response formatting to the PURE `mapOrderSummaryView` in
+ * `orders.dto.ts`; `getOrderDetail` reuses the existing `mapExistingOrderDetailView`.
  * WU4 (Cancellation) will add `cancelOrder` in this same file.
  *
  * Architecture: no repositories/ layer — service calls prisma delegates directly
@@ -57,8 +59,13 @@ import { decrementStock } from "@/modules/inventory/services/inventory.service";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
+  NotFoundError,
   ValidationFailedError,
 } from "@/shared/errors/errors";
+import { prisma } from "@/shared/utils/prisma";
+
+import type { OrderSummaryView } from "../dto/orders.dto";
+import { mapOrderSummaryView } from "../dto/orders.dto";
 
 // ---------------------------------------------------------------------------
 // Internal type alias (consistent with inventory.service.ts pattern)
@@ -467,4 +474,79 @@ export async function createOrderFromPayment(
     payment: { status: payment.status },
     subOrders,
   };
+}
+
+// ---------------------------------------------------------------------------
+// listOrders / getOrderDetail — WU3 (Read Surface)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /pedidos — owner-scoped summary history for `req.user.id`.
+ *
+ * Issues ONE `prisma.order.findMany` scoped to `userId`, newest first,
+ * selecting only the nested `SubOrder.status` needed to derive `Order.status`
+ * (design Decision 2, the SOLE authority — never the persisted column) and
+ * to compute `producerCount` (= `subOrders.length`; each `SubOrder` is
+ * created for exactly one distinct producer at checkout time, design
+ * Decision 4 step 6). Mapping to the wire shape is delegated to the PURE
+ * `mapOrderSummaryView` (orders.dto.ts) — this function only derives status
+ * and count, then hands off formatting.
+ *
+ * Spec: orders §"GET /pedidos returns owner-scoped summary history"
+ * Design: Decision 2, Data Flow ("GET /pedidos[/:id] -> ordersService ->
+ *   deriveOrderStatus(subStatuses) -> View")
+ */
+export async function listOrders(userId: string): Promise<OrderSummaryView[]> {
+  const orders = await prisma.order.findMany({
+    where: { userId },
+    orderBy: { createdAt: "desc" },
+    select: {
+      id: true,
+      createdAt: true,
+      totalAmount: true,
+      subOrders: { select: { status: true } },
+    },
+  });
+
+  return orders.map((order) => {
+    const statuses = order.subOrders.map((s) => s.status);
+    return mapOrderSummaryView({
+      id: order.id,
+      createdAt: order.createdAt,
+      totalAmount: order.totalAmount,
+      status: deriveOrderStatus(statuses),
+      producerCount: order.subOrders.length,
+    });
+  });
+}
+
+/**
+ * GET /pedidos/:id — nested detail for the caller's own order only.
+ *
+ * Ownership is enforced at the QUERY level (`where: { id, userId }`), so an
+ * unknown OR non-owned id resolves to the SAME `null` result and the SAME
+ * `NotFoundError` (404) — no-leak, never `403` (spec §"GET /pedidos/:id
+ * returns nested detail with no-leak 404").
+ *
+ * Reuses `mapExistingOrderDetailView` (the same mapper the WU2 idempotency
+ * pre-check path already uses) so the detail shape is identical whichever
+ * code path produced it.
+ *
+ * Spec: orders §"GET /pedidos/:id returns nested detail with no-leak 404"
+ * Design: Decision 6 (owner = req.user.id, no-leak 404)
+ */
+export async function getOrderDetail(userId: string, orderId: string): Promise<OrderDetailView> {
+  const order = await prisma.order.findFirst({
+    where: { id: orderId, userId },
+    include: {
+      payment: { select: { status: true } },
+      subOrders: { include: { orderLines: true } },
+    },
+  });
+
+  if (!order) {
+    throw new NotFoundError("Order not found");
+  }
+
+  return mapExistingOrderDetailView(order, order.payment.status);
 }
