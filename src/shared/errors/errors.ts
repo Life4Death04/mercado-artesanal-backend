@@ -249,3 +249,29 @@ export class NotImplementedError extends AppError {
     super(detail, cause);
   }
 }
+
+// ===========================================================================
+// Cycle 4 additions — orders slice (consumer-purchase-flow 2/3)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 422 — createOrderFromPayment invoked with zero cart items
+// ---------------------------------------------------------------------------
+
+export class EmptyCartCheckoutError extends AppError {
+  readonly code = "EMPTY_CART_CHECKOUT" as const;
+  readonly status = 422;
+  readonly title = "Empty cart checkout";
+}
+
+// ---------------------------------------------------------------------------
+// 409 — any cart item unavailable at checkout (producer soft-deleted or
+//       product inactive/soft-deleted) — all-or-nothing (design Decision 5).
+//       Distinct from InsufficientStockError (stock shortfall, not availability).
+// ---------------------------------------------------------------------------
+
+export class CartItemNotAvailableError extends AppError {
+  readonly code = "CART_ITEM_NOT_AVAILABLE" as const;
+  readonly status = 409;
+  readonly title = "Cart item not available";
+}
