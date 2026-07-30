@@ -16,6 +16,10 @@
  * suite. ONLY `@/modules/payments/services/stripe.client` is stubbed — no
  * real Stripe SDK call is ever made.
  *
+ * Seed/cleanup scaffolding lives in `tests/helpers/payments-fixtures.ts`
+ * (extracted refactor — see that file's header for details). WU2/WU3 reuse
+ * the same helpers instead of re-authoring this boilerplate.
+ *
  * SKIP POLICY: When the database is unreachable, each test calls `ctx.skip()`
  * so Vitest reports it as SKIPPED (not passed) — same policy as
  * `orders.test.ts`. `docker compose -f docker-compose.test.yml up -d` MUST
@@ -90,12 +94,20 @@ import { stripeClient } from "@/modules/payments/services/stripe.client";
 import { prisma } from "@/shared/utils/prisma";
 // eslint-disable-next-line import/first
 import { createApp } from "@/app";
+// eslint-disable-next-line import/first
+import {
+  authHeader,
+  consumerAuthHeaderFor,
+  consumerClaim,
+  createPaymentsFixtureCleanup,
+  cleanupPaymentsFixtures,
+  isDbReachable,
+  seedCheckoutReadyCart,
+  seedConsumer,
+  seedProducer,
+} from "../helpers/payments-fixtures";
 
 const mockedCreatePaymentIntent = vi.mocked(stripeClient.createPaymentIntent);
-
-function authHeader(claims: Record<string, unknown>): string {
-  return Buffer.from(JSON.stringify(claims)).toString("base64");
-}
 
 const app = createApp();
 const request = supertest(app);
@@ -107,91 +119,19 @@ const db = new PrismaClient();
 
 let dbReachable = false;
 
-async function isDbReachable(): Promise<boolean> {
-  try {
-    await db.$queryRaw`SELECT 1`;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Seed helpers — mirror orders.test.ts's seedProducer/seedConsumer pattern.
+// Seed/cleanup tracking — helpers themselves live in
+// tests/helpers/payments-fixtures.ts (see file header note above).
 // ---------------------------------------------------------------------------
-const cleanupUserIds: string[] = [];
-const cleanupProducerIds: string[] = [];
-const cleanupCategorySlugs = new Set<string>();
-
-async function seedProducer(namePrefix: string, nif: string) {
-  const category = await db.category.upsert({
-    where: { slug: `test-payments-${namePrefix}-cat` },
-    create: { slug: `test-payments-${namePrefix}-cat`, name: `Test Payments ${namePrefix} Category`, isActive: true },
-    update: {},
-  });
-  cleanupCategorySlugs.add(category.slug);
-
-  const producerUser = await db.user.upsert({
-    where: { auth0Sub: `test-payments-${namePrefix}-producer` },
-    create: {
-      auth0Sub: `test-payments-${namePrefix}-producer`,
-      email: `payments-${namePrefix}-producer@test.local`,
-      role: "PRODUCER",
-    },
-    update: {},
-  });
-  cleanupUserIds.push(producerUser.id);
-
-  const producer = await db.producer.upsert({
-    where: { userId: producerUser.id },
-    create: {
-      userId: producerUser.id,
-      businessName: `Test Payments Producer ${namePrefix}`,
-      nif,
-      description: "Producer for payments WU1 integration tests",
-      addressLine1: "Calle Pagos 1",
-      addressCity: "Madrid",
-      addressPostalCode: "28001",
-      addressProvince: "Madrid",
-    },
-    update: {},
-  });
-  cleanupProducerIds.push(producer.id);
-
-  return { category, producer };
-}
-
-async function seedConsumer(namePrefix: string) {
-  const user = await db.user.upsert({
-    where: { auth0Sub: `test-payments-${namePrefix}-user` },
-    create: {
-      auth0Sub: `test-payments-${namePrefix}-user`,
-      email: `payments-${namePrefix}@test.local`,
-      role: "CONSUMER",
-    },
-    update: {},
-  });
-  cleanupUserIds.push(user.id);
-  return user;
-}
-
-function consumerClaim(sub: string): Record<string, unknown> {
-  return { sub, "https://mercado-artesanal.com/email": `${sub}@test.local` };
-}
+const cleanup = createPaymentsFixtureCleanup();
 
 beforeAll(async () => {
-  dbReachable = await isDbReachable();
+  dbReachable = await isDbReachable(db);
 });
 
 afterAll(async () => {
   if (dbReachable) {
-    await db.cartItem.deleteMany({ where: { cart: { userId: { in: cleanupUserIds } } } });
-    await db.cart.deleteMany({ where: { userId: { in: cleanupUserIds } } });
-    await db.deliveryMode.deleteMany({ where: { producerId: { in: cleanupProducerIds } } });
-    await db.product.deleteMany({ where: { producerId: { in: cleanupProducerIds } } });
-    await db.producer.deleteMany({ where: { id: { in: cleanupProducerIds } } });
-    await db.user.deleteMany({ where: { id: { in: cleanupUserIds } } });
-    await db.category.deleteMany({ where: { slug: { in: [...cleanupCategorySlugs] } } });
+    await cleanupPaymentsFixtures(db, cleanup);
   }
   await db.$disconnect();
   await prisma.$disconnect();
@@ -211,25 +151,10 @@ describe("POST /api/v1/pagos/intent — happy path [PH1]", () => {
       }
       vi.clearAllMocks();
 
-      const { producer, category } = await seedProducer("ph1", "B20000011");
-      const consumer = await seedConsumer("ph1");
-
-      const dm = await db.deliveryMode.create({
-        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 2.0, isActive: true },
+      const { producer, deliveryMode } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "ph1",
+        nif: "B20000011",
       });
-      const product = await db.product.create({
-        data: {
-          producerId: producer.id,
-          categoryId: category.id,
-          name: "PH1 Product",
-          description: "d",
-          price: 5.0,
-          stock: 10,
-          isActive: true,
-        },
-      });
-
-      await cartService.addItem(consumer.id, product.id, 1);
 
       mockedCreatePaymentIntent.mockResolvedValueOnce({
         id: "pi_ph1",
@@ -238,8 +163,8 @@ describe("POST /api/v1/pagos/intent — happy path [PH1]", () => {
 
       const res = await request
         .post("/api/v1/pagos/intent")
-        .set("x-test-auth", authHeader(consumerClaim(`test-payments-ph1-user`)))
-        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: dm.id }] });
+        .set("x-test-auth", consumerAuthHeaderFor("ph1"))
+        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
 
       expect(res.status).toBe(201);
       expect(res.body).toEqual({ clientSecret: "secret_ph1" });
@@ -276,7 +201,7 @@ describe("POST /api/v1/pagos/intent — 404 when no Cart row exists [PH3]", () =
       }
       vi.clearAllMocks();
 
-      const consumer = await seedConsumer("ph3");
+      const consumer = await seedConsumer(db, cleanup, "ph3");
 
       const res = await request
         .post("/api/v1/pagos/intent")
@@ -305,7 +230,7 @@ describe("POST /api/v1/pagos/intent — 422 EMPTY_CART_CHECKOUT [PH4]", () => {
       }
       vi.clearAllMocks();
 
-      const consumer = await seedConsumer("ph4");
+      const consumer = await seedConsumer(db, cleanup, "ph4");
       // Lazily create an empty Cart row via clearCart's no-op-safe path is not
       // guaranteed to create a row; use the real service the same way cart
       // PR#2/#3 tests do — a Cart row is created lazily on first addItem, so
@@ -343,8 +268,8 @@ describe("POST /api/v1/pagos/intent — 422 VALIDATION_FAILED on bad delivery se
       }
       vi.clearAllMocks();
 
-      const { producer, category } = await seedProducer("ph5", "B20000051");
-      const consumer = await seedConsumer("ph5");
+      const { producer, category } = await seedProducer(db, cleanup, "ph5", "B20000051");
+      const consumer = await seedConsumer(db, cleanup, "ph5");
 
       const product = await db.product.create({
         data: {
@@ -386,33 +311,20 @@ describe("POST /api/v1/pagos/intent — 409 INSUFFICIENT_STOCK [PH6]", () => {
       }
       vi.clearAllMocks();
 
-      const { producer, category } = await seedProducer("ph6", "B20000061");
-      const consumer = await seedConsumer("ph6");
-
-      const dm = await db.deliveryMode.create({
-        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 2.0, isActive: true },
+      const { producer, deliveryMode, product } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "ph6",
+        nif: "B20000061",
+        stock: 2,
+        quantity: 2,
       });
-      const product = await db.product.create({
-        data: {
-          producerId: producer.id,
-          categoryId: category.id,
-          name: "PH6 Product",
-          description: "d",
-          price: 5.0,
-          stock: 2,
-          isActive: true,
-        },
-      });
-
-      await cartService.addItem(consumer.id, product.id, 2);
       // Stock drops below the already-in-cart quantity AFTER the add (simulates
       // another consumer/producer action reducing stock live before intent creation).
       await db.product.update({ where: { id: product.id }, data: { stock: 1 } });
 
       const res = await request
         .post("/api/v1/pagos/intent")
-        .set("x-test-auth", authHeader(consumerClaim(`test-payments-ph6-user`)))
-        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: dm.id }] });
+        .set("x-test-auth", consumerAuthHeaderFor("ph6"))
+        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
 
       expect(res.status).toBe(409);
       expect(res.body).toMatchObject({ code: "INSUFFICIENT_STOCK" });
@@ -436,31 +348,17 @@ describe("POST /api/v1/pagos/intent — 502 PAYMENT_INTENT_CREATION_FAILED [PH7]
       }
       vi.clearAllMocks();
 
-      const { producer, category } = await seedProducer("ph7", "B20000071");
-      const consumer = await seedConsumer("ph7");
-
-      const dm = await db.deliveryMode.create({
-        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 2.0, isActive: true },
+      const { producer, deliveryMode, consumer } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "ph7",
+        nif: "B20000071",
       });
-      const product = await db.product.create({
-        data: {
-          producerId: producer.id,
-          categoryId: category.id,
-          name: "PH7 Product",
-          description: "d",
-          price: 5.0,
-          stock: 10,
-          isActive: true,
-        },
-      });
-      await cartService.addItem(consumer.id, product.id, 1);
 
       mockedCreatePaymentIntent.mockRejectedValueOnce(new Error("stripe unreachable"));
 
       const res = await request
         .post("/api/v1/pagos/intent")
-        .set("x-test-auth", authHeader(consumerClaim(`test-payments-ph7-user`)))
-        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: dm.id }] });
+        .set("x-test-auth", consumerAuthHeaderFor("ph7"))
+        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
 
       expect(res.status).toBe(502);
       expect(res.body).toMatchObject({ code: "PAYMENT_INTENT_CREATION_FAILED" });
@@ -489,29 +387,15 @@ describe("POST /api/v1/pagos/intent — stable idempotency key across repeat req
       }
       vi.clearAllMocks();
 
-      const { producer, category } = await seedProducer("ph8", "B20000081");
-      const consumer = await seedConsumer("ph8");
-
-      const dm = await db.deliveryMode.create({
-        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 2.0, isActive: true },
+      const { producer, deliveryMode } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "ph8",
+        nif: "B20000081",
       });
-      const product = await db.product.create({
-        data: {
-          producerId: producer.id,
-          categoryId: category.id,
-          name: "PH8 Product",
-          description: "d",
-          price: 5.0,
-          stock: 10,
-          isActive: true,
-        },
-      });
-      await cartService.addItem(consumer.id, product.id, 1);
 
       mockedCreatePaymentIntent.mockResolvedValue({ id: "pi_ph8", client_secret: "secret_ph8" });
 
-      const body = { deliverySelections: [{ producerId: producer.id, deliveryModeId: dm.id }] };
-      const authSet = authHeader(consumerClaim(`test-payments-ph8-user`));
+      const body = { deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] };
+      const authSet = consumerAuthHeaderFor("ph8");
 
       await request.post("/api/v1/pagos/intent").set("x-test-auth", authSet).send(body);
       await request.post("/api/v1/pagos/intent").set("x-test-auth", authSet).send(body);
