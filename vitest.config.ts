@@ -24,6 +24,11 @@ export default defineConfig({
       // Required after expose-product-images-in-producer-list Slice 1.
       // Tests use https:// so the singleton boots cleanly in NODE_ENV=test.
       S3_PUBLIC_BASE_URL: "https://test-cdn.example.com",
+      // Required after Cycle 5 payments WU1. Real Stripe SDK calls are always
+      // mocked in tests (unit: mock stripe.client module; integration: stubbed
+      // Stripe per design Testing Strategy) — this value only satisfies env.ts
+      // fail-fast validation at singleton import time.
+      STRIPE_SECRET_KEY: "sk_test_dummy_for_vitest",
     },
     coverage: {
       provider: "v8",
