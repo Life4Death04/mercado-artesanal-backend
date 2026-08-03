@@ -1,10 +1,13 @@
 /**
- * Integration tests — POST /api/v1/pagos/intent (Cycle 5 payments WU1, real
- * Postgres, strict TDD).
+ * Integration tests — POST /api/v1/pagos/intent and POST /api/v1/pagos/webhook
+ * (Cycle 5 payments WU1 + WU2, real Postgres, strict TDD).
  *
- * WU1 scope ONLY. WU2 (webhook raw-body trust boundary) and WU3 (atomic
- * webhook events) are OUT OF SCOPE for this file — no `/pagos/webhook` tests
- * belong here yet.
+ * WU1 scope: `/pagos/intent`. WU2 scope: the `/pagos/webhook` raw-body trust
+ * boundary — signature verification ONLY (400 + zero writes on bad/missing
+ * signature, 200 no-op on any accepted-but-unhandled event type). WU2 does
+ * NOT implement `payment_intent.succeeded` / `payment_intent.payment_failed`
+ * production handling — every verified event type is a no-op in this slice
+ * (WU3 scope). See the "[WU2]" describe blocks below.
  *
  * Strategy (design §Testing Strategy — "Integration (Supertest + real
  * Prisma, stubbed Stripe)"): mirrors `orders.test.ts`'s real-Postgres
@@ -25,7 +28,7 @@
  * `orders.test.ts`. `docker compose -f docker-compose.test.yml up -d` MUST
  * be running before this suite executes.
  *
- * Scenarios covered (spec §ADDED requirements R1-R5):
+ * Scenarios covered (spec §ADDED requirements R1-R5, R6, R9):
  *   [PH1] valid cart + valid delivery selection -> 201 { clientSecret }
  *   [PH2] no Authorization header -> 401
  *   [PH3] no Cart row for the authenticated user -> 404
@@ -34,6 +37,12 @@
  *   [PH6] requested quantity exceeds LIVE Product.stock -> 409 INSUFFICIENT_STOCK
  *   [PH7] Stripe rejects the PaymentIntent call -> 502 PAYMENT_INTENT_CREATION_FAILED
  *   [PH8] repeat request for the SAME cart reuses the SAME idempotencyKey (cartId)
+ *   [WU2-1] invalid webhook signature -> 400 WEBHOOK_SIGNATURE_INVALID, zero writes
+ *   [WU2-2] missing webhook signature header -> 400 WEBHOOK_SIGNATURE_INVALID, zero writes
+ *   [WU2-3] unhandled/unknown event type -> 200 no-op, zero writes
+ *   [WU2-4] /pagos/intent still parses a normal JSON body after the webhook
+ *           raw-body wiring is added in src/app.ts (proves route-scoped
+ *           express.raw does not regress the global express.json parser)
  *
  * Spec references:
  *   payments §"POST /pagos/intent creates intent behind full auth chain" (R1)
@@ -41,6 +50,8 @@
  *   payments §"Intent hard stock gate" (R3)
  *   payments §"Intent amount server-side EUR" (R4)
  *   payments §"Stripe failure -> PaymentIntentCreationError 502" (R5)
+ *   payments §"POST /pagos/webhook verifies the Stripe signature over the raw body" (R6)
+ *   payments §"Unhandled webhook event types are ignored" (R9)
  */
 import { PrismaClient } from "@prisma/client";
 import supertest from "supertest";
@@ -83,6 +94,7 @@ vi.mock("express-oauth2-jwt-bearer", () => ({
 vi.mock("@/modules/payments/services/stripe.client", () => ({
   stripeClient: {
     createPaymentIntent: vi.fn(),
+    constructEvent: vi.fn(),
   },
 }));
 
@@ -108,6 +120,7 @@ import {
 } from "../helpers/payments-fixtures";
 
 const mockedCreatePaymentIntent = vi.mocked(stripeClient.createPaymentIntent);
+const mockedConstructEvent = vi.mocked(stripeClient.constructEvent);
 
 const app = createApp();
 const request = supertest(app);
@@ -405,6 +418,157 @@ describe("POST /api/v1/pagos/intent — stable idempotency key across repeat req
       const secondKey = mockedCreatePaymentIntent.mock.calls[1]?.[0]?.idempotencyKey;
       expect(firstKey).toBe(secondKey);
       expect(typeof firstKey).toBe("string");
+    },
+    20000,
+  );
+});
+
+// ===========================================================================
+// WU2 — Webhook Trust Boundary (payments §R6, §R9)
+//
+// [WU2-1] invalid signature -> 400 WEBHOOK_SIGNATURE_INVALID, zero writes
+// [WU2-2] missing signature header -> 400 WEBHOOK_SIGNATURE_INVALID, zero writes
+// [WU2-3] unhandled event type -> 200 no-op, zero writes
+// [WU2-4] a normal JSON route (/pagos/intent) still parses its body correctly
+//         after the webhook raw-body wiring is added to src/app.ts
+//
+// `stripeClient.constructEvent` is the ONLY verification seam (design "TDD
+// Seams: Signature verification") — every WU2 scenario below drives it
+// through the real HTTP boundary rather than calling payments.service
+// directly, so the raw-body middleware wiring in src/app.ts is exercised
+// end-to-end, not just the service function in isolation.
+// ===========================================================================
+
+describe("POST /api/v1/pagos/webhook — invalid signature is rejected [WU2-1]", () => {
+  it(
+    "[WU2-1] returns 400 WEBHOOK_SIGNATURE_INVALID and writes zero Payment/Order rows",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      mockedConstructEvent.mockImplementationOnce(() => {
+        throw new Error("Stripe signature verification failed");
+      });
+
+      const paymentsBefore = await db.payment.count();
+      const ordersBefore = await db.order.count();
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=deadbeef")
+        .send({ id: "evt_wu2_bad_sig", type: "payment_intent.succeeded" });
+
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ code: "WEBHOOK_SIGNATURE_INVALID" });
+      expect(mockedConstructEvent).toHaveBeenCalledTimes(1);
+
+      const paymentsAfter = await db.payment.count();
+      const ordersAfter = await db.order.count();
+      expect(paymentsAfter).toBe(paymentsBefore);
+      expect(ordersAfter).toBe(ordersBefore);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — missing signature header is rejected [WU2-2]", () => {
+  it(
+    "[WU2-2] returns 400 WEBHOOK_SIGNATURE_INVALID without ever calling constructEvent, zero writes",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const paymentsBefore = await db.payment.count();
+      const ordersBefore = await db.order.count();
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .send({ id: "evt_wu2_no_sig", type: "payment_intent.succeeded" });
+
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ code: "WEBHOOK_SIGNATURE_INVALID" });
+      // Missing-signature rejection MUST short-circuit before the Stripe
+      // client is ever consulted (design "Signature verification is the
+      // ONLY verification point").
+      expect(mockedConstructEvent).not.toHaveBeenCalled();
+
+      const paymentsAfter = await db.payment.count();
+      const ordersAfter = await db.order.count();
+      expect(paymentsAfter).toBe(paymentsBefore);
+      expect(ordersAfter).toBe(ordersBefore);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — unhandled event type is a no-op [WU2-3]", () => {
+  it(
+    "[WU2-3] returns 200 for a verified but unhandled event type, with zero writes",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      mockedConstructEvent.mockReturnValueOnce({
+        id: "evt_wu2_unhandled",
+        type: "payment_intent.canceled",
+        data: { object: {} },
+      });
+
+      const paymentsBefore = await db.payment.count();
+      const ordersBefore = await db.order.count();
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=validlooking")
+        .send({ id: "evt_wu2_unhandled", type: "payment_intent.canceled" });
+
+      expect(res.status).toBe(200);
+
+      const paymentsAfter = await db.payment.count();
+      const ordersAfter = await db.order.count();
+      expect(paymentsAfter).toBe(paymentsBefore);
+      expect(ordersAfter).toBe(ordersBefore);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/intent — still parses JSON after webhook raw-body wiring [WU2-4]", () => {
+  it(
+    "[WU2-4] returns 201 { clientSecret } proving req.body is still a parsed JSON object on the intent route",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, deliveryMode } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu2json",
+        nif: "B20000091",
+      });
+
+      mockedCreatePaymentIntent.mockResolvedValueOnce({
+        id: "pi_wu2json",
+        client_secret: "secret_wu2json",
+      });
+
+      const res = await request
+        .post("/api/v1/pagos/intent")
+        .set("x-test-auth", consumerAuthHeaderFor("wu2json"))
+        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toEqual({ clientSecret: "secret_wu2json" });
     },
     20000,
   );
