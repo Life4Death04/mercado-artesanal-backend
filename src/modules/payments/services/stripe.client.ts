@@ -64,7 +64,9 @@ class RealStripeClient implements StripeClient {
   private readonly sdk: Stripe;
 
   constructor(secretKey: string) {
-    this.sdk = new Stripe(secretKey);
+    // Explicit timeout + retry bounds — without them, an unresponsive Stripe
+    // endpoint can hang the request for ~241s (SDK default backoff ceiling).
+    this.sdk = new Stripe(secretKey, { timeout: 20000, maxNetworkRetries: 2 });
   }
 
   async createPaymentIntent(params: CreatePaymentIntentParams): Promise<CreatePaymentIntentResult> {

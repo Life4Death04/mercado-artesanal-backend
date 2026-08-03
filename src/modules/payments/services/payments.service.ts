@@ -29,10 +29,11 @@
  *   6. Serialize the D1 compact metadata guard
  *      (`serializeDeliverySelectionsForMetadata`) — may itself throw
  *      `ValidationFailedError` (422) before any Stripe call.
- *   7. Call `stripeClient.createPaymentIntent` with
- *      `idempotencyKey: cartView.cartId` (spec R4 "same cart reuses
- *      idempotency key") — a rejection is wrapped as
- *      `PaymentIntentCreationError` (502), never leaking the raw Stripe error.
+ *   7. Call `stripeClient.createPaymentIntent` with `idempotencyKey` set to
+ *      a sha256 content fingerprint of {cartId, total, item set, delivery
+ *      selections} (spec R4 "same checkout content reuses idempotency key")
+ *      — a rejection is wrapped as `PaymentIntentCreationError` (502), never
+ *      leaking the raw Stripe error.
  *
  * Spec references:
  *   payments §"POST /pagos/intent creates intent behind full auth chain" (R1)
@@ -42,12 +43,15 @@
  *   payments §"Stripe failure -> PaymentIntentCreationError 502" (R5)
  *   design D1 (deliverySelections carry-through / metadata guard)
  */
+import { createHash } from "node:crypto";
+
 import type { Prisma } from "@prisma/client";
 import { Prisma as PrismaValue } from "@prisma/client";
 
 import { getCartForCheckout } from "@/modules/cart/services/cart.service";
 import type { DeliverySelection } from "@/modules/orders/services/orders.service";
 import {
+  CartItemNotAvailableError,
   EmptyCartCheckoutError,
   InsufficientStockError,
   PaymentIntentCreationError,
@@ -161,6 +165,13 @@ export async function createPaymentIntent(
     );
   }
 
+  // Step 3b: availability gate, all-or-nothing (mirrors orders.service.ts's
+  // base checkout guard) — a soft-deleted/inactive/producer-deleted product
+  // must never be charged, even if its stock snapshot still looks sufficient.
+  if (cartView.items.some((item) => !item.isAvailable)) {
+    throw new CartItemNotAvailableError("One or more cart items are no longer available");
+  }
+
   // Step 4: hard stock gate, all-or-nothing. `product.stock` is already LIVE
   // (getCartForCheckout issues a fresh query per call) — no second query needed.
   const hasShortfall = cartView.items.some((item) => item.quantity > item.product.stock);
@@ -180,12 +191,34 @@ export async function createPaymentIntent(
   // Step 6: D1 compact metadata guard — may throw ValidationFailedError before any Stripe call.
   const deliverySelectionsMetadata = serializeDeliverySelectionsForMetadata(deliverySelections);
 
-  // Step 7: Stripe call — idempotencyKey = cartId (spec R4), failure -> 502, never leaked raw.
+  // Step 6b: idempotency key = a content fingerprint, NOT the bare cartId.
+  // Cart identity is preserved across clear/repopulate (cart.service.ts
+  // clear-then-repopulate flow), so a raw cartId key would make a CHANGED
+  // checkout reuse a stale prior intent's client_secret. A sha256 digest over
+  // {cartId, total, sorted item set, deliverySelections} is deterministic: a
+  // genuine retry of the SAME content reuses the key (Stripe dedupes
+  // correctly); any change in items/amount/delivery yields a new key.
+  const itemFingerprint = cartView.items
+    .map((item) => `${item.productId}:${item.quantity}`)
+    .sort()
+    .join(",");
+  const idempotencyKey = createHash("sha256")
+    .update(
+      JSON.stringify({
+        cartId: cartView.cartId,
+        total: total.toString(),
+        items: itemFingerprint,
+        deliverySelections: deliverySelectionsMetadata,
+      }),
+    )
+    .digest("hex");
+
+  // Step 7: Stripe call — idempotencyKey = content fingerprint, failure -> 502, never leaked raw.
   try {
     const intent = await client.createPaymentIntent({
       amount: total.toNumber(),
       currency: "eur",
-      idempotencyKey: cartView.cartId,
+      idempotencyKey,
       metadata: {
         userId,
         cartId: cartView.cartId,

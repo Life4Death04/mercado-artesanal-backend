@@ -91,6 +91,7 @@ import type { CartForCheckout, CartItemForCheckout } from "@/modules/cart/servic
 import { getCartForCheckout } from "@/modules/cart/services/cart.service";
 import type { DeliverySelection } from "@/modules/orders/services/orders.service";
 import {
+  CartItemNotAvailableError,
   EmptyCartCheckoutError,
   InsufficientStockError,
   NotFoundError,
@@ -338,6 +339,18 @@ describe("payments.service.createPaymentIntent", () => {
     expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
   });
 
+  it("[CPI-UNAVAILABLE] isAvailable=false on one item -> CartItemNotAvailableError, no Stripe call", async () => {
+    mockedGetCartForCheckout.mockResolvedValueOnce(
+      makeCartView([makeCartItem({ isAvailable: false, quantity: 1 })]),
+    );
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryModeRow()]);
+
+    await expect(
+      paymentsService.createPaymentIntent("user_001", [makeSelection()]),
+    ).rejects.toBeInstanceOf(CartItemNotAvailableError);
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
   it("[CPI-TOTAL] total sums lines + per-producer shipping -> exactly 27.00", async () => {
     // 2 * 5.00 + 3 * 5.00 = 25.00, + shipping 2.00 = 27.00
     mockedGetCartForCheckout.mockResolvedValueOnce(
@@ -369,7 +382,7 @@ describe("payments.service.createPaymentIntent", () => {
     expect(callArgs).not.toHaveProperty("clientAmount");
   });
 
-  it("[CPI-IDEMPOTENCY] idempotencyKey passed to Stripe equals cartView.cartId", async () => {
+  it("[CPI-IDEMPOTENCY-SAME] identical cart content across repeat calls -> same idempotencyKey", async () => {
     mockedGetCartForCheckout.mockResolvedValue(makeCartView([makeCartItem()], { cartId: "cart_XYZ" }));
     mockedDeliveryMode.findMany.mockResolvedValue([makeDeliveryModeRow()]);
     mockedCreatePaymentIntent.mockResolvedValue({ id: "pi_123", client_secret: "secret_123" });
@@ -377,14 +390,31 @@ describe("payments.service.createPaymentIntent", () => {
     await paymentsService.createPaymentIntent("user_001", [makeSelection()]);
     await paymentsService.createPaymentIntent("user_001", [makeSelection()]);
 
-    expect(mockedCreatePaymentIntent).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({ idempotencyKey: "cart_XYZ" }),
+    const firstKey = mockedCreatePaymentIntent.mock.calls[0]?.[0]?.idempotencyKey;
+    const secondKey = mockedCreatePaymentIntent.mock.calls[1]?.[0]?.idempotencyKey;
+    expect(firstKey).toBeTruthy();
+    expect(secondKey).toBe(firstKey);
+  });
+
+  it("[CPI-IDEMPOTENCY-DIFF] changed cart content on same cartId -> different idempotencyKey", async () => {
+    mockedGetCartForCheckout.mockResolvedValueOnce(
+      makeCartView([makeCartItem({ quantity: 2 })], { cartId: "cart_XYZ" }),
     );
-    expect(mockedCreatePaymentIntent).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({ idempotencyKey: "cart_XYZ" }),
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryModeRow()]);
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_123", client_secret: "secret_123" });
+
+    mockedGetCartForCheckout.mockResolvedValueOnce(
+      makeCartView([makeCartItem({ quantity: 3 })], { cartId: "cart_XYZ" }),
     );
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryModeRow()]);
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_456", client_secret: "secret_456" });
+
+    await paymentsService.createPaymentIntent("user_001", [makeSelection()]);
+    await paymentsService.createPaymentIntent("user_001", [makeSelection()]);
+
+    const firstKey = mockedCreatePaymentIntent.mock.calls[0]?.[0]?.idempotencyKey;
+    const secondKey = mockedCreatePaymentIntent.mock.calls[1]?.[0]?.idempotencyKey;
+    expect(firstKey).not.toBe(secondKey);
   });
 
   it("[CPI-STRIPE-FAIL] stripeClient rejection -> PaymentIntentCreationError, no partial state leaked", async () => {
