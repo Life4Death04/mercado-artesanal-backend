@@ -29,6 +29,10 @@ export default defineConfig({
       // Stripe per design Testing Strategy) — this value only satisfies env.ts
       // fail-fast validation at singleton import time.
       STRIPE_SECRET_KEY: "sk_test_dummy_for_vitest",
+      // Required after Cycle 5 payments WU2. `stripeClient.constructEvent` is
+      // always mocked in tests (see tests/integration/payments.test.ts) — this
+      // value only satisfies env.ts fail-fast validation at singleton import time.
+      STRIPE_WEBHOOK_SECRET: "whsec_dummy_for_vitest",
     },
     coverage: {
       provider: "v8",

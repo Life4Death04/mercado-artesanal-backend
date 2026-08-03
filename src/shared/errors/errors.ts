@@ -290,3 +290,15 @@ export class PaymentIntentCreationError extends AppError {
   readonly status = 502;
   readonly title = "Payment intent creation failed";
 }
+
+// ---------------------------------------------------------------------------
+// 400 — POST /pagos/webhook signature verification fails (missing header or
+//       Stripe HMAC mismatch over the raw body). Zero DB writes on this path
+//       (payments.service.ts verifies BEFORE any event dispatch).
+// ---------------------------------------------------------------------------
+
+export class WebhookSignatureError extends AppError {
+  readonly code = "WEBHOOK_SIGNATURE_INVALID" as const;
+  readonly status = 400;
+  readonly title = "Webhook signature invalid";
+}

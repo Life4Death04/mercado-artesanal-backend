@@ -1,5 +1,6 @@
 /**
- * Payments service — WU1 (Payment Intent creation).
+ * Payments service — WU1 (Payment Intent creation) + WU2 (webhook signature
+ * verification and event-dispatch seam).
  *
  * All exports are NAMED FUNCTIONS (not a class, not a default export).
  * Tests import via:
@@ -56,13 +57,15 @@ import {
   InsufficientStockError,
   PaymentIntentCreationError,
   ValidationFailedError,
+  WebhookSignatureError,
 } from "@/shared/errors/errors";
+import { env } from "@/shared/utils/env";
 import { prisma } from "@/shared/utils/prisma";
 
 import { serializeDeliverySelectionsForMetadata } from "../dto/payments.dto";
 
 import { stripeClient } from "./stripe.client";
-import type { StripeClient } from "./stripe.client";
+import type { StripeClient, StripeEvent } from "./stripe.client";
 
 type DecimalValue = InstanceType<typeof PrismaValue.Decimal>;
 type DeliveryModeRow = { id: string; producerId: string; isActive: boolean; cost: Prisma.Decimal };
@@ -229,4 +232,79 @@ export async function createPaymentIntent(
   } catch (err) {
     throw new PaymentIntentCreationError("Failed to create payment intent", err);
   }
+}
+
+// ===========================================================================
+// WU2 — Webhook Trust Boundary (spec R6, R9; design Decision 2, TDD Seams)
+//
+// `verifyWebhookSignature` is the ONLY place in the codebase that reads the
+// `stripe-signature` header value and calls `client.constructEvent`. The
+// controller (payments.controller.ts) passes through the raw `Buffer` body
+// (set by the route-scoped `express.raw` middleware in src/app.ts) and the
+// header value untouched — it does not parse or inspect either.
+// ===========================================================================
+
+/**
+ * Verifies a Stripe webhook signature over the RAW request body and returns
+ * the parsed event.
+ *
+ * @throws {WebhookSignatureError} when the signature header is missing, or
+ *   when `client.constructEvent` rejects it (invalid/expired HMAC). Neither
+ *   branch performs any DB read/write — this function runs strictly BEFORE
+ *   `dispatchWebhookEvent`, so a rejection here writes zero local state
+ *   (spec "Invalid signature is rejected before any processing").
+ */
+export function verifyWebhookSignature(
+  rawBody: Buffer,
+  signature: string | undefined,
+  client: StripeClient = stripeClient,
+): StripeEvent {
+  if (!signature) {
+    throw new WebhookSignatureError("Missing Stripe signature header");
+  }
+
+  try {
+    return client.constructEvent(rawBody, signature, env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    throw new WebhookSignatureError("Invalid Stripe webhook signature", err);
+  }
+}
+
+/**
+ * Event dispatch seam (design "TDD Seams: Tx boundary" + REFACTOR task 2.3).
+ *
+ * WU2 wires the signature-verification boundary and the routing seam ONLY —
+ * no `case` here performs a production write yet, so EVERY verified event
+ * type reaches `default` and is a no-op (spec "Unhandled webhook event types
+ * are ignored"). WU3 adds `case "payment_intent.succeeded"` (delegates to
+ * the frozen `createOrderFromPayment` inside one `$transaction`, design
+ * Decision 3) and `case "payment_intent.payment_failed"` (FAILED
+ * `payment.upsert`) here, WITHOUT touching `verifyWebhookSignature` above.
+ */
+function dispatchWebhookEvent(event: StripeEvent): void {
+  switch (event.type) {
+    default:
+      return;
+  }
+}
+
+/**
+ * Entry point for `POST /pagos/webhook` (design Decision 2, spec R6).
+ * Verifies the signature over the raw body, then dispatches by event type.
+ * Rejection paths (missing/invalid signature) throw BEFORE any dispatch —
+ * see `verifyWebhookSignature` for the zero-write guarantee.
+ *
+ * Not `async` yet — neither `verifyWebhookSignature` nor `dispatchWebhookEvent`
+ * awaits anything in WU2. WU3 makes `dispatchWebhookEvent` async (it opens a
+ * `prisma.$transaction` for the succeeded/failed cases) and this function
+ * will need `async`/`await` again at that point; the controller already
+ * `await`s this call, so that change is transparent to callers.
+ */
+export function handleWebhookEvent(
+  rawBody: Buffer,
+  signature: string | undefined,
+  client: StripeClient = stripeClient,
+): void {
+  const event = verifyWebhookSignature(rawBody, signature, client);
+  dispatchWebhookEvent(event);
 }

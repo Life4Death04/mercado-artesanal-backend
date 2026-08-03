@@ -35,6 +35,8 @@ const BASE_VALID = {
   CORS_ORIGIN: "*",
   // Required after Cycle 5 payments WU1 (STRIPE_SECRET_KEY added to env.ts).
   STRIPE_SECRET_KEY: "sk_test_dummy_for_env_test",
+  // Required after Cycle 5 payments WU2 (STRIPE_WEBHOOK_SECRET added to env.ts).
+  STRIPE_WEBHOOK_SECRET: "whsec_dummy_for_env_test",
 };
 
 // ---------------------------------------------------------------------------

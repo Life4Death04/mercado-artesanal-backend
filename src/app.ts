@@ -9,6 +9,10 @@
  *   1. helmet          — security headers before anything else
  *   2. cors            — cross-origin rejection at the edge (before body/log I/O)
  *   3. compression     — transparent to routing; applied when response is sent
+ *   3b. express.raw    — route-scoped raw body for POST /api/v1/pagos/webhook
+ *                         ONLY, registered before express.json (Cycle 5 WU2,
+ *                         design Decision 2 — Stripe signature verification
+ *                         needs the raw Buffer, not a parsed JSON object)
  *   4. express.json    — body parser before pino-http (body must be parsed for redaction paths)
  *   5. pino-http       — request logger + correlation ID (assigns req.id to every request)
  *   6. /health router  — public, no auth chain; cheap probes bypass everything downstream
@@ -71,6 +75,14 @@ export function createApp({ logger = defaultLogger }: CreateAppOptions = {}): Ex
 
   // 3. Compression — transparent; happens after routing sends the response
   app.use(compression());
+
+  // 3b. Webhook raw-body wiring — MUST be registered BEFORE the global JSON
+  //     parser below so POST /api/v1/pagos/webhook receives the raw Buffer
+  //     for Stripe signature verification (design Decision 2, spec R6).
+  //     body-parser sets an internal `req._body` flag once a body has been
+  //     parsed; the global express.json() call below checks that flag and
+  //     is a no-op for this path — every OTHER route is unaffected.
+  app.use("/api/v1/pagos/webhook", express.raw({ type: "application/json" }));
 
   // 4. Body parser — must run before pino-http so req.body is available for redaction
   app.use(express.json({ limit: "10mb" }));

@@ -7,15 +7,18 @@
  * tests `vi.mock("@/modules/payments/services/stripe.client")` wholesale,
  * so no real network call to Stripe is ever made from a test.
  *
- * WU1 implements `createPaymentIntent` only. `constructEvent` (webhook
- * signature verification, design D2/D3) is deliberately NOT declared on
- * this interface yet — it is added in WU2 alongside its own RED tests, per
- * strict TDD ("do not write more code than the current failing test needs").
+ * WU1 implements `createPaymentIntent`. WU2 adds `constructEvent` — the
+ * ONLY signature-verification point for POST /pagos/webhook (design D2,
+ * spec R6, "TDD Seams: Signature verification"). `StripeEvent` is a
+ * type-only shape declared here (not re-exporting the `stripe` package's
+ * `Stripe.Event`) so `payments.service.ts` never needs to import the
+ * concrete SDK package.
  *
  * Spec references:
  *   payments §"Intent amount server-side EUR" (R4)
  *   payments §"Stripe failure -> PaymentIntentCreationError 502" (R5)
- *   design — Interfaces: StripeClient.createPaymentIntent, TDD Seams
+ *   payments §"POST /pagos/webhook verifies the Stripe signature over the raw body" (R6)
+ *   design — Interfaces: StripeClient.createPaymentIntent/constructEvent, TDD Seams
  */
 import Stripe from "stripe";
 
@@ -29,7 +32,13 @@ export interface CreatePaymentIntentParams {
   /** Amount in MAJOR units (euros), e.g. 27.00 — never pre-converted to cents by callers. */
   amount: number;
   currency: "eur";
-  /** Stripe idempotency key — payments.service passes cartView.cartId (spec R4). */
+  /**
+   * Stripe idempotency key — payments.service passes a sha256 content
+   * fingerprint over {cartId, total, item set, deliverySelections}, NOT the
+   * bare `cartView.cartId` (spec R4 supersedes the D5 bare-cartId clause;
+   * review finding R1-002 — a raw cartId key would reuse a stale intent
+   * after a preserved-identity cart was cleared and repopulated).
+   */
   idempotencyKey: string;
   /** Compact metadata — {userId, cartId, deliverySelections} per design D1. */
   metadata: Record<string, string>;
@@ -40,8 +49,26 @@ export interface CreatePaymentIntentResult {
   client_secret: string;
 }
 
+/**
+ * Minimal shape of a verified Stripe webhook event — only the fields
+ * `payments.service.ts`'s event dispatch seam needs (design D3/WU3 branches
+ * on `type`; WU3 will read `data.object` for `payment_intent.*` payloads).
+ */
+export interface StripeEvent {
+  id: string;
+  type: string;
+  data: { object: Record<string, unknown> };
+}
+
 export interface StripeClient {
   createPaymentIntent(params: CreatePaymentIntentParams): Promise<CreatePaymentIntentResult>;
+  /**
+   * Verifies the Stripe signature over the RAW request body and returns the
+   * parsed event. This is the ONLY verification point in the module (design
+   * "TDD Seams: Signature verification") — throws on a missing/invalid
+   * signature; callers MUST NOT attempt to parse `rawBody` themselves.
+   */
+  constructEvent(rawBody: Buffer, signature: string, secret: string): StripeEvent;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +114,18 @@ class RealStripeClient implements StripeClient {
     }
 
     return { id: intent.id, client_secret: intent.client_secret };
+  }
+
+  constructEvent(rawBody: Buffer, signature: string, secret: string): StripeEvent {
+    // Throws Stripe.errors.StripeSignatureVerificationError on a bad/missing
+    // signature — callers (payments.service.ts) wrap this in
+    // WebhookSignatureError; the raw Stripe error is never leaked to the wire.
+    const event = this.sdk.webhooks.constructEvent(rawBody, signature, secret);
+    return {
+      id: event.id,
+      type: event.type,
+      data: event.data as unknown as { object: Record<string, unknown> },
+    };
   }
 }
 

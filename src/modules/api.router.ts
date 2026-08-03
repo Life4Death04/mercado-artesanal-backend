@@ -24,8 +24,8 @@
  *   cartRouter           — Cycle 3: consumer cart CRUD under /carrito (cart-foundation PR #1)
  *   ordersRouter         — Cycle 4: consumer order read surface under /pedidos (orders WU3)
  *   paymentsRouter       — Cycle 5: POST /pagos/intent (payments WU1 — authenticated
- *                          Stripe PaymentIntent creation). /pagos/webhook (unauth,
- *                          raw-body) is added in WU2 — NOT wired yet.
+ *                          Stripe PaymentIntent creation) + POST /pagos/webhook
+ *                          (payments WU2 — unauth, raw-body, signature-verified).
  *
  * Mount order: public routers (categoriesRouter, producersRouter GET /:id) are registered
  * BEFORE auth-gated routers so they are reachable without any auth header.
