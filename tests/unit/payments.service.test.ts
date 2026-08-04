@@ -253,6 +253,12 @@ describe("payments.dto — deserializeDeliverySelectionsFromMetadata (WU3 D1 rou
     const compact = serializeDeliverySelectionsForMetadata([]);
     expect(deserializeDeliverySelectionsFromMetadata(compact)).toEqual([]);
   });
+
+  it("[PD-META-MALFORMED] throws ValidationFailedError (not a raw SyntaxError) on malformed JSON metadata", () => {
+    expect(() => deserializeDeliverySelectionsFromMetadata("{not-valid-json")).toThrow(
+      ValidationFailedError,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -177,7 +177,13 @@ export async function seedCheckoutReadyCart(
 
   await cartService.addItem(consumer.id, product.id, quantity);
 
-  return { producer, category, consumer, deliveryMode, product, quantity };
+  // WU3 rework: `cartId` is exposed so webhook-event fixtures can build a
+  // `metadata.cartId` that matches what `getCartForCheckout` will ACTUALLY
+  // resolve at webhook time (Bug 2 fix — the reconciliation guard compares
+  // `cartView.cartId === metadata.cartId`).
+  const cartView = await cartService.getCartForCheckout(consumer.id);
+
+  return { producer, category, consumer, deliveryMode, product, quantity, cartId: cartView.cartId };
 }
 
 export async function cleanupPaymentsFixtures(db: PrismaClient, cleanup: PaymentsFixtureCleanup): Promise<void> {
