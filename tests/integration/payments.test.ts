@@ -648,7 +648,7 @@ describe("POST /api/v1/pagos/webhook — payment_intent.succeeded creates the or
       }
       vi.clearAllMocks();
 
-      const { producer, deliveryMode, consumer } = await seedCheckoutReadyCart(db, cleanup, {
+      const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
         namePrefix: "wu3succ1",
         nif: "B20000101",
       });
@@ -660,7 +660,7 @@ describe("POST /api/v1/pagos/webhook — payment_intent.succeeded creates the or
           intentId,
           amountCents: 700,
           userId: consumer.id,
-          cartId: "not-used-for-lookup",
+          cartId,
           deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
         }),
       );
@@ -692,7 +692,7 @@ describe("POST /api/v1/pagos/webhook — replayed succeeded event is a no-op [WU
       }
       vi.clearAllMocks();
 
-      const { producer, deliveryMode, consumer } = await seedCheckoutReadyCart(db, cleanup, {
+      const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
         namePrefix: "wu3replay",
         nif: "B20000102",
       });
@@ -703,7 +703,7 @@ describe("POST /api/v1/pagos/webhook — replayed succeeded event is a no-op [WU
         intentId,
         amountCents: 700,
         userId: consumer.id,
-        cartId: "not-used-for-lookup",
+        cartId,
         deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
       });
       mockedConstructEvent.mockReturnValue(event);
@@ -781,7 +781,7 @@ describe("POST /api/v1/pagos/webhook — D3 FAILED->SUCCEEDED same providerRef t
       }
       vi.clearAllMocks();
 
-      const { producer, deliveryMode, consumer } = await seedCheckoutReadyCart(db, cleanup, {
+      const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
         namePrefix: "wu3d3",
         nif: "B20000104",
       });
@@ -797,7 +797,7 @@ describe("POST /api/v1/pagos/webhook — D3 FAILED->SUCCEEDED same providerRef t
           intentId,
           amountCents: 700,
           userId: consumer.id,
-          cartId: "not-used-for-lookup",
+          cartId,
           deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
         }),
       );
@@ -832,7 +832,7 @@ describe("POST /api/v1/pagos/webhook — transaction failure leaves no partial s
       }
       vi.clearAllMocks();
 
-      const { producer, consumer } = await seedCheckoutReadyCart(db, cleanup, {
+      const { producer, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
         namePrefix: "wu3rollback",
         nif: "B20000105",
       });
@@ -847,13 +847,17 @@ describe("POST /api/v1/pagos/webhook — transaction failure leaves no partial s
       // has already run inside the SAME $transaction: an unresolvable
       // deliveryModeId -> ValidationFailedError (orders.service.ts step 3a),
       // well after step 0's idempotency pre-check (no *SUCCEEDED* payment
-      // exists yet, so it proceeds into the write path).
+      // exists yet, so it proceeds into the write path). `cartId` matches
+      // the LIVE cart so the Bug 2 reconciliation guard does not itself
+      // short-circuit this scenario — the unresolvable deliveryModeId makes
+      // `recomputeCartTotal` return `null` (defer to the frozen contract's
+      // own validation below), which is exactly what this test proves.
       mockedConstructEvent.mockReturnValueOnce(
         makeSucceededEvent({
           intentId,
           amountCents: 700,
           userId: consumer.id,
-          cartId: "not-used-for-lookup",
+          cartId,
           deliverySelections: [{ producerId: producer.id, deliveryModeId: "mode_does_not_exist" }],
         }),
       );

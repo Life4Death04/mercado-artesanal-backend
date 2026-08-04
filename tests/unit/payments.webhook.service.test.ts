@@ -66,7 +66,12 @@ vi.mock("@/shared/utils/prisma", () => ({
   prisma: {
     $transaction: vi.fn(),
     payment: {
-      upsert: vi.fn(),
+      findUnique: vi.fn(),
+      updateMany: vi.fn(),
+      create: vi.fn(),
+    },
+    deliveryMode: {
+      findMany: vi.fn(),
     },
   },
 }));
@@ -85,7 +90,10 @@ const mockedGetCartForCheckout = vi.mocked(getCartForCheckout);
 const mockedCreateOrderFromPayment = vi.mocked(ordersService.createOrderFromPayment);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedTransaction = vi.mocked(prisma).$transaction as any;
-const mockedUpsert = vi.mocked(prisma.payment.upsert);
+const mockedFindUnique = vi.mocked(prisma.payment.findUnique);
+const mockedUpdateMany = vi.mocked(prisma.payment.updateMany);
+const mockedCreate = vi.mocked(prisma.payment.create);
+const mockedDeliveryModeFindMany = vi.mocked(prisma.deliveryMode.findMany);
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -121,7 +129,11 @@ function makeSucceededEvent(
 ): StripeEvent {
   const {
     id = "pi_wh_001",
-    amount = 2700,
+    // 700 cents = EUR 7.00 = default `makeCartView` item (5.00) + default
+    // `deliveryMode.findMany` mock cost (2.00) — matches the Bug 2
+    // reconciliation guard's recomputed total so existing dispatch tests
+    // stay green without individually mocking the guard per test.
+    amount = 700,
     metadata = {
       userId: "user_001",
       cartId: "cart_001",
@@ -152,31 +164,67 @@ const SIGNATURE = "t=1,v1=whatever";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default: no existing Payment row, and a resolvable producer_A/mode_A
+  // DeliveryMode (cost 2.00) — matches the default `makeCartView`/
+  // `makeSucceededEvent` fixtures so the Bug 2 reconciliation guard passes
+  // by default without every succeeded-path test re-mocking it.
+  mockedFindUnique.mockResolvedValue(null);
+  mockedDeliveryModeFindMany.mockResolvedValue([
+    { id: "mode_A", producerId: "producer_A", isActive: true, cost: 2.0 },
+  ] as never);
 });
 
 // ---------------------------------------------------------------------------
-// payment_intent.payment_failed -> FAILED Payment upsert (spec R8)
+// payment_intent.payment_failed -> FAILED Payment via updateMany/create,
+// NEVER downgrading a SUCCEEDED row (spec R8; Bug 1 fix — WU3 rework)
 // ---------------------------------------------------------------------------
 
 describe("payments.service — payment_intent.payment_failed dispatch [WHU-FAILED]", () => {
-  it("[WHU-FAILED-UPSERT] persists a FAILED Payment via payment.upsert keyed on providerRef, amount converted from cents", async () => {
-    mockedUpsert.mockResolvedValueOnce({} as never);
+  it("[WHU-FAILED-CREATE] first failure for a providerRef with no existing Payment -> creates a FAILED row, amount converted from cents", async () => {
+    mockedUpdateMany.mockResolvedValueOnce({ count: 0 });
+    mockedFindUnique.mockResolvedValueOnce(null);
+    mockedCreate.mockResolvedValueOnce({} as never);
 
     const event = makeFailedEvent({ id: "pi_fail_001", amount: 2700 });
     await paymentsService.handleWebhookEvent(RAW_BODY, SIGNATURE, makeClient(event));
 
-    expect(mockedUpsert).toHaveBeenCalledTimes(1);
-    const call = mockedUpsert.mock.calls[0]?.[0];
-    expect(call?.where).toEqual({ providerRef: "pi_fail_001" });
-    // create/update both set status FAILED — never `create` unconditionally
-    // (design Decision 3: the FAILED path is upsert-only, never a bare create).
-    expect(String((call?.create as { status?: unknown })?.status)).toBe("FAILED");
-    expect(String((call?.update as { status?: unknown })?.status)).toBe("FAILED");
-    expect(Number((call?.create as { amount?: unknown })?.amount)).toBe(27);
+    expect(mockedUpdateMany).toHaveBeenCalledWith({
+      where: { providerRef: "pi_fail_001", status: { not: "SUCCEEDED" } },
+      data: { status: "FAILED", amount: expect.anything() },
+    });
+    expect(mockedCreate).toHaveBeenCalledTimes(1);
+    const call = mockedCreate.mock.calls[0]?.[0];
+    expect(call?.data).toMatchObject({ providerRef: "pi_fail_001", status: "FAILED" });
+    expect(Number((call?.data as { amount?: unknown })?.amount)).toBe(27);
+  });
+
+  it("[WHU-FAILED-REUSE] a repeated failure for the SAME providerRef reuses the existing non-SUCCEEDED row via updateMany, never `create`", async () => {
+    mockedUpdateMany.mockResolvedValueOnce({ count: 1 });
+
+    const event = makeFailedEvent({ id: "pi_fail_repeat" });
+    await paymentsService.handleWebhookEvent(RAW_BODY, SIGNATURE, makeClient(event));
+
+    expect(mockedUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mockedFindUnique).not.toHaveBeenCalled();
+    expect(mockedCreate).not.toHaveBeenCalled();
+  });
+
+  it("[WHU-FAILED-NO-DOWNGRADE] a delayed/reordered failure for a providerRef with an existing SUCCEEDED Payment is a no-op — never downgrades it (Bug 1 fix)", async () => {
+    mockedUpdateMany.mockResolvedValueOnce({ count: 0 });
+    mockedFindUnique.mockResolvedValueOnce({ status: "SUCCEEDED" } as never);
+
+    const event = makeFailedEvent({ id: "pi_fail_downgrade" });
+    await paymentsService.handleWebhookEvent(RAW_BODY, SIGNATURE, makeClient(event));
+
+    expect(mockedUpdateMany).toHaveBeenCalledWith({
+      where: { providerRef: "pi_fail_downgrade", status: { not: "SUCCEEDED" } },
+      data: { status: "FAILED", amount: expect.anything() },
+    });
+    expect(mockedCreate).not.toHaveBeenCalled();
   });
 
   it("[WHU-FAILED-NO-CART-TOUCH] the FAILED path never reads the cart or calls createOrderFromPayment", async () => {
-    mockedUpsert.mockResolvedValueOnce({} as never);
+    mockedUpdateMany.mockResolvedValueOnce({ count: 1 });
 
     const event = makeFailedEvent({ id: "pi_fail_002" });
     await paymentsService.handleWebhookEvent(RAW_BODY, SIGNATURE, makeClient(event));
@@ -228,7 +276,18 @@ describe("payments.service — payment_intent.succeeded dispatch [WHU-SUCCESS]",
     const fakeTx = { payment: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }) } };
     mockedTransaction.mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) => fn(fakeTx));
     mockedCreateOrderFromPayment.mockResolvedValueOnce({} as OrderDetailView);
-    mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView({ userId: "user_xyz" }));
+    // `cartId: "cart_xyz"` matches the event metadata below — the Bug 2
+    // reconciliation guard (WU3 rework) compares cartView.cartId against
+    // metadata.cartId, so the two must agree for this test to exercise the
+    // metadata re-derivation path instead of the mismatch branch.
+    mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView({ userId: "user_xyz", cartId: "cart_xyz" }));
+    // producer_A/mode_B: a DIFFERENT deliveryModeId than the default
+    // producer_A/mode_A fixture, still proving the selection re-derived
+    // from metadata threads through untouched, while resolving to a valid
+    // DeliveryMode for the cart's own producer (guard requirement).
+    mockedDeliveryModeFindMany.mockResolvedValueOnce([
+      { id: "mode_B", producerId: "producer_A", isActive: true, cost: 2.0 },
+    ] as never);
 
     const event = makeSucceededEvent({
       id: "pi_success_002",
@@ -236,7 +295,7 @@ describe("payments.service — payment_intent.succeeded dispatch [WHU-SUCCESS]",
         userId: "user_xyz",
         cartId: "cart_xyz",
         deliverySelections: serializeDeliverySelectionsForMetadata([
-          { producerId: "producer_B", deliveryModeId: "mode_B" },
+          { producerId: "producer_A", deliveryModeId: "mode_B" },
         ]),
       },
     });
@@ -246,7 +305,7 @@ describe("payments.service — payment_intent.succeeded dispatch [WHU-SUCCESS]",
     expect(mockedCreateOrderFromPayment).toHaveBeenCalledWith(
       "pi_success_002",
       expect.anything(),
-      [{ producerId: "producer_B", deliveryModeId: "mode_B" }],
+      [{ producerId: "producer_A", deliveryModeId: "mode_B" }],
       fakeTx,
     );
   });

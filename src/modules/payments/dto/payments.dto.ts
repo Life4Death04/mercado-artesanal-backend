@@ -126,7 +126,20 @@ export function serializeDeliverySelectionsForMetadata(
  *
  * Spec: payments §"payment_intent.succeeded creates the order atomically and idempotently"
  * Design: Decision 1 (deliverySelections carry-through)
+ *
+ * WU3 rework (4R escalation WARNING fix): a malformed metadata string threw
+ * a raw `SyntaxError` from `JSON.parse` instead of the module's standard
+ * `ValidationFailedError` (422) — wrapped here so a corrupted/tampered
+ * PaymentIntent metadata value surfaces through the same error taxonomy as
+ * every other rejection this module produces, instead of an unhandled 500.
  */
 export function deserializeDeliverySelectionsFromMetadata(compact: string): DeliverySelection[] {
-  return JSON.parse(compact) as DeliverySelection[];
+  try {
+    return JSON.parse(compact) as DeliverySelection[];
+  } catch {
+    throw new ValidationFailedError(
+      [{ path: "deliverySelections", message: "Malformed deliverySelections metadata" }],
+      "Invalid delivery selections",
+    );
+  }
 }

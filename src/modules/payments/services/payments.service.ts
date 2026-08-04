@@ -338,24 +338,130 @@ function isUniqueConstraintViolation(err: unknown): boolean {
 }
 
 /**
+ * Persists (create-or-reuse) a NON-terminal `Payment` row for `providerRef`
+ * — used by BOTH the `FAILED` audit path and the Bug 2 reconciliation
+ * `PENDING` path (WU3 rework, 4R escalation fix).
+ *
+ * A `SUCCEEDED` `Payment` is a TERMINAL, paid state and MUST NEVER be
+ * downgraded (Bug 1: a delayed/reordered `payment_intent.payment_failed`
+ * arriving AFTER a `payment_intent.succeeded` for the SAME `providerRef`
+ * must be a no-op, not a downgrade). The `updateMany({ status: { not:
+ * "SUCCEEDED" } })` guard makes that check atomic with the write itself —
+ * there is no read-then-write race window where a concurrent succeeded
+ * event could commit between a plain read-check and a plain update.
+ *
+ * Never a bare `create`: repeated non-succeeded events for the SAME
+ * `providerRef` (Stripe's own confirmation retries, or the mismatch
+ * reconciliation path replaying) reuse ONE row instead of hitting the
+ * `Payment.providerRef @unique` constraint (design Decision 3).
+ */
+async function upsertNonTerminalPayment(
+  providerRef: string,
+  status: "FAILED" | "PENDING",
+  amount: DecimalValue,
+): Promise<void> {
+  const updated = await prisma.payment.updateMany({
+    where: { providerRef, status: { not: "SUCCEEDED" } },
+    data: { status, amount },
+  });
+  if (updated.count > 0) {
+    return;
+  }
+
+  const existing = await prisma.payment.findUnique({ where: { providerRef } });
+  if (existing) {
+    // A SUCCEEDED row already exists for this providerRef — terminal-state
+    // guard: NEVER downgrade a paid order. No-op (Bug 1 fix).
+    return;
+  }
+
+  try {
+    await prisma.payment.create({ data: { providerRef, status, amount } });
+  } catch (err) {
+    if (!isUniqueConstraintViolation(err)) {
+      throw err;
+    }
+    // Race: a concurrent event created the row between the check above and
+    // this create — retry the update-only path once; if that row turned out
+    // to be SUCCEEDED in the meantime, the `not: "SUCCEEDED"` where clause
+    // makes this a safe no-op instead of a downgrade.
+    await prisma.payment.updateMany({
+      where: { providerRef, status: { not: "SUCCEEDED" } },
+      data: { status, amount },
+    });
+  }
+}
+
+/**
  * `payment_intent.payment_failed` — persists a FAILED `Payment` row for
  * audit/history and creates NO order (spec "payment_intent.payment_failed
- * persists a FAILED payment and keeps the cart"). Never a bare `create`:
- * `upsert` keyed on `providerRef` so a repeated failure for the SAME intent
- * (Stripe's own confirmation retries) reuses one row instead of hitting the
- * `Payment.providerRef @unique` constraint (design Decision 3). Cart state
- * is never touched here — leaving it intact so the consumer can retry
- * (#987.1) requires no action, only the ABSENCE of a cart write.
+ * persists a FAILED payment and keeps the cart"). Delegates to
+ * `upsertNonTerminalPayment` (WU3 rework, Bug 1 fix) so a delayed/reordered
+ * failure arriving AFTER a `payment_intent.succeeded` for the SAME
+ * `providerRef` can NEVER downgrade the already-SUCCEEDED payment/order.
+ * Cart state is never touched here — leaving it intact so the consumer can
+ * retry (#987.1) requires no action, only the ABSENCE of a cart write.
  */
 async function handleFailedEvent(event: StripeEvent): Promise<void> {
   const intent = extractPaymentIntentPayload(event);
   const amount = new PrismaValue.Decimal(centsToEuros(intent.amount));
+  await upsertNonTerminalPayment(intent.id, "FAILED", amount);
+}
 
-  await prisma.payment.upsert({
-    where: { providerRef: intent.id },
-    create: { providerRef: intent.id, status: "FAILED", amount },
-    update: { status: "FAILED", amount },
-  });
+/**
+ * Recomputes the server-side EUR total for `cartView` + `deliverySelections`
+ * using the EXACT SAME calculation `createPaymentIntent` uses at
+ * intent-creation time (Σ unitPriceSnapshot*quantity + Σ per-producer
+ * `DeliveryMode.cost`) — the Bug 2 reconciliation guard's source-of-truth
+ * check (WU3 rework, 4R escalation fix; maintainer decision: `intent.amount`
+ * — what Stripe actually charged — is the money source of truth; this
+ * function proves whether the CURRENT live cart still matches it).
+ *
+ * Returns `null` (never throws) when a `deliverySelections` entry does not
+ * resolve to a valid/active `DeliveryMode` for its producer, OR the
+ * bijection against the LIVE cart is incomplete. That is NOT this guard's
+ * concern to reject — an unresolvable selection is validation the frozen
+ * `createOrderFromPayment` (step 3a) ALREADY re-checks and rejects on its
+ * own inside the transaction; misclassifying it here as an "amount
+ * mismatch" would short-circuit BEFORE that frozen validation ever runs.
+ * The caller treats `null` as "cannot verify — defer to the delegated
+ * write", not as a reconciliation failure.
+ */
+async function recomputeCartTotal(
+  cartView: Awaited<ReturnType<typeof getCartForCheckout>>,
+  deliverySelections: DeliverySelection[],
+): Promise<DecimalValue | null> {
+  const selectedModeIds = deliverySelections.map((selection) => selection.deliveryModeId);
+  const selectedModes: DeliveryModeRow[] =
+    selectedModeIds.length > 0
+      ? await prisma.deliveryMode.findMany({ where: { id: { in: selectedModeIds } } })
+      : [];
+  const modesById = new Map(selectedModes.map((mode) => [mode.id, mode]));
+
+  const shippingByProducer = new Map<string, DecimalValue>();
+  for (const selection of deliverySelections) {
+    const mode = modesById.get(selection.deliveryModeId);
+    if (!mode || mode.producerId !== selection.producerId || !mode.isActive) {
+      continue;
+    }
+    shippingByProducer.set(selection.producerId, mode.cost);
+  }
+
+  const cartProducerIds = new Set(cartView.items.map((item) => item.producerId));
+  for (const producerId of cartProducerIds) {
+    if (!shippingByProducer.has(producerId)) {
+      return null;
+    }
+  }
+
+  let total = new PrismaValue.Decimal(0);
+  for (const item of cartView.items) {
+    total = total.plus(new PrismaValue.Decimal(item.unitPriceSnapshot).times(item.quantity));
+  }
+  for (const producerId of cartProducerIds) {
+    total = total.plus(shippingByProducer.get(producerId)!);
+  }
+  return total;
 }
 
 /**
@@ -402,6 +508,62 @@ async function handleSucceededEvent(event: StripeEvent): Promise<void> {
 
   const deliverySelections = deserializeDeliverySelectionsFromMetadata(deliverySelectionsMetadata);
   const cartView = await getCartForCheckout(userId);
+
+  // Bug 2 fix (WU3 rework, 4R escalation) — reconciliation guard BEFORE any
+  // order/stock write, SKIPPED for a REPLAY of an already-SUCCEEDED intent
+  // (Stripe's own webhook retries): the cart may since have been cleared or
+  // changed by the ORIGINAL processing, so re-verifying it against a NEW
+  // snapshot is meaningless once the order already exists —
+  // `createOrderFromPayment`'s own step-0 idempotency pre-check (inside the
+  // transaction below) is the correct, existing mechanism for that case.
+  const existingPayment = await prisma.payment.findUnique({ where: { providerRef: intent.id } });
+  const isReplayOfSucceeded = existingPayment?.status === "SUCCEEDED";
+
+  if (!isReplayOfSucceeded) {
+    // `intent.amount` (what Stripe actually charged) is the money source of
+    // truth (maintainer decision). The LIVE cart is re-priced with the SAME
+    // calculation `createPaymentIntent` used, and its identity (`cartId`)
+    // re-checked against the metadata captured at intent creation. A
+    // `null` recomputed total means an unresolvable selection — deferred to
+    // the frozen `createOrderFromPayment`'s own validation below, NOT
+    // treated as a mismatch (see `recomputeCartTotal`'s docstring).
+    const chargedAmount = new PrismaValue.Decimal(centsToEuros(intent.amount));
+    const recomputedTotal = await recomputeCartTotal(cartView, deliverySelections);
+    const cartIdMatches = cartView.cartId === intent.metadata.cartId;
+    const totalMismatch = recomputedTotal !== null && !recomputedTotal.equals(chargedAmount);
+
+    if (!cartIdMatches || totalMismatch) {
+      // INVARIANT: NEVER create an order, NEVER decrement stock. Persist
+      // the CHARGED amount as an auditable Payment for manual
+      // reconciliation. `PaymentStatus` has no dedicated "needs review"
+      // value (schema is frozen for this fix) — `PENDING` is the closest
+      // non-terminal fit: neither a fulfilled order (`SUCCEEDED`) nor a
+      // refused charge (`FAILED`). `upsertNonTerminalPayment` also guards
+      // against downgrading an already-SUCCEEDED row on a replayed
+      // mismatch event.
+      await upsertNonTerminalPayment(intent.id, "PENDING", chargedAmount);
+      // Intentional loud audit signal — this module has no structured
+      // logger yet; `no-console` is not enforced by this project's ESLint
+      // config, so no disable directive is needed here.
+      console.error(
+        JSON.stringify({
+          level: "error",
+          event: "payment_reconciliation_mismatch",
+          providerRef: intent.id,
+          userId,
+          cartIdMatches,
+          totalMismatch,
+          expectedCartId: intent.metadata.cartId,
+          actualCartId: cartView.cartId,
+          chargedAmount: chargedAmount.toString(),
+          recomputedTotal: recomputedTotal?.toString() ?? null,
+          message:
+            "payment_intent.succeeded amount/cart mismatch — order NOT created, manual reconciliation required",
+        }),
+      );
+      return;
+    }
+  }
 
   const attempt = (): Promise<OrderDetailView> =>
     prisma.$transaction(async (tx) => {
