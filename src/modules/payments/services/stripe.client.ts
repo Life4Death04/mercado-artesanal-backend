@@ -52,12 +52,28 @@ export interface CreatePaymentIntentResult {
 /**
  * Minimal shape of a verified Stripe webhook event — only the fields
  * `payments.service.ts`'s event dispatch seam needs (design D3/WU3 branches
- * on `type`; WU3 will read `data.object` for `payment_intent.*` payloads).
+ * on `type`; WU3 reads `data.object` for `payment_intent.*` payloads).
  */
 export interface StripeEvent {
   id: string;
   type: string;
   data: { object: Record<string, unknown> };
+}
+
+/**
+ * WU3 — minimal typed shape of `event.data.object` for `payment_intent.*`
+ * events, cast from the untyped `Record<string, unknown>` above at the ONE
+ * place `payments.service.ts` reads it (design Decision 3). `id` is the
+ * Stripe PaymentIntent id (`pi_...`) used as `Payment.providerRef` — NOT
+ * `StripeEvent.id` (the wrapping event's own `evt_...` id). `amount` is
+ * integer cents, needed only by the FAILED path (`centsToEuros` below).
+ * `metadata` mirrors exactly what `createPaymentIntent` writes at creation
+ * time (design Decision 1): `{ userId, cartId, deliverySelections }`.
+ */
+export interface StripePaymentIntentObject {
+  id: string;
+  amount: number;
+  metadata: Record<string, string>;
 }
 
 export interface StripeClient {
@@ -81,6 +97,16 @@ const CENTS_PER_EUR = 100;
 /** Converts a EUR amount in major units to Stripe's integer minor-unit cents. */
 export function eurosToCents(amount: number): number {
   return Math.round(amount * CENTS_PER_EUR);
+}
+
+/**
+ * Converts Stripe's integer minor-unit cents back to a EUR amount in major
+ * units (WU3 — the `payment_intent.payment_failed` handler persists
+ * `Payment.amount` from `event.data.object.amount`, which Stripe always
+ * reports in cents). The inverse of `eurosToCents` above.
+ */
+export function centsToEuros(cents: number): number {
+  return cents / CENTS_PER_EUR;
 }
 
 // ---------------------------------------------------------------------------

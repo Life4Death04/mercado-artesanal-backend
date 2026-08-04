@@ -89,15 +89,24 @@ vi.mock("express-oauth2-jwt-bearer", () => ({
 
 // ---------------------------------------------------------------------------
 // Mock: the Stripe SDK boundary/mock seam ONLY — "stubbed Stripe" per design
-// Testing Strategy. `createPaymentIntent` is the only export exercised by
-// WU1; no real network call to Stripe is ever made from this suite.
+// Testing Strategy. `createPaymentIntent`/`constructEvent` are the only
+// exports exercised as mocks; no real network call to Stripe is ever made
+// from this suite. `centsToEuros` (WU3) is a pure function with zero Stripe
+// SDK dependency — preserved as the REAL implementation via `importOriginal`
+// (strict-tdd "Extract-Before-Mock Rule"), since `payments.service.ts`
+// imports it directly and this suite exercises the real FAILED-amount
+// conversion end-to-end, not a mocked one.
 // ---------------------------------------------------------------------------
-vi.mock("@/modules/payments/services/stripe.client", () => ({
-  stripeClient: {
-    createPaymentIntent: vi.fn(),
-    constructEvent: vi.fn(),
-  },
-}));
+vi.mock("@/modules/payments/services/stripe.client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/modules/payments/services/stripe.client")>();
+  return {
+    ...actual,
+    stripeClient: {
+      createPaymentIntent: vi.fn(),
+      constructEvent: vi.fn(),
+    },
+  };
+});
 
 // eslint-disable-next-line import/first
 import * as cartService from "@/modules/cart/services/cart.service";

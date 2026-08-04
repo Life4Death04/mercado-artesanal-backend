@@ -1,6 +1,7 @@
 /**
  * Payments service — WU1 (Payment Intent creation) + WU2 (webhook signature
- * verification and event-dispatch seam).
+ * verification and event-dispatch seam) + WU3 (atomic webhook event
+ * handling: succeeded/failed).
  *
  * All exports are NAMED FUNCTIONS (not a class, not a default export).
  * Tests import via:
@@ -50,7 +51,8 @@ import type { Prisma } from "@prisma/client";
 import { Prisma as PrismaValue } from "@prisma/client";
 
 import { getCartForCheckout } from "@/modules/cart/services/cart.service";
-import type { DeliverySelection } from "@/modules/orders/services/orders.service";
+import { createOrderFromPayment } from "@/modules/orders/services/orders.service";
+import type { DeliverySelection, OrderDetailView } from "@/modules/orders/services/orders.service";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
@@ -62,10 +64,13 @@ import {
 import { env } from "@/shared/utils/env";
 import { prisma } from "@/shared/utils/prisma";
 
-import { serializeDeliverySelectionsForMetadata } from "../dto/payments.dto";
+import {
+  deserializeDeliverySelectionsFromMetadata,
+  serializeDeliverySelectionsForMetadata,
+} from "../dto/payments.dto";
 
-import { stripeClient } from "./stripe.client";
-import type { StripeClient, StripeEvent } from "./stripe.client";
+import { centsToEuros, stripeClient } from "./stripe.client";
+import type { StripeClient, StripeEvent, StripePaymentIntentObject } from "./stripe.client";
 
 type DecimalValue = InstanceType<typeof PrismaValue.Decimal>;
 type DeliveryModeRow = { id: string; producerId: string; isActive: boolean; cost: Prisma.Decimal };
@@ -273,16 +278,20 @@ export function verifyWebhookSignature(
 /**
  * Event dispatch seam (design "TDD Seams: Tx boundary" + REFACTOR task 2.3).
  *
- * WU2 wires the signature-verification boundary and the routing seam ONLY —
- * no `case` here performs a production write yet, so EVERY verified event
- * type reaches `default` and is a no-op (spec "Unhandled webhook event types
- * are ignored"). WU3 adds `case "payment_intent.succeeded"` (delegates to
- * the frozen `createOrderFromPayment` inside one `$transaction`, design
- * Decision 3) and `case "payment_intent.payment_failed"` (FAILED
- * `payment.upsert`) here, WITHOUT touching `verifyWebhookSignature` above.
+ * `async` since WU3: both new cases open a `prisma.$transaction` (succeeded)
+ * or await a `payment.upsert` (failed). Any OTHER verified event type still
+ * reaches `default` and is a no-op (spec "Unhandled webhook event types are
+ * ignored") — WU3 adds ONLY the two cases below, without touching
+ * `verifyWebhookSignature` above.
  */
-function dispatchWebhookEvent(event: StripeEvent): void {
+async function dispatchWebhookEvent(event: StripeEvent): Promise<void> {
   switch (event.type) {
+    case "payment_intent.succeeded":
+      await handleSucceededEvent(event);
+      return;
+    case "payment_intent.payment_failed":
+      await handleFailedEvent(event);
+      return;
     default:
       return;
   }
@@ -294,17 +303,118 @@ function dispatchWebhookEvent(event: StripeEvent): void {
  * Rejection paths (missing/invalid signature) throw BEFORE any dispatch —
  * see `verifyWebhookSignature` for the zero-write guarantee.
  *
- * Not `async` yet — neither `verifyWebhookSignature` nor `dispatchWebhookEvent`
- * awaits anything in WU2. WU3 makes `dispatchWebhookEvent` async (it opens a
- * `prisma.$transaction` for the succeeded/failed cases) and this function
- * will need `async`/`await` again at that point; the controller already
- * `await`s this call, so that change is transparent to callers.
+ * `async` since WU3 (`dispatchWebhookEvent` now awaits DB writes) — the
+ * controller already `await`s this call.
  */
-export function handleWebhookEvent(
+export async function handleWebhookEvent(
   rawBody: Buffer,
   signature: string | undefined,
   client: StripeClient = stripeClient,
-): void {
+): Promise<void> {
   const event = verifyWebhookSignature(rawBody, signature, client);
-  dispatchWebhookEvent(event);
+  await dispatchWebhookEvent(event);
+}
+
+// ===========================================================================
+// WU3 — Atomic Webhook Events (spec R7, R8; design Decision 3)
+// ===========================================================================
+
+/**
+ * Casts `event.data.object` into the minimal typed shape WU3 reads. No
+ * shape validation — the payload comes from a SIGNATURE-VERIFIED Stripe
+ * event (WU2's `verifyWebhookSignature` already ran) describing a
+ * PaymentIntent this same service created (WU1's `createPaymentIntent`
+ * always populates `id`, `amount`, and `metadata`), so a malformed value
+ * here would indicate a Stripe API contract break, not a hostile input this
+ * module needs to defend against at this layer.
+ */
+function extractPaymentIntentPayload(event: StripeEvent): StripePaymentIntentObject {
+  return event.data.object as unknown as StripePaymentIntentObject;
+}
+
+/** True for a Prisma unique-constraint violation (`P2002`), false otherwise. */
+function isUniqueConstraintViolation(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: string }).code === "P2002";
+}
+
+/**
+ * `payment_intent.payment_failed` — persists a FAILED `Payment` row for
+ * audit/history and creates NO order (spec "payment_intent.payment_failed
+ * persists a FAILED payment and keeps the cart"). Never a bare `create`:
+ * `upsert` keyed on `providerRef` so a repeated failure for the SAME intent
+ * (Stripe's own confirmation retries) reuses one row instead of hitting the
+ * `Payment.providerRef @unique` constraint (design Decision 3). Cart state
+ * is never touched here — leaving it intact so the consumer can retry
+ * (#987.1) requires no action, only the ABSENCE of a cart write.
+ */
+async function handleFailedEvent(event: StripeEvent): Promise<void> {
+  const intent = extractPaymentIntentPayload(event);
+  const amount = new PrismaValue.Decimal(centsToEuros(intent.amount));
+
+  await prisma.payment.upsert({
+    where: { providerRef: intent.id },
+    create: { providerRef: intent.id, status: "FAILED", amount },
+    update: { status: "FAILED", amount },
+  });
+}
+
+/**
+ * `payment_intent.succeeded` — opens ONE `prisma.$transaction` that FIRST
+ * deletes any prior FAILED `Payment` row for the SAME `providerRef`, THEN
+ * delegates ENTIRELY to the frozen `createOrderFromPayment` (design Decision
+ * 3, "D3 hinge"). The delete is scoped to `status: "FAILED"` so it is a safe
+ * no-op when no prior FAILED row exists (first-time success, spec "First
+ * succeeded event creates the order once") and NEVER touches an existing
+ * SUCCEEDED row (replay safety, spec "Replayed succeeded event is a
+ * no-op" — `createOrderFromPayment`'s own step-0 idempotency pre-check
+ * handles that case once the delete is a no-op).
+ *
+ * `deliverySelections`/`cartView` are re-derived from the webhook payload —
+ * NOT re-read from any request-scoped state (design Decision 1): `cartView`
+ * via the frozen `getCartForCheckout(metadata.userId)`, `deliverySelections`
+ * via `deserializeDeliverySelectionsFromMetadata(metadata.deliverySelections)`.
+ *
+ * P2002 backstop (design "TDD Seams: Tx boundary"): if the delegated
+ * `payment.create` still throws a REAL unique-constraint violation (a
+ * genuine concurrent-webhook race with no prior FAILED row to have already
+ * cleared it — mirrors `orders.test.ts`'s `invokeWithP2002Recovery` /
+ * `cart.service.ts`'s `addItem` retry-once idiom), the WHOLE `$transaction`
+ * is retried ONCE with a FRESH transaction: by the time the retry starts,
+ * the winning transaction has already committed, so the retry's
+ * `createOrderFromPayment` step-0 pre-check finds the now-committed row and
+ * returns it idempotently. Any OTHER error propagates uncaught.
+ */
+async function handleSucceededEvent(event: StripeEvent): Promise<void> {
+  const intent = extractPaymentIntentPayload(event);
+
+  // `noUncheckedIndexedAccess` narrows Record<string,string> property reads
+  // to `string | undefined` — both fields are ALWAYS populated by this same
+  // service's own `createPaymentIntent` (design Decision 1), so a missing
+  // value here is a Stripe API contract break, not a request this module
+  // needs to gracefully reject; the guard exists for type-safety AND to
+  // fail loudly instead of silently proceeding with `undefined`.
+  const { userId, deliverySelections: deliverySelectionsMetadata } = intent.metadata;
+  if (!userId || !deliverySelectionsMetadata) {
+    throw new Error(
+      "payment_intent.succeeded event is missing required metadata (userId/deliverySelections)",
+    );
+  }
+
+  const deliverySelections = deserializeDeliverySelectionsFromMetadata(deliverySelectionsMetadata);
+  const cartView = await getCartForCheckout(userId);
+
+  const attempt = (): Promise<OrderDetailView> =>
+    prisma.$transaction(async (tx) => {
+      await tx.payment.deleteMany({ where: { providerRef: intent.id, status: "FAILED" } });
+      return createOrderFromPayment(intent.id, cartView, deliverySelections, tx);
+    });
+
+  try {
+    await attempt();
+  } catch (err: unknown) {
+    if (!isUniqueConstraintViolation(err)) {
+      throw err;
+    }
+    await attempt();
+  }
 }

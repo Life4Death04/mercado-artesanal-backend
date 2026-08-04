@@ -110,3 +110,23 @@ export function serializeDeliverySelectionsForMetadata(
 
   return compact;
 }
+
+/**
+ * Parses the compact JSON string written into PaymentIntent metadata by
+ * `serializeDeliverySelectionsForMetadata` back into `DeliverySelection[]`
+ * (WU3 — the `payment_intent.succeeded` handler re-derives the caller's
+ * `deliverySelections` from `event.data.object.metadata.deliverySelections`
+ * before delegating to the frozen `createOrderFromPayment`).
+ *
+ * No shape validation is performed here — the resolved rows are re-validated
+ * EXCLUSIVELY against LIVE `DeliveryMode` data inside `createOrderFromPayment`
+ * (design Decision 4 step 3a), the same pattern `payments.service.ts`
+ * already follows for the intent-creation path. A malformed/unexpected value
+ * would surface as `ValidationFailedError` there, not here.
+ *
+ * Spec: payments §"payment_intent.succeeded creates the order atomically and idempotently"
+ * Design: Decision 1 (deliverySelections carry-through)
+ */
+export function deserializeDeliverySelectionsFromMetadata(compact: string): DeliverySelection[] {
+  return JSON.parse(compact) as DeliverySelection[];
+}
