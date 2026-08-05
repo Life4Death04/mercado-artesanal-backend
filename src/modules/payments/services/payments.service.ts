@@ -419,13 +419,15 @@ async function handleFailedEvent(event: StripeEvent): Promise<void> {
  *
  * Returns `null` (never throws) when a `deliverySelections` entry does not
  * resolve to a valid/active `DeliveryMode` for its producer, OR the
- * bijection against the LIVE cart is incomplete. That is NOT this guard's
- * concern to reject — an unresolvable selection is validation the frozen
- * `createOrderFromPayment` (step 3a) ALREADY re-checks and rejects on its
- * own inside the transaction; misclassifying it here as an "amount
- * mismatch" would short-circuit BEFORE that frozen validation ever runs.
- * The caller treats `null` as "cannot verify — defer to the delegated
- * write", not as a reconciliation failure.
+ * bijection against the LIVE cart is incomplete. `null` means "cannot
+ * verify the charged amount against the live cart". The caller (WU3 R4 fix)
+ * treats `null` as UNVERIFIABLE and routes it through the SAME safety block
+ * as a reconciliation failure: persist a durable PENDING Payment for the
+ * charged amount and return WITHOUT creating an order. This is money-safe
+ * for BOTH `null` causes: (a) a delivery mode vanished — deferring to the
+ * frozen `createOrderFromPayment` would make it THROW and roll back
+ * `payment.create`, losing the charge record entirely; (b) the live cart
+ * changed — an order must NOT be created anyway. Never `null == "proceed"`.
  */
 async function recomputeCartTotal(
   cartView: Awaited<ReturnType<typeof getCartForCheckout>>,
@@ -524,15 +526,19 @@ async function handleSucceededEvent(event: StripeEvent): Promise<void> {
     // truth (maintainer decision). The LIVE cart is re-priced with the SAME
     // calculation `createPaymentIntent` used, and its identity (`cartId`)
     // re-checked against the metadata captured at intent creation. A
-    // `null` recomputed total means an unresolvable selection — deferred to
-    // the frozen `createOrderFromPayment`'s own validation below, NOT
-    // treated as a mismatch (see `recomputeCartTotal`'s docstring).
+    // `null` recomputed total means the charge CANNOT be verified against
+    // the live cart (a selected delivery mode vanished/inactive, or the
+    // live-cart bijection is incomplete) — WU3 R4 fix: this is handled here
+    // as UNVERIFIABLE, routed through the SAME safety block as a mismatch,
+    // NOT deferred to the throwing frozen `createOrderFromPayment` below
+    // (see `recomputeCartTotal`'s docstring for the money-loss rationale).
     const chargedAmount = new PrismaValue.Decimal(centsToEuros(intent.amount));
     const recomputedTotal = await recomputeCartTotal(cartView, deliverySelections);
     const cartIdMatches = cartView.cartId === intent.metadata.cartId;
+    const cannotVerifyTotal = recomputedTotal === null;
     const totalMismatch = recomputedTotal !== null && !recomputedTotal.equals(chargedAmount);
 
-    if (!cartIdMatches || totalMismatch) {
+    if (!cartIdMatches || totalMismatch || cannotVerifyTotal) {
       // INVARIANT: NEVER create an order, NEVER decrement stock. Persist
       // the CHARGED amount as an auditable Payment for manual
       // reconciliation. `PaymentStatus` has no dedicated "needs review"
@@ -549,16 +555,18 @@ async function handleSucceededEvent(event: StripeEvent): Promise<void> {
         JSON.stringify({
           level: "error",
           event: "payment_reconciliation_mismatch",
+          reason: cannotVerifyTotal ? "cannot_verify" : "amount_or_cart_mismatch",
           providerRef: intent.id,
           userId,
           cartIdMatches,
           totalMismatch,
+          cannotVerifyTotal,
           expectedCartId: intent.metadata.cartId,
           actualCartId: cartView.cartId,
           chargedAmount: chargedAmount.toString(),
           recomputedTotal: recomputedTotal?.toString() ?? null,
           message:
-            "payment_intent.succeeded amount/cart mismatch — order NOT created, manual reconciliation required",
+            "payment_intent.succeeded could not be reconciled against the live cart — order NOT created, manual reconciliation required",
         }),
       );
       return;

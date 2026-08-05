@@ -832,9 +832,11 @@ describe("POST /api/v1/pagos/webhook — transaction failure leaves no partial s
       }
       vi.clearAllMocks();
 
-      const { producer, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
+      const { producer, deliveryMode, consumer, cartId, product } = await seedCheckoutReadyCart(db, cleanup, {
         namePrefix: "wu3rollback",
         nif: "B20000105",
+        stock: 1,
+        quantity: 1,
       });
       const intentId = "pi_wu3_rollback";
       cleanup.providerRefs.push(intentId);
@@ -844,21 +846,24 @@ describe("POST /api/v1/pagos/webhook — transaction failure leaves no partial s
       await db.payment.create({ data: { providerRef: intentId, status: "FAILED", amount: 7.0 } });
 
       // Force createOrderFromPayment to throw AFTER the wrapper's deleteMany
-      // has already run inside the SAME $transaction: an unresolvable
-      // deliveryModeId -> ValidationFailedError (orders.service.ts step 3a),
-      // well after step 0's idempotency pre-check (no *SUCCEEDED* payment
-      // exists yet, so it proceeds into the write path). `cartId` matches
-      // the LIVE cart so the Bug 2 reconciliation guard does not itself
-      // short-circuit this scenario — the unresolvable deliveryModeId makes
-      // `recomputeCartTotal` return `null` (defer to the frozen contract's
-      // own validation below), which is exactly what this test proves.
+      // has already run inside the SAME $transaction, using a throw that
+      // PASSES the WU3 R4 reconciliation guard (active delivery mode +
+      // matching cartId + matching total, so `recomputeCartTotal` is neither
+      // null nor a mismatch): the product went out of stock between cart-add
+      // and webhook delivery, so `decrementStock` throws InsufficientStockError
+      // deep inside the frozen write — well past step-0's idempotency
+      // pre-check (no *SUCCEEDED* payment exists yet). This is the correct
+      // mechanism to prove tx rollback now that an unresolvable delivery mode
+      // is intercepted by the guard (persisted PENDING) instead of reaching
+      // the transaction at all.
+      await db.product.update({ where: { id: product.id }, data: { stock: 0 } });
       mockedConstructEvent.mockReturnValueOnce(
         makeSucceededEvent({
           intentId,
           amountCents: 700,
           userId: consumer.id,
           cartId,
-          deliverySelections: [{ producerId: producer.id, deliveryModeId: "mode_does_not_exist" }],
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
         }),
       );
 
@@ -1051,6 +1056,66 @@ describe("POST /api/v1/pagos/webhook — reconciliation guard: cartId identity m
 
       const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
       expect(orderCount).toBe(0);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — reconciliation guard: unverifiable total (delivery mode vanished) [WU3-9]", () => {
+  it(
+    "[WU3-9] a succeeded event whose selected delivery mode no longer resolves (recomputeCartTotal -> null) with a matching cartId persists a PENDING Payment for the CHARGED amount, creates NO Order, does NOT decrement stock, and returns 200 — the charge is NEVER lost",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, consumer, cartId, product } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu3cannotverify",
+        nif: "B20000109",
+        price: 5.0,
+        deliveryCost: 2.0,
+        quantity: 1,
+        stock: 10,
+      });
+      const intentId = "pi_wu3_cannot_verify";
+      cleanup.providerRefs.push(intentId);
+
+      // The selected deliveryModeId no longer resolves to any active
+      // DeliveryMode (it was deactivated/deleted after intent creation), so
+      // `recomputeCartTotal` returns null: the charge CANNOT be verified.
+      // cartId still matches, so WITHOUT the WU3 R4 fix the guard is skipped,
+      // the frozen createOrderFromPayment THROWS ValidationFailedError, the
+      // whole $transaction (incl. payment.create) rolls back, and this
+      // CHARGED intent ends with NO Order AND NO Payment row — silent money
+      // loss. The fix routes null through the safety block instead.
+      mockedConstructEvent.mockReturnValueOnce(
+        makeSucceededEvent({
+          intentId,
+          amountCents: 700,
+          userId: consumer.id,
+          cartId,
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: "mode_vanished" }],
+        }),
+      );
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+      expect(res.status).toBe(200);
+
+      // Durable record of the charge for manual reconciliation/refund.
+      const payment = await db.payment.findUnique({ where: { providerRef: intentId } });
+      expect(payment?.status).toBe("PENDING");
+      expect(Number(payment?.amount)).toBe(7.0);
+
+      const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCount).toBe(0);
+
+      const liveProduct = await db.product.findUnique({ where: { id: product.id } });
+      expect(liveProduct?.stock).toBe(10);
     },
     20000,
   );
