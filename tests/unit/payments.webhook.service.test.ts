@@ -341,3 +341,47 @@ describe("payments.service — payment_intent.succeeded dispatch [WHU-SUCCESS]",
     expect(mockedTransaction).toHaveBeenCalledTimes(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// payment_intent.succeeded -> reconciliation guard: recomputeCartTotal cannot
+// verify the charged amount (a selected DeliveryMode vanished / went inactive,
+// so `recomputeCartTotal` returns null). WU3 R4 money-integrity fix: an
+// unverifiable total must be treated the SAME as a reconciliation failure —
+// persist a durable PENDING Payment for the CHARGED amount and RETURN, never
+// entering the order $transaction (whose frozen createOrderFromPayment would
+// throw ValidationFailedError for the missing mode, rolling back payment.create
+// and leaving a CHARGED intent with NO Order and NO Payment row at all).
+// ---------------------------------------------------------------------------
+
+describe("payments.service — payment_intent.succeeded reconciliation guard: unverifiable total [WHU-CANNOT-VERIFY]", () => {
+  it("[WHU-CANNOT-VERIFY] a succeeded event whose selected DeliveryMode is gone/inactive (recomputeCartTotal -> null) with a matching cartId persists a PENDING Payment for the charged amount, never opens the order $transaction, and never throws", async () => {
+    // The producer's selected DeliveryMode no longer resolves to an active
+    // row -> recomputeCartTotal returns null ("cannot verify"). cartId still
+    // matches, so WITHOUT the fix totalMismatch is false, the safety block is
+    // skipped, and execution falls into the throwing frozen $transaction.
+    mockedDeliveryModeFindMany.mockResolvedValueOnce([]);
+    mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView());
+    // upsertNonTerminalPayment path: no existing row -> updateMany count 0 ->
+    // findUnique null (beforeEach default) -> create a fresh PENDING row.
+    mockedUpdateMany.mockResolvedValueOnce({ count: 0 });
+    mockedCreate.mockResolvedValueOnce({} as never);
+
+    const event = makeSucceededEvent({ id: "pi_cannot_verify", amount: 700 });
+
+    // MUST NOT throw/propagate — the charge is a fact; losing it is the bug.
+    await expect(
+      paymentsService.handleWebhookEvent(RAW_BODY, SIGNATURE, makeClient(event)),
+    ).resolves.toBeUndefined();
+
+    // A durable PENDING Payment for the CHARGED amount (700 cents = 7.00 EUR)
+    // is written for manual reconciliation/refund.
+    expect(mockedCreate).toHaveBeenCalledTimes(1);
+    const call = mockedCreate.mock.calls[0]?.[0];
+    expect(call?.data).toMatchObject({ providerRef: "pi_cannot_verify", status: "PENDING" });
+    expect(Number((call?.data as { amount?: unknown })?.amount)).toBe(7);
+
+    // NO order is ever created and the throwing $transaction is never opened.
+    expect(mockedCreateOrderFromPayment).not.toHaveBeenCalled();
+    expect(mockedTransaction).not.toHaveBeenCalled();
+  });
+});
