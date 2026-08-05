@@ -56,9 +56,11 @@ export async function createIntent(req: Request, res: Response, next: NextFuncti
  * Unauthenticated (server-to-server) — verifies the Stripe signature over
  * the raw body and dispatches the event. Always 200 on a verified event
  * (handled or ignored); 400 WEBHOOK_SIGNATURE_INVALID on a bad/missing
- * signature (thrown by `payments.service.handleWebhookEvent`, caught below).
+ * signature; other errors (e.g. a WU3 transaction failure) are also mapped
+ * by errorMiddleware (all thrown by `payments.service.handleWebhookEvent`,
+ * caught below).
  */
-export function handleWebhook(req: Request, res: Response, next: NextFunction): void {
+export async function handleWebhook(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const signatureHeader = req.headers["stripe-signature"];
     const signature = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
@@ -66,10 +68,9 @@ export function handleWebhook(req: Request, res: Response, next: NextFunction): 
     // never a parsed JSON object, for this specific path.
     const rawBody = req.body as Buffer;
 
-    // Not `async`/`await` — payments.service.handleWebhookEvent is synchronous
-    // in WU2 (no case dispatches a DB write yet). WU3 will make it async and
-    // this handler will need `async`/`await` again at that point.
-    paymentsService.handleWebhookEvent(rawBody, signature);
+    // `async`/`await` since WU3 — payments.service.handleWebhookEvent now
+    // awaits DB writes (succeeded/failed handlers) for verified events.
+    await paymentsService.handleWebhookEvent(rawBody, signature);
     res.status(200).json({ received: true });
   } catch (err) {
     next(err);

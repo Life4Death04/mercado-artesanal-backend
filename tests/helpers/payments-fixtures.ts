@@ -27,15 +27,26 @@ import * as cartService from "@/modules/cart/services/cart.service";
  * Tracks the rows created by the seed helpers below so a single
  * `cleanupPaymentsFixtures` call can tear them all down in FK-safe order
  * (children before parents).
+ *
+ * `providerRefs` (WU3 addition): Stripe PaymentIntent ids used by webhook
+ * atomic-event tests (`tests/integration/payments.test.ts` WU3 describe
+ * blocks) — these tests write REAL `Order`/`SubOrder`/`OrderLine`/`Payment`
+ * rows via the frozen `createOrderFromPayment`, which WU1/WU2 never did.
+ * `Order`/`SubOrder`/`OrderLine` are Restrict-FK'd to `Producer`/`Product`/
+ * `DeliveryMode` (schema.prisma), so this file's existing `deliveryMode`/
+ * `product`/`producer` deletes below would fail with a foreign-key violation
+ * once any WU3 test has run, UNLESS the Order aggregate is deleted first —
+ * see `cleanupPaymentsFixtures`.
  */
 export interface PaymentsFixtureCleanup {
   userIds: string[];
   producerIds: string[];
   categorySlugs: Set<string>;
+  providerRefs: string[];
 }
 
 export function createPaymentsFixtureCleanup(): PaymentsFixtureCleanup {
-  return { userIds: [], producerIds: [], categorySlugs: new Set<string>() };
+  return { userIds: [], producerIds: [], categorySlugs: new Set<string>(), providerRefs: [] };
 }
 
 export async function isDbReachable(db: PrismaClient): Promise<boolean> {
@@ -166,10 +177,26 @@ export async function seedCheckoutReadyCart(
 
   await cartService.addItem(consumer.id, product.id, quantity);
 
-  return { producer, category, consumer, deliveryMode, product, quantity };
+  // WU3 rework: `cartId` is exposed so webhook-event fixtures can build a
+  // `metadata.cartId` that matches what `getCartForCheckout` will ACTUALLY
+  // resolve at webhook time (Bug 2 fix — the reconciliation guard compares
+  // `cartView.cartId === metadata.cartId`).
+  const cartView = await cartService.getCartForCheckout(consumer.id);
+
+  return { producer, category, consumer, deliveryMode, product, quantity, cartId: cartView.cartId };
 }
 
 export async function cleanupPaymentsFixtures(db: PrismaClient, cleanup: PaymentsFixtureCleanup): Promise<void> {
+  // WU3: tear down any real Order aggregate written by webhook atomic-event
+  // tests BEFORE the deliveryMode/product/producer deletes below — both are
+  // Restrict-FK'd from SubOrder/OrderLine and would otherwise fail once any
+  // WU3 test has created an Order. Order/SubOrder have no cascade, so this
+  // must run child-first: OrderLine -> SubOrder -> Order -> Payment.
+  await db.orderLine.deleteMany({ where: { subOrder: { order: { userId: { in: cleanup.userIds } } } } });
+  await db.subOrder.deleteMany({ where: { order: { userId: { in: cleanup.userIds } } } });
+  await db.order.deleteMany({ where: { userId: { in: cleanup.userIds } } });
+  await db.payment.deleteMany({ where: { providerRef: { in: cleanup.providerRefs } } });
+
   await db.cartItem.deleteMany({ where: { cart: { userId: { in: cleanup.userIds } } } });
   await db.cart.deleteMany({ where: { userId: { in: cleanup.userIds } } });
   await db.deliveryMode.deleteMany({ where: { producerId: { in: cleanup.producerIds } } });

@@ -1,9 +1,16 @@
 /**
  * Unit tests — payments module (Cycle 5 payments WU1, strict TDD).
  *
- * WU1 scope ONLY: POST /pagos/intent (authenticated PaymentIntent creation).
- * WU2 (webhook trust boundary) and WU3 (atomic webhook events) are OUT OF
- * SCOPE for this file — no webhook/event-dispatch tests belong here.
+ * WU1 scope: POST /pagos/intent (authenticated PaymentIntent creation).
+ * WU2 (webhook trust boundary) and WU3 (atomic webhook event DISPATCH) are
+ * OUT OF SCOPE for this file — no webhook/event-dispatch behavior tests
+ * belong here; those live in `tests/unit/payments.webhook.service.test.ts`.
+ *
+ * WU3 EXCEPTION: `deserializeDeliverySelectionsFromMetadata` (payments.dto.ts)
+ * and `centsToEuros` (stripe.client.ts) are PURE DTO/money-conversion helpers
+ * — not webhook dispatch behavior — so their tests stay here, alongside their
+ * WU1 siblings `serializeDeliverySelectionsForMetadata` / `eurosToCents`,
+ * per this file's own "Extract-Before-Mock" pure-function convention.
  *
  * Strategy:
  *   - DTO/metadata-guard/cents-conversion tests are PURE — zero mocks
@@ -103,9 +110,10 @@ import { prisma } from "@/shared/utils/prisma";
 import {
   CreatePaymentIntentSchema,
   DeliverySelectionSchema,
+  deserializeDeliverySelectionsFromMetadata,
   serializeDeliverySelectionsForMetadata,
 } from "@/modules/payments/dto/payments.dto";
-import { eurosToCents } from "@/modules/payments/services/stripe.client";
+import { centsToEuros, eurosToCents } from "@/modules/payments/services/stripe.client";
 import { stripeClient } from "@/modules/payments/services/stripe.client";
 import * as paymentsService from "@/modules/payments/services/payments.service";
 
@@ -230,6 +238,30 @@ describe("payments.dto — serializeDeliverySelectionsForMetadata (D1 guard)", (
 });
 
 // ---------------------------------------------------------------------------
+// DTO — WU3 metadata round-trip (deserializeDeliverySelectionsFromMetadata),
+// pure function, zero mocks
+// ---------------------------------------------------------------------------
+
+describe("payments.dto — deserializeDeliverySelectionsFromMetadata (WU3 D1 round-trip)", () => {
+  it("[PD-META-ROUNDTRIP] parses the compact JSON produced by serializeDeliverySelectionsForMetadata back into the original array", () => {
+    const selections = [makeSelection(), makeSelection({ producerId: "producer_B", deliveryModeId: "mode_B" })];
+    const compact = serializeDeliverySelectionsForMetadata(selections);
+    expect(deserializeDeliverySelectionsFromMetadata(compact)).toEqual(selections);
+  });
+
+  it("[PD-META-EMPTY-ROUNDTRIP] round-trips an empty selections array", () => {
+    const compact = serializeDeliverySelectionsForMetadata([]);
+    expect(deserializeDeliverySelectionsFromMetadata(compact)).toEqual([]);
+  });
+
+  it("[PD-META-MALFORMED] throws ValidationFailedError (not a raw SyntaxError) on malformed JSON metadata", () => {
+    expect(() => deserializeDeliverySelectionsFromMetadata("{not-valid-json")).toThrow(
+      ValidationFailedError,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // stripe.client — eurosToCents pure function (zero mocks)
 // ---------------------------------------------------------------------------
 
@@ -240,6 +272,16 @@ describe("stripe.client — eurosToCents", () => {
 
   it("[SC-CENTS-2] rounds a fractional-cent amount (floating point safety)", () => {
     expect(eurosToCents(19.999999999998)).toBe(2000);
+  });
+});
+
+describe("stripe.client — centsToEuros (WU3 FAILED-payment amount conversion)", () => {
+  it("[SC-CENTS-3] converts integer cents to a whole-euro amount", () => {
+    expect(centsToEuros(2700)).toBe(27);
+  });
+
+  it("[SC-CENTS-4] converts integer cents to a fractional-euro amount", () => {
+    expect(centsToEuros(750)).toBe(7.5);
   });
 });
 

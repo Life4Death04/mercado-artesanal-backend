@@ -110,3 +110,36 @@ export function serializeDeliverySelectionsForMetadata(
 
   return compact;
 }
+
+/**
+ * Parses the compact JSON string written into PaymentIntent metadata by
+ * `serializeDeliverySelectionsForMetadata` back into `DeliverySelection[]`
+ * (WU3 — the `payment_intent.succeeded` handler re-derives the caller's
+ * `deliverySelections` from `event.data.object.metadata.deliverySelections`
+ * before delegating to the frozen `createOrderFromPayment`).
+ *
+ * No shape validation is performed here — the resolved rows are re-validated
+ * EXCLUSIVELY against LIVE `DeliveryMode` data inside `createOrderFromPayment`
+ * (design Decision 4 step 3a), the same pattern `payments.service.ts`
+ * already follows for the intent-creation path. A malformed/unexpected value
+ * would surface as `ValidationFailedError` there, not here.
+ *
+ * Spec: payments §"payment_intent.succeeded creates the order atomically and idempotently"
+ * Design: Decision 1 (deliverySelections carry-through)
+ *
+ * WU3 rework (4R escalation WARNING fix): a malformed metadata string threw
+ * a raw `SyntaxError` from `JSON.parse` instead of the module's standard
+ * `ValidationFailedError` (422) — wrapped here so a corrupted/tampered
+ * PaymentIntent metadata value surfaces through the same error taxonomy as
+ * every other rejection this module produces, instead of an unhandled 500.
+ */
+export function deserializeDeliverySelectionsFromMetadata(compact: string): DeliverySelection[] {
+  try {
+    return JSON.parse(compact) as DeliverySelection[];
+  } catch {
+    throw new ValidationFailedError(
+      [{ path: "deliverySelections", message: "Malformed deliverySelections metadata" }],
+      "Invalid delivery selections",
+    );
+  }
+}

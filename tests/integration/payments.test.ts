@@ -1,13 +1,14 @@
 /**
  * Integration tests — POST /api/v1/pagos/intent and POST /api/v1/pagos/webhook
- * (Cycle 5 payments WU1 + WU2, real Postgres, strict TDD).
+ * (Cycle 5 payments WU1 + WU2 + WU3, real Postgres, strict TDD).
  *
  * WU1 scope: `/pagos/intent`. WU2 scope: the `/pagos/webhook` raw-body trust
  * boundary — signature verification ONLY (400 + zero writes on bad/missing
- * signature, 200 no-op on any accepted-but-unhandled event type). WU2 does
- * NOT implement `payment_intent.succeeded` / `payment_intent.payment_failed`
- * production handling — every verified event type is a no-op in this slice
- * (WU3 scope). See the "[WU2]" describe blocks below.
+ * signature, 200 no-op on any accepted-but-unhandled event type). WU3 scope:
+ * the `payment_intent.succeeded` / `payment_intent.payment_failed` PRODUCTION
+ * handlers — atomic order creation, idempotent replay, FAILED audit rows, and
+ * the D3 FAILED->SUCCEEDED same-providerRef transition. See the "[WU2]" and
+ * "[WU3]" describe blocks below.
  *
  * Strategy (design §Testing Strategy — "Integration (Supertest + real
  * Prisma, stubbed Stripe)"): mirrors `orders.test.ts`'s real-Postgres
@@ -88,20 +89,33 @@ vi.mock("express-oauth2-jwt-bearer", () => ({
 
 // ---------------------------------------------------------------------------
 // Mock: the Stripe SDK boundary/mock seam ONLY — "stubbed Stripe" per design
-// Testing Strategy. `createPaymentIntent` is the only export exercised by
-// WU1; no real network call to Stripe is ever made from this suite.
+// Testing Strategy. `createPaymentIntent`/`constructEvent` are the only
+// exports exercised as mocks; no real network call to Stripe is ever made
+// from this suite. `centsToEuros` (WU3) is a pure function with zero Stripe
+// SDK dependency — preserved as the REAL implementation via `importOriginal`
+// (strict-tdd "Extract-Before-Mock Rule"), since `payments.service.ts`
+// imports it directly and this suite exercises the real FAILED-amount
+// conversion end-to-end, not a mocked one.
 // ---------------------------------------------------------------------------
-vi.mock("@/modules/payments/services/stripe.client", () => ({
-  stripeClient: {
-    createPaymentIntent: vi.fn(),
-    constructEvent: vi.fn(),
-  },
-}));
+vi.mock("@/modules/payments/services/stripe.client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/modules/payments/services/stripe.client")>();
+  return {
+    ...actual,
+    stripeClient: {
+      createPaymentIntent: vi.fn(),
+      constructEvent: vi.fn(),
+    },
+  };
+});
 
 // eslint-disable-next-line import/first
 import * as cartService from "@/modules/cart/services/cart.service";
 // eslint-disable-next-line import/first
+import { serializeDeliverySelectionsForMetadata } from "@/modules/payments/dto/payments.dto";
+// eslint-disable-next-line import/first
 import { stripeClient } from "@/modules/payments/services/stripe.client";
+// eslint-disable-next-line import/first
+import type { StripeEvent } from "@/modules/payments/services/stripe.client";
 // eslint-disable-next-line import/first
 import { prisma } from "@/shared/utils/prisma";
 // eslint-disable-next-line import/first
@@ -149,6 +163,44 @@ afterAll(async () => {
   await db.$disconnect();
   await prisma.$disconnect();
 });
+
+// ---------------------------------------------------------------------------
+// WU3 — Stripe webhook event payload builders (design Data Flow, spec R7/R8).
+// `data.object.metadata` mirrors exactly what WU1's `createPaymentIntent`
+// writes at intent-creation time: `{ userId, cartId, deliverySelections }`.
+// ---------------------------------------------------------------------------
+
+function makeSucceededEvent(args: {
+  intentId: string;
+  amountCents: number;
+  userId: string;
+  cartId: string;
+  deliverySelections: { producerId: string; deliveryModeId: string }[];
+}): StripeEvent {
+  return {
+    id: `evt_${args.intentId}`,
+    type: "payment_intent.succeeded",
+    data: {
+      object: {
+        id: args.intentId,
+        amount: args.amountCents,
+        metadata: {
+          userId: args.userId,
+          cartId: args.cartId,
+          deliverySelections: serializeDeliverySelectionsForMetadata(args.deliverySelections),
+        },
+      },
+    },
+  };
+}
+
+function makeFailedEvent(args: { intentId: string; amountCents: number }): StripeEvent {
+  return {
+    id: `evt_${args.intentId}`,
+    type: "payment_intent.payment_failed",
+    data: { object: { id: args.intentId, amount: args.amountCents } },
+  };
+}
 
 // ===========================================================================
 // [PH1] valid cart + valid delivery selection -> 201 { clientSecret }
@@ -569,6 +621,501 @@ describe("POST /api/v1/pagos/intent — still parses JSON after webhook raw-body
 
       expect(res.status).toBe(201);
       expect(res.body).toEqual({ clientSecret: "secret_wu2json" });
+    },
+    20000,
+  );
+});
+
+// ===========================================================================
+// WU3 — Atomic Webhook Events (payments §R7, §R8; design Decision 3)
+//
+// [WU3-1] first succeeded event creates exactly one Order + SUCCEEDED Payment
+// [WU3-2] replayed succeeded event is a no-op — still exactly one Order
+// [WU3-3] failed event persists a FAILED Payment, no Order, cart intact
+// [WU3-4] D3 hinge: a prior FAILED Payment for the SAME providerRef is
+//         deleted before the succeeded delegation, no P2002
+// [WU3-5] a mid-transaction failure rolls back BOTH the prior-FAILED delete
+//         and any partial order writes (proves the wrapper is ONE tx)
+// ===========================================================================
+
+describe("POST /api/v1/pagos/webhook — payment_intent.succeeded creates the order atomically [WU3-1]", () => {
+  it(
+    "[WU3-1] first succeeded event creates exactly ONE Order linked to a SUCCEEDED Payment",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu3succ1",
+        nif: "B20000101",
+      });
+      const intentId = "pi_wu3_succ1";
+      cleanup.providerRefs.push(intentId);
+
+      mockedConstructEvent.mockReturnValueOnce(
+        makeSucceededEvent({
+          intentId,
+          amountCents: 700,
+          userId: consumer.id,
+          cartId,
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        }),
+      );
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+
+      expect(res.status).toBe(200);
+
+      const payment = await db.payment.findUnique({ where: { providerRef: intentId } });
+      expect(payment?.status).toBe("SUCCEEDED");
+
+      const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCount).toBe(1);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — replayed succeeded event is a no-op [WU3-2]", () => {
+  it(
+    "[WU3-2] a replayed succeeded event for an already-recorded intent creates NO second Order",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu3replay",
+        nif: "B20000102",
+      });
+      const intentId = "pi_wu3_replay";
+      cleanup.providerRefs.push(intentId);
+
+      const event = makeSucceededEvent({
+        intentId,
+        amountCents: 700,
+        userId: consumer.id,
+        cartId,
+        deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+      });
+      mockedConstructEvent.mockReturnValue(event);
+
+      const firstRes = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+      expect(firstRes.status).toBe(200);
+
+      // Replay — the cart is now empty (cleared by the first delegation),
+      // proving the no-op comes from createOrderFromPayment's step-0
+      // idempotency pre-check, not from an incidental empty-cart short-circuit.
+      const replayRes = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+      expect(replayRes.status).toBe(200);
+
+      const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCount).toBe(1);
+      const paymentCount = await db.payment.count({ where: { providerRef: intentId } });
+      expect(paymentCount).toBe(1);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — payment_intent.payment_failed persists a FAILED audit row [WU3-3]", () => {
+  it(
+    "[WU3-3] persists a FAILED Payment, creates no Order, and leaves the cart intact",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { consumer } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu3fail1",
+        nif: "B20000103",
+      });
+      const intentId = "pi_wu3_fail1";
+      cleanup.providerRefs.push(intentId);
+
+      mockedConstructEvent.mockReturnValueOnce(makeFailedEvent({ intentId, amountCents: 700 }));
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.payment_failed" });
+
+      expect(res.status).toBe(200);
+
+      const payment = await db.payment.findUnique({ where: { providerRef: intentId } });
+      expect(payment?.status).toBe("FAILED");
+
+      const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCount).toBe(0);
+
+      const cartItemCount = await db.cartItem.count({ where: { cart: { userId: consumer.id } } });
+      expect(cartItemCount).toBe(1);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — D3 FAILED->SUCCEEDED same providerRef transition [WU3-4]", () => {
+  it(
+    "[WU3-4] a succeeded event for a providerRef with a prior FAILED Payment deletes the FAILED row and creates the order without a P2002",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu3d3",
+        nif: "B20000104",
+      });
+      const intentId = "pi_wu3_d3_retry";
+      cleanup.providerRefs.push(intentId);
+
+      // Seed the prior FAILED payment directly — isolates this test from the
+      // FAILED handler's own correctness (already proven by [WU3-3]).
+      await db.payment.create({ data: { providerRef: intentId, status: "FAILED", amount: 7.0 } });
+
+      mockedConstructEvent.mockReturnValueOnce(
+        makeSucceededEvent({
+          intentId,
+          amountCents: 700,
+          userId: consumer.id,
+          cartId,
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        }),
+      );
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+
+      // No P2002 should ever surface as an error response — the wrapper
+      // deletes the prior FAILED row BEFORE the frozen create runs.
+      expect(res.status).toBe(200);
+
+      const payments = await db.payment.findMany({ where: { providerRef: intentId } });
+      expect(payments).toHaveLength(1);
+      expect(payments[0]?.status).toBe("SUCCEEDED");
+
+      const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCount).toBe(1);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — transaction failure leaves no partial state [WU3-5]", () => {
+  it(
+    "[WU3-5] a mid-transaction failure in the delegated write rolls back BOTH the prior-FAILED delete and any partial order writes",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, deliveryMode, consumer, cartId, product } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu3rollback",
+        nif: "B20000105",
+        stock: 1,
+        quantity: 1,
+      });
+      const intentId = "pi_wu3_rollback";
+      cleanup.providerRefs.push(intentId);
+
+      // Prior FAILED row for the SAME providerRef — the rollback proof below
+      // only holds meaning if this row existed before the webhook fired.
+      await db.payment.create({ data: { providerRef: intentId, status: "FAILED", amount: 7.0 } });
+
+      // Force createOrderFromPayment to throw AFTER the wrapper's deleteMany
+      // has already run inside the SAME $transaction, using a throw that
+      // PASSES the WU3 R4 reconciliation guard (active delivery mode +
+      // matching cartId + matching total, so `recomputeCartTotal` is neither
+      // null nor a mismatch): the product went out of stock between cart-add
+      // and webhook delivery, so `decrementStock` throws InsufficientStockError
+      // deep inside the frozen write — well past step-0's idempotency
+      // pre-check (no *SUCCEEDED* payment exists yet). This is the correct
+      // mechanism to prove tx rollback now that an unresolvable delivery mode
+      // is intercepted by the guard (persisted PENDING) instead of reaching
+      // the transaction at all.
+      await db.product.update({ where: { id: product.id }, data: { stock: 0 } });
+      mockedConstructEvent.mockReturnValueOnce(
+        makeSucceededEvent({
+          intentId,
+          amountCents: 700,
+          userId: consumer.id,
+          cartId,
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        }),
+      );
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+
+      // The delegated write throws (ValidationFailedError) — errorMiddleware
+      // maps it to a non-200 response; the spec scenario asserts DB state.
+      expect(res.status).not.toBe(200);
+
+      // Rollback proof: the prior FAILED row STILL EXISTS — the wrapper's
+      // deleteMany ran inside the SAME now-rolled-back $transaction.
+      const payments = await db.payment.findMany({ where: { providerRef: intentId } });
+      expect(payments).toHaveLength(1);
+      expect(payments[0]?.status).toBe("FAILED");
+
+      const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCount).toBe(0);
+    },
+    20000,
+  );
+});
+
+// ===========================================================================
+// WU3 rework — 4R escalation fixes (money-integrity)
+//
+// [WU3-6] Bug 1: a delayed/reordered payment_intent.payment_failed for a
+//         providerRef that ALREADY has a SUCCEEDED Payment + Order must
+//         NEVER downgrade it — terminal-state guard.
+// [WU3-7] Bug 2a: the recomputed live-cart total no longer matches what
+//         Stripe actually charged -> reconciliation MISMATCH: no Order, no
+//         stock decrement, an auditable PENDING Payment for the CHARGED
+//         amount.
+// [WU3-8] Bug 2b: same reconciliation guard, triggered by a cartId identity
+//         mismatch instead of a total mismatch.
+// ===========================================================================
+
+describe("POST /api/v1/pagos/webhook — delayed FAILED after SUCCEEDED never downgrades [WU3-6]", () => {
+  it(
+    "[WU3-6] a payment_intent.payment_failed arriving AFTER payment_intent.succeeded for the SAME providerRef leaves the Payment SUCCEEDED and the Order intact",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu3downgrade",
+        nif: "B20000106",
+      });
+      const intentId = "pi_wu3_downgrade";
+      cleanup.providerRefs.push(intentId);
+
+      mockedConstructEvent.mockReturnValueOnce(
+        makeSucceededEvent({
+          intentId,
+          amountCents: 700,
+          userId: consumer.id,
+          cartId,
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        }),
+      );
+      const succeededRes = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+      expect(succeededRes.status).toBe(200);
+
+      const orderCountBefore = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCountBefore).toBe(1);
+
+      // A delayed/reordered payment_intent.payment_failed for the SAME
+      // providerRef arrives AFTER the succeeded event already created the
+      // order — this must be a no-op, never a downgrade (Bug 1 fix).
+      mockedConstructEvent.mockReturnValueOnce(makeFailedEvent({ intentId, amountCents: 700 }));
+      const failedRes = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.payment_failed" });
+      expect(failedRes.status).toBe(200);
+
+      const payments = await db.payment.findMany({ where: { providerRef: intentId } });
+      expect(payments).toHaveLength(1);
+      expect(payments[0]?.status).toBe("SUCCEEDED");
+
+      const orderCountAfter = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCountAfter).toBe(1);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — reconciliation guard: charged amount no longer matches the live cart [WU3-7]", () => {
+  it(
+    "[WU3-7] a succeeded event whose recomputed live-cart total does not match intent.amount creates NO Order, does NOT decrement stock, and persists an auditable PENDING Payment for the CHARGED amount",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, deliveryMode, consumer, cartId, product } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu3mismatch",
+        nif: "B20000107",
+        price: 5.0,
+        deliveryCost: 2.0,
+        quantity: 1,
+        stock: 10,
+      });
+      const intentId = "pi_wu3_mismatch_total";
+      cleanup.providerRefs.push(intentId);
+
+      // Live cart total is 5.00 + 2.00 = 7.00 (700 cents) — Stripe charged
+      // 9.99 instead, simulating the cart changing between intent creation
+      // and webhook delivery.
+      mockedConstructEvent.mockReturnValueOnce(
+        makeSucceededEvent({
+          intentId,
+          amountCents: 999,
+          userId: consumer.id,
+          cartId,
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        }),
+      );
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+      expect(res.status).toBe(200);
+
+      const payment = await db.payment.findUnique({ where: { providerRef: intentId } });
+      expect(payment?.status).toBe("PENDING");
+      expect(Number(payment?.amount)).toBe(9.99);
+
+      const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCount).toBe(0);
+
+      const liveProduct = await db.product.findUnique({ where: { id: product.id } });
+      expect(liveProduct?.stock).toBe(10);
+
+      const cartItemCount = await db.cartItem.count({ where: { cart: { userId: consumer.id } } });
+      expect(cartItemCount).toBe(1);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — reconciliation guard: cartId identity mismatch [WU3-8]", () => {
+  it(
+    "[WU3-8] a succeeded event whose metadata.cartId no longer matches the LIVE cart creates NO Order and persists an auditable PENDING Payment",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, deliveryMode, consumer } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu3mismatchcart",
+        nif: "B20000108",
+      });
+      const intentId = "pi_wu3_mismatch_cartid";
+      cleanup.providerRefs.push(intentId);
+
+      // amountCents matches the live cart total (700 = 5.00 + 2.00), but
+      // metadata.cartId does NOT match the LIVE cart's id.
+      mockedConstructEvent.mockReturnValueOnce(
+        makeSucceededEvent({
+          intentId,
+          amountCents: 700,
+          userId: consumer.id,
+          cartId: "cart_id_stale_or_mismatched",
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        }),
+      );
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+      expect(res.status).toBe(200);
+
+      const payment = await db.payment.findUnique({ where: { providerRef: intentId } });
+      expect(payment?.status).toBe("PENDING");
+
+      const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCount).toBe(0);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — reconciliation guard: unverifiable total (delivery mode vanished) [WU3-9]", () => {
+  it(
+    "[WU3-9] a succeeded event whose selected delivery mode no longer resolves (recomputeCartTotal -> null) with a matching cartId persists a PENDING Payment for the CHARGED amount, creates NO Order, does NOT decrement stock, and returns 200 — the charge is NEVER lost",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, consumer, cartId, product } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "wu3cannotverify",
+        nif: "B20000109",
+        price: 5.0,
+        deliveryCost: 2.0,
+        quantity: 1,
+        stock: 10,
+      });
+      const intentId = "pi_wu3_cannot_verify";
+      cleanup.providerRefs.push(intentId);
+
+      // The selected deliveryModeId no longer resolves to any active
+      // DeliveryMode (it was deactivated/deleted after intent creation), so
+      // `recomputeCartTotal` returns null: the charge CANNOT be verified.
+      // cartId still matches, so WITHOUT the WU3 R4 fix the guard is skipped,
+      // the frozen createOrderFromPayment THROWS ValidationFailedError, the
+      // whole $transaction (incl. payment.create) rolls back, and this
+      // CHARGED intent ends with NO Order AND NO Payment row — silent money
+      // loss. The fix routes null through the safety block instead.
+      mockedConstructEvent.mockReturnValueOnce(
+        makeSucceededEvent({
+          intentId,
+          amountCents: 700,
+          userId: consumer.id,
+          cartId,
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: "mode_vanished" }],
+        }),
+      );
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+      expect(res.status).toBe(200);
+
+      // Durable record of the charge for manual reconciliation/refund.
+      const payment = await db.payment.findUnique({ where: { providerRef: intentId } });
+      expect(payment?.status).toBe("PENDING");
+      expect(Number(payment?.amount)).toBe(7.0);
+
+      const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCount).toBe(0);
+
+      const liveProduct = await db.product.findUnique({ where: { id: product.id } });
+      expect(liveProduct?.stock).toBe(10);
     },
     20000,
   );
