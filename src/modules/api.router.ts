@@ -23,6 +23,9 @@
  *   statisticsRouter     — Cycle 2: GET /producers/me/stats/{revenue,order-count,low-stock} (producer)
  *   cartRouter           — Cycle 3: consumer cart CRUD under /carrito (cart-foundation PR #1)
  *   ordersRouter         — Cycle 4: consumer order read surface under /pedidos (orders WU3)
+ *   paymentsRouter       — Cycle 5: POST /pagos/intent (payments WU1 — authenticated
+ *                          Stripe PaymentIntent creation) + POST /pagos/webhook
+ *                          (payments WU2 — unauth, raw-body, signature-verified).
  *
  * Mount order: public routers (categoriesRouter, producersRouter GET /:id) are registered
  * BEFORE auth-gated routers so they are reachable without any auth header.
@@ -40,6 +43,7 @@ import { deliveryModesRouter } from "./delivery-modes/routes/delivery-modes.rout
 import { imagesRouter } from "./images/routes/images.routes";
 import { onboardingRouter } from "./onboarding/routes/onboarding.routes";
 import { ordersRouter } from "./orders/routes/orders.routes";
+import { paymentsRouter } from "./payments/routes/payments.routes";
 import { producersRouter } from "./producers/routes/producers.routes";
 import { productsRouter } from "./products/routes/products.routes";
 import { statisticsRouter } from "./statistics/routes/statistics.routes";
@@ -66,3 +70,4 @@ apiRouter.use(subOrdersRouter);
 apiRouter.use(statisticsRouter);
 apiRouter.use(cartRouter);
 apiRouter.use(ordersRouter);
+apiRouter.use(paymentsRouter);

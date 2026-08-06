@@ -44,7 +44,10 @@ export type ErrorCode =
   | "NOT_IMPLEMENTED"
   // Cycle 4 additions — orders slice (consumer-purchase-flow 2/3)
   | "EMPTY_CART_CHECKOUT"
-  | "CART_ITEM_NOT_AVAILABLE";
+  | "CART_ITEM_NOT_AVAILABLE"
+  // Cycle 5 additions — payments slice (consumer-purchase-flow 3/3)
+  | "PAYMENT_INTENT_CREATION_FAILED"
+  | "WEBHOOK_SIGNATURE_INVALID";
 
 export interface ProblemDetails {
   type: string;

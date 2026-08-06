@@ -10,6 +10,14 @@ const EnvSchema = z
     LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
     CORS_ORIGIN: z.string().default("*"),
     S3_PUBLIC_BASE_URL: z.string().url().min(1),
+    // Cycle 5 — payments slice (consumer-purchase-flow 3/3). Server-side Stripe
+    // secret key used exclusively by src/modules/payments/services/stripe.client.ts
+    // to construct the SDK client. Never sent to the browser.
+    STRIPE_SECRET_KEY: z.string().min(1),
+    // Cycle 5 WU2 — Stripe webhook signing secret ("whsec_..."), used ONLY by
+    // payments.service.ts's `verifyWebhookSignature` to verify the raw request
+    // body signature on POST /pagos/webhook (design Decision 2, spec R6).
+    STRIPE_WEBHOOK_SECRET: z.string().min(1),
   })
   .superRefine((v, ctx) => {
     // Positive check: fail-closed when NODE_ENV === "production" and URL is not HTTPS.

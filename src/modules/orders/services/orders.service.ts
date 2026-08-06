@@ -81,7 +81,7 @@ type DecimalValue = InstanceType<typeof PrismaValue.Decimal>;
 
 export type OrderStatusValue = "PENDING" | "PARTIAL" | "FULFILLED" | "CANCELLED";
 export type SubOrderStatusValue = "pending" | "preparing" | "sent" | "delivered" | "cancelled";
-export type PaymentStatusValue = "PENDING" | "SUCCEEDED" | "FAILED" | "REFUNDED";
+export type PaymentStatusValue = "PENDING" | "SUCCEEDED" | "FAILED" | "CANCELED" | "REFUNDED";
 
 export interface DeliverySelection {
   producerId: string;
@@ -243,8 +243,15 @@ function mapExistingOrderDetailView(
  *   4. Compute totals with `Prisma.Decimal`, from the cart snapshot + the
  *       step-3a maps, BEFORE any create call.
  *   5. `payment.create` then `order.create`, both persisting the step-4 total.
- *   6. Group items by producer -> one `subOrder.create` each, retaining each
- *       created id in `subOrderIdByProducer`.
+ *   5b. (checkout-contracts BE-3, design Fork 4 — ADDITIVE, does not reorder
+ *       0-9 above) ONE `pendingCheckout.findUnique({ providerRef })` read —
+ *       the immutable address snapshot `payments.service.ts` wrote at
+ *       intent-creation time. `null` when no matching row exists (all-pickup
+ *       checkout, or a webhook-only caller with no prior intent).
+ *   6. Group items by producer -> one `subOrder.create` each, copying the
+ *       step-5b snapshot into `shipTo*` for `SHIPPING_FLAT_RATE` producers
+ *       only (PICKUP stays null), retaining each created id in
+ *       `subOrderIdByProducer`.
  *   7. One `orderLine.create` per item, `unitPriceSnapshot` copied AS-IS from
  *       the cart snapshot, `subOrderId` resolved via `subOrderIdByProducer`.
  *   8. `decrementStock(productId, quantity, tx)` per line (frozen contract).
@@ -411,6 +418,19 @@ export async function createOrderFromPayment(
     },
   });
 
+  // Step 5b (checkout-contracts BE-3, design Fork 4): resolve the immutable
+  // address snapshot ONCE — looked up by `providerRef` (set by
+  // `payments.service.ts` right after Stripe returns the PaymentIntent id,
+  // BEFORE this transaction ever runs). `null` when no matching row exists
+  // (an all-pickup checkout never needed one, or this is a webhook-only
+  // test double with no prior intent-creation call) — Step 6 below then
+  // writes no `shipTo*` content for any producer, matching PICKUP behavior.
+  // The mutable `Address` row is NEVER read here (assumption #4) — only
+  // this durable, pre-webhook snapshot.
+  const pendingCheckout = await tx.pendingCheckout.findUnique({
+    where: { providerRef: stripeIntentId },
+  });
+
   // Step 6: group items by producer -> one SubOrder each; retain created ids.
   const itemsByProducer = new Map<string, CartItemForCheckout[]>();
   for (const item of cartView.items) {
@@ -422,12 +442,27 @@ export async function createOrderFromPayment(
   const subOrderIdByProducer = new Map<string, string>();
   const subOrderStatusByProducer = new Map<string, SubOrderStatusValue>();
   for (const producerId of itemsByProducer.keys()) {
+    const deliveryModeId = deliveryModeByProducer.get(producerId)!;
+    // Snapshot flows to SHIPPING_FLAT_RATE SubOrders only (spec "Snapshot
+    // flows to shipping SubOrders only") — PICKUP SubOrders leave every
+    // `shipTo*` column null, matching the schema default.
+    const isShippingProducer = modesById.get(deliveryModeId)?.type === "SHIPPING_FLAT_RATE";
     const subOrder = await tx.subOrder.create({
       data: {
         orderId: order.id,
         producerId,
-        deliveryModeId: deliveryModeByProducer.get(producerId)!,
+        deliveryModeId,
         shippingCostSnapshot: shippingByProducer.get(producerId)!,
+        ...(isShippingProducer && pendingCheckout
+          ? {
+              shipToLine1: pendingCheckout.addressLine1,
+              shipToLine2: pendingCheckout.addressLine2,
+              shipToCity: pendingCheckout.addressCity,
+              shipToPostalCode: pendingCheckout.addressPostalCode,
+              shipToProvince: pendingCheckout.addressProvince,
+              shipToCountry: pendingCheckout.addressCountry,
+            }
+          : {}),
       },
     });
     subOrderIdByProducer.set(producerId, subOrder.id);

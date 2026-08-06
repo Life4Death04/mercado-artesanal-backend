@@ -275,3 +275,30 @@ export class CartItemNotAvailableError extends AppError {
   readonly status = 409;
   readonly title = "Cart item not available";
 }
+
+// ===========================================================================
+// Cycle 5 additions — payments slice (consumer-purchase-flow 3/3)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 502 — the Stripe PaymentIntent creation call fails or rejects.
+//       No local state is written; detail MUST NOT leak Stripe internals.
+// ---------------------------------------------------------------------------
+
+export class PaymentIntentCreationError extends AppError {
+  readonly code = "PAYMENT_INTENT_CREATION_FAILED" as const;
+  readonly status = 502;
+  readonly title = "Payment intent creation failed";
+}
+
+// ---------------------------------------------------------------------------
+// 400 — POST /pagos/webhook signature verification fails (missing header or
+//       Stripe HMAC mismatch over the raw body). Zero DB writes on this path
+//       (payments.service.ts verifies BEFORE any event dispatch).
+// ---------------------------------------------------------------------------
+
+export class WebhookSignatureError extends AppError {
+  readonly code = "WEBHOOK_SIGNATURE_INVALID" as const;
+  readonly status = 400;
+  readonly title = "Webhook signature invalid";
+}
