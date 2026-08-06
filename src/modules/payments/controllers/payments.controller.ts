@@ -45,7 +45,7 @@ import * as paymentsService from "../services/payments.service";
 export async function createIntent(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const body = validateBody(CreatePaymentIntentSchema, req.body);
-    const result = await paymentsService.createPaymentIntent(req.user!.id, body.deliverySelections);
+    const result = await paymentsService.createPaymentIntent(req.user!.id, body.deliverySelections, body.addressId);
     res.status(201).json(result);
   } catch (err) {
     next(err);
