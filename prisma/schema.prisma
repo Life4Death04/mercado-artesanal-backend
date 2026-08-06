@@ -301,18 +301,62 @@ model DeliveryMode {
 /// idempotency backstop: a second createOrderFromPayment call for the same
 /// Stripe intent rejects with P2002 on tx.payment.create, letting the caller's
 /// fresh-transaction retry recover idempotently via the providerRef pre-check.
+/// userId is nullable (checkout-contracts WU1, design Fork 2) — additive
+/// ownership column so BE-2 (`GET /pagos/status/:paymentIntentId`) can
+/// authorize with a single `findFirst({ providerRef, userId })` predicate
+/// across all five payment states, including plain SUCCEEDED/FAILED rows
+/// that have no Order to join through. Set at every write point that
+/// already knows the user: `createOrderFromPayment` (cartView.userId) and
+/// `upsertNonTerminalPayment` (threaded from intent.metadata.userId).
 model Payment {
   id          String        @id @default(cuid())
   status      PaymentStatus @default(PENDING)
   amount      Decimal       @db.Decimal(10, 2)
   currency    String        @default("EUR")
   providerRef String?       @unique @map("provider_ref")
+  userId      String?       @map("user_id")
   createdAt   DateTime      @default(now()) @map("created_at")
   updatedAt   DateTime      @updatedAt @map("updated_at")
 
   order Order?
 
+  @@index([userId])
   @@map("payments")
+}
+
+/// Immutable pre-webhook checkout snapshot (checkout-contracts WU1, design
+/// Fork 1/Fork 4). Content columns — NOT a foreign key to Address — snapshot
+/// the selected Address at `POST /pagos/intent` time so a later profile edit
+/// (`PATCH /users/me/addresses/:id` mutates in place) or a Stripe replay can
+/// never alter a recorded order. `fingerprint` reuses the SAME sha256
+/// idempotency key already computed for the Stripe PaymentIntent call
+/// (payments.service.ts) — a genuine retry reuses the row via upsert-by-
+/// fingerprint; a changed cart yields a new fingerprint.
+///
+/// `providerRef` (nullable, unique) is set right after Stripe returns the
+/// PaymentIntent id, BEFORE any `Payment` row exists. This is what lets BE-2
+/// report owner-scoped PROCESSING for an intent that has no persisted
+/// `Payment` row yet: BE-2 can resolve ownership via
+/// `PendingCheckout.findFirst({ providerRef, userId })` without a live
+/// Stripe read (see design "CANCELED detection" / Fork 3, and Engram
+/// discovery `sdd/checkout-contracts/payment-status-processing-ambiguity`).
+/// No relation to `User` is declared here (no FK) — additive/non-destructive
+/// by design; ownership is enforced at the query layer only.
+model PendingCheckout {
+  id                String   @id @default(cuid())
+  fingerprint       String   @unique
+  providerRef       String?  @unique @map("provider_ref")
+  userId            String   @map("user_id")
+  addressLine1      String   @map("address_line1")
+  addressLine2      String?  @map("address_line2")
+  addressCity       String   @map("address_city")
+  addressPostalCode String   @map("address_postal_code")
+  addressProvince   String   @map("address_province")
+  addressCountry    String   @default("ES") @map("address_country")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("pending_checkouts")
 }
 
 /// Aggregate consumer order. One Order → N SubOrders (one per producer).
@@ -341,6 +385,14 @@ model Order {
 /// trackingNumber MUST remain null in Cycle 2 — settable only after COURIER mode ships (RF-21).
 /// shippingCostSnapshot is written by Cycle 3 checkout from DeliveryMode.cost at order time.
 /// Idempotent PATCH: if current.status === target, return current with no UPDATE issued.
+///
+/// shipTo* (checkout-contracts WU1, design Fork 4) — immutable address
+/// snapshot, written ONCE at `createOrderFromPayment` step 6 for
+/// SHIPPING_FLAT_RATE producers only (copied from the matching
+/// `PendingCheckout` row); PICKUP SubOrders leave every shipTo* column null.
+/// Mirrors the `shippingCostSnapshot` immutability precedent exactly — never
+/// updated after insert, so a later profile address edit cannot alter an
+/// already-placed order.
 model SubOrder {
   id                   String         @id @default(cuid())
   orderId              String         @map("order_id")
@@ -349,6 +401,12 @@ model SubOrder {
   status               SubOrderStatus @default(pending)
   shippingCostSnapshot Decimal        @map("shipping_cost_snapshot") @db.Decimal(10, 2)
   trackingNumber       String?        @map("tracking_number")
+  shipToLine1          String?        @map("ship_to_line1")
+  shipToLine2          String?        @map("ship_to_line2")
+  shipToCity           String?        @map("ship_to_city")
+  shipToPostalCode     String?        @map("ship_to_postal_code")
+  shipToProvince       String?        @map("ship_to_province")
+  shipToCountry        String?        @map("ship_to_country")
   createdAt            DateTime       @default(now()) @map("created_at")
   updatedAt            DateTime       @updatedAt @map("updated_at")
 
