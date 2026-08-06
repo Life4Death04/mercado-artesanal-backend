@@ -41,9 +41,16 @@ export const DeliverySelectionSchema = strictObject({
  *   deliverySelections — array of DeliverySelectionSchema (bijection against
  *     the caller's cart is enforced in the service layer, not here — Zod
  *     cannot see the cart).
+ *   addressId — ADDITIVE, optional at the schema level (checkout-contracts
+ *     BE-3, design Fork 1). The SERVICE (not this schema) enforces it is
+ *     required WHEN any selected DeliveryMode.type is SHIPPING_FLAT_RATE,
+ *     and ignored for an all-pickup cart — Zod cannot see the resolved
+ *     delivery modes. The schema stays `strictObject`: this is a new
+ *     optional field, not a shape relaxation.
  */
 export const CreatePaymentIntentSchema = strictObject({
   deliverySelections: z.array(DeliverySelectionSchema),
+  addressId: z.string().min(1, "addressId must not be empty").optional(),
 });
 
 export type CreatePaymentIntentBody = z.infer<typeof CreatePaymentIntentSchema>;

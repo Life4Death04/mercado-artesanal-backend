@@ -210,6 +210,14 @@ function makeMockTx(overrides: Record<string, any> = {}) {
       findMany: vi.fn().mockResolvedValue([makeLiveCartItemRow()]),
       deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
+    // checkout-contracts WU4 (BE-3, design Fork 4): step 5b reads the
+    // immutable address snapshot by providerRef. `null` here matches every
+    // pre-existing CO-* fixture below (none selects a SHIPPING_FLAT_RATE
+    // `type` on `makeDeliveryModeRow()`), so no `shipTo*` content is ever
+    // attempted and no existing assertion changes.
+    pendingCheckout: {
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
     ...overrides,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any;
@@ -697,6 +705,104 @@ describe("ordersService.createOrderFromPayment — maps for shipping/deliveryMod
     const orderLineCallB = tx.orderLine.create.mock.calls.find((c: any) => c[0].data.productId === "product_B")![0];
     expect(orderLineCallA.data.subOrderId).toBe(subOrderViewA.id);
     expect(orderLineCallB.data.subOrderId).toBe(subOrderViewB.id);
+  });
+});
+
+describe("ordersService.createOrderFromPayment — BE-3 shipTo* snapshot copy [CO-SHIPTO]", () => {
+  it("[CO-SHIPTO-MIXED] copies the PendingCheckout snapshot into SHIPPING_FLAT_RATE SubOrders only; PICKUP stays untouched", async () => {
+    const shippingItem = makeCartItemForCheckout({
+      cartItemId: "item_ship",
+      productId: "product_ship",
+      producerId: "producer_ship",
+      quantity: 1,
+      unitPriceSnapshot: "5.00",
+    });
+    const pickupItem = makeCartItemForCheckout({
+      cartItemId: "item_pick",
+      productId: "product_pick",
+      producerId: "producer_pick",
+      quantity: 1,
+      unitPriceSnapshot: "3.00",
+    });
+
+    const snapshot = {
+      addressLine1: "Calle Test 1",
+      addressLine2: null,
+      addressCity: "Madrid",
+      addressPostalCode: "28001",
+      addressProvince: "Madrid",
+      addressCountry: "ES",
+    };
+
+    const tx = makeMockTx({
+      cartItem: {
+        findMany: vi.fn().mockResolvedValue([
+          makeLiveCartItemRow({
+            id: "item_ship",
+            productId: "product_ship",
+            product: { id: "product_ship", isActive: true, deletedAt: null, producer: { id: "producer_ship", deletedAt: null } },
+          }),
+          makeLiveCartItemRow({
+            id: "item_pick",
+            productId: "product_pick",
+            product: { id: "product_pick", isActive: true, deletedAt: null, producer: { id: "producer_pick", deletedAt: null } },
+          }),
+        ]),
+        deleteMany: vi.fn().mockResolvedValue({ count: 2 }),
+      },
+      deliveryMode: {
+        findMany: vi.fn().mockResolvedValue([
+          makeDeliveryModeRow({ id: "dm_ship", producerId: "producer_ship", type: "SHIPPING_FLAT_RATE", cost: new Prisma.Decimal("2.00") }),
+          makeDeliveryModeRow({ id: "dm_pick", producerId: "producer_pick", type: "PICKUP", cost: new Prisma.Decimal("0.00") }),
+        ]),
+      },
+      pendingCheckout: {
+        findUnique: vi.fn().mockResolvedValue(snapshot),
+      },
+    });
+
+    const cartView = makeCartView([shippingItem, pickupItem]);
+    await ordersService.createOrderFromPayment(
+      "pi_shipto",
+      cartView,
+      [
+        { producerId: "producer_ship", deliveryModeId: "dm_ship" },
+        { producerId: "producer_pick", deliveryModeId: "dm_pick" },
+      ],
+      tx,
+    );
+
+    expect(tx.pendingCheckout.findUnique).toHaveBeenCalledWith({ where: { providerRef: "pi_shipto" } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const shipCall = tx.subOrder.create.mock.calls.find((c: any) => c[0].data.producerId === "producer_ship")![0];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pickCall = tx.subOrder.create.mock.calls.find((c: any) => c[0].data.producerId === "producer_pick")![0];
+
+    expect(shipCall.data.shipToLine1).toBe("Calle Test 1");
+    expect(shipCall.data.shipToCity).toBe("Madrid");
+    expect(shipCall.data.shipToPostalCode).toBe("28001");
+    expect(pickCall.data.shipToLine1).toBeUndefined();
+    expect(pickCall.data.shipToCity).toBeUndefined();
+  });
+
+  it("[CO-SHIPTO-NO-SNAPSHOT] a null PendingCheckout (no prior intent) writes no shipTo* content even for a shipping producer", async () => {
+    const tx = makeMockTx({
+      deliveryMode: {
+        findMany: vi.fn().mockResolvedValue([makeDeliveryModeRow({ type: "SHIPPING_FLAT_RATE" })]),
+      },
+      // pendingCheckout.findUnique already defaults to null in makeMockTx().
+    });
+    const cartView = makeCartView([makeCartItemForCheckout()]);
+
+    await ordersService.createOrderFromPayment(
+      "pi_no_snapshot",
+      cartView,
+      [{ producerId: "producer_A", deliveryModeId: "dm_A" }],
+      tx,
+    );
+
+    const call = tx.subOrder.create.mock.calls[0]![0];
+    expect(call.data.shipToLine1).toBeUndefined();
   });
 });
 

@@ -78,6 +78,10 @@ vi.mock("@/shared/utils/prisma", () => ({
       updateMany: vi.fn(),
       create: vi.fn(),
     },
+    // checkout-contracts WU4 (BE-3) — addressId ownership resolution.
+    address: {
+      findFirst: vi.fn(),
+    },
   },
 }));
 
@@ -126,6 +130,8 @@ const mockedGetCartForCheckout = vi.mocked(getCartForCheckout);
 const mockedDeliveryMode = vi.mocked(prisma).deliveryMode as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedPendingCheckout = vi.mocked(prisma).pendingCheckout as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedAddress = vi.mocked(prisma).address as any;
 const mockedCreatePaymentIntent = vi.mocked(stripeClient.createPaymentIntent);
 
 // ---------------------------------------------------------------------------
@@ -487,5 +493,143 @@ describe("payments.service.createPaymentIntent", () => {
     expect(mockedPendingCheckout.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: expect.objectContaining({ userId: "user_001" }), data: { providerRef: "pi_999" } }),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkout-contracts WU4 (BE-3) — additive addressId, ownership, snapshot
+// upsert (spec BE3-R1/BE3-R2/BE3-R3; design Fork 1). `makeDeliveryModeRow()`
+// has no `type` field by default (undefined !== "SHIPPING_FLAT_RATE"), so
+// every PRE-EXISTING test above this block is unaffected by the new
+// required-when-shipping gate — only tests that explicitly pass
+// `type: "SHIPPING_FLAT_RATE"` below exercise it.
+// ---------------------------------------------------------------------------
+
+function makeAddressRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "addr_A",
+    userId: "user_001",
+    line1: "Calle Envio 1",
+    line2: null,
+    city: "Valencia",
+    postalCode: "46001",
+    province: "Valencia",
+    country: "ES",
+    isDefault: true,
+    deletedAt: null,
+    ...overrides,
+  };
+}
+
+describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
+  it("[CPI-ADDR-REQUIRED] shipping selection without addressId -> ValidationFailedError, no address lookup, no Stripe call", async () => {
+    mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView([makeCartItem()]));
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([
+      makeDeliveryModeRow({ type: "SHIPPING_FLAT_RATE" }),
+    ]);
+
+    await expect(
+      paymentsService.createPaymentIntent("user_001", [makeSelection()]),
+    ).rejects.toBeInstanceOf(ValidationFailedError);
+    expect(mockedAddress.findFirst).not.toHaveBeenCalled();
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("[CPI-ADDR-PICKUP-IGNORED] pickup-only selection with a supplied addressId -> ignored, no address lookup, no snapshot content written", async () => {
+    mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView([makeCartItem()]));
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryModeRow({ type: "PICKUP" })]);
+    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_pickup", client_secret: "secret_pickup" });
+
+    const result = await paymentsService.createPaymentIntent(
+      "user_001",
+      [makeSelection()],
+      "addr_supplied_but_ignored",
+    );
+
+    expect(result).toEqual({ clientSecret: "secret_pickup" });
+    expect(mockedAddress.findFirst).not.toHaveBeenCalled();
+    expect(mockedPendingCheckout.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        addressLine1: "",
+        addressLine2: null,
+        addressCity: "",
+        addressPostalCode: "",
+        addressProvince: "",
+      }),
+    });
+    const createCallData = mockedPendingCheckout.create.mock.calls[0]?.[0]?.data;
+    expect(createCallData).not.toHaveProperty("addressCountry");
+  });
+
+  it("[CPI-ADDR-OWNERSHIP] addressId resolves to null (unknown or not owned) -> ValidationFailedError, no Stripe call", async () => {
+    mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView([makeCartItem()]));
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([
+      makeDeliveryModeRow({ type: "SHIPPING_FLAT_RATE" }),
+    ]);
+    mockedAddress.findFirst.mockResolvedValueOnce(null);
+
+    await expect(
+      paymentsService.createPaymentIntent("user_001", [makeSelection()], "addr_not_owned"),
+    ).rejects.toBeInstanceOf(ValidationFailedError);
+    expect(mockedAddress.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "addr_not_owned", userId: "user_001", deletedAt: null },
+      }),
+    );
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("[CPI-ADDR-SNAPSHOT] shipping selection with a valid, owned addressId -> snapshot content copied verbatim into the PendingCheckout create call", async () => {
+    mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView([makeCartItem()]));
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([
+      makeDeliveryModeRow({ type: "SHIPPING_FLAT_RATE" }),
+    ]);
+    mockedAddress.findFirst.mockResolvedValueOnce(
+      makeAddressRow({ line1: "Avenida Real 42", line2: "Piso 3", city: "Alicante", postalCode: "03001", province: "Alicante", country: "ES" }),
+    );
+    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_shipping", client_secret: "secret_shipping" });
+
+    const result = await paymentsService.createPaymentIntent("user_001", [makeSelection()], "addr_owned");
+
+    expect(result).toEqual({ clientSecret: "secret_shipping" });
+    expect(mockedPendingCheckout.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        addressLine1: "Avenida Real 42",
+        addressLine2: "Piso 3",
+        addressCity: "Alicante",
+        addressPostalCode: "03001",
+        addressProvince: "Alicante",
+        addressCountry: "ES",
+      }),
+    });
+  });
+
+  // R1-001/R3-001 correction (review-bf06f52e2bf5b337): the idempotency
+  // fingerprint previously excluded addressId, so a repeat shipping intent
+  // for the SAME cart/total/delivery but a DIFFERENT owned address collided
+  // on the fingerprint and the stale first address survived. addressId is
+  // now part of the fingerprint payload — a different owned address MUST
+  // yield a different idempotencyKey.
+  it("[CPI-ADDR-FINGERPRINT-DIFF] same cart/cartId/deliverySelections but a different owned addressId -> different idempotencyKey", async () => {
+    mockedGetCartForCheckout.mockResolvedValue(makeCartView([makeCartItem()], { cartId: "cart_XYZ" }));
+    mockedDeliveryMode.findMany.mockResolvedValue([makeDeliveryModeRow({ type: "SHIPPING_FLAT_RATE" })]);
+    mockedAddress.findFirst.mockResolvedValueOnce(makeAddressRow({ id: "addr_A" }));
+    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_addr_A", client_secret: "secret_addr_A" });
+
+    await paymentsService.createPaymentIntent("user_001", [makeSelection()], "addr_A");
+
+    mockedAddress.findFirst.mockResolvedValueOnce(makeAddressRow({ id: "addr_B", line1: "Otra Calle 9", city: "Sevilla" }));
+    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_addr_B", client_secret: "secret_addr_B" });
+
+    await paymentsService.createPaymentIntent("user_001", [makeSelection()], "addr_B");
+
+    const firstKey = mockedCreatePaymentIntent.mock.calls[0]?.[0]?.idempotencyKey;
+    const secondKey = mockedCreatePaymentIntent.mock.calls[1]?.[0]?.idempotencyKey;
+    expect(firstKey).toBeTruthy();
+    expect(secondKey).not.toBe(firstKey);
   });
 });
