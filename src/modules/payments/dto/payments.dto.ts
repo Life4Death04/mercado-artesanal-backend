@@ -48,6 +48,14 @@ export const CreatePaymentIntentSchema = strictObject({
 
 export type CreatePaymentIntentBody = z.infer<typeof CreatePaymentIntentSchema>;
 
+export type PaymentProcessingState = "PROCESSING" | "SUCCEEDED" | "FAILED" | "PENDING" | "CANCELED";
+
+export interface PaymentStatusView {
+  state: PaymentProcessingState;
+  orderId: string | null;
+  code: string;
+}
+
 // ---------------------------------------------------------------------------
 // D1 — compact deliverySelections metadata guard
 // ---------------------------------------------------------------------------

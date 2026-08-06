@@ -68,6 +68,7 @@ import {
   deserializeDeliverySelectionsFromMetadata,
   serializeDeliverySelectionsForMetadata,
 } from "../dto/payments.dto";
+import type { PaymentStatusView } from "../dto/payments.dto";
 
 import { centsToEuros, stripeClient } from "./stripe.client";
 import type { StripeClient, StripeEvent, StripePaymentIntentObject } from "./stripe.client";
@@ -77,6 +78,40 @@ type DeliveryModeRow = { id: string; producerId: string; isActive: boolean; cost
 
 export interface PaymentIntentResult {
   clientSecret: string;
+}
+
+export async function getPaymentStatus(userId: string, paymentIntentId: string): Promise<PaymentStatusView | null> {
+  const payment = await prisma.payment.findFirst({
+    where: { providerRef: paymentIntentId, userId },
+    include: { order: { select: { id: true } } },
+  });
+
+  if (!payment) {
+    const pendingCheckout = await prisma.pendingCheckout.findFirst({
+      where: { providerRef: paymentIntentId, userId },
+      select: { id: true },
+    });
+    if (pendingCheckout) {
+      return { state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" };
+    }
+    return null;
+  }
+
+  if (payment.status === "SUCCEEDED") {
+    return payment.order
+      ? { state: "SUCCEEDED", orderId: payment.order.id, code: "PAYMENT_SUCCEEDED" }
+      : { state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" };
+  }
+  if (payment.status === "FAILED") {
+    return { state: "FAILED", orderId: null, code: "PAYMENT_FAILED" };
+  }
+  if (payment.status === "CANCELED") {
+    return { state: "CANCELED", orderId: null, code: "PAYMENT_CANCELED" };
+  }
+  if (payment.status === "PENDING") {
+    return { state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" };
+  }
+  return { state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" };
 }
 
 /**
@@ -233,6 +268,38 @@ export async function createPaymentIntent(
         deliverySelections: deliverySelectionsMetadata,
       },
     });
+    // Bind an existing WU4 snapshot when present; until then, create the
+    // fingerprint-bound ownership row needed for owner-scoped PROCESSING.
+    const updated = await prisma.pendingCheckout.updateMany({
+      where: { fingerprint: idempotencyKey, userId },
+      data: { providerRef: intent.id },
+    });
+    if (updated.count === 0) {
+      try {
+        await prisma.pendingCheckout.create({
+          data: {
+            fingerprint: idempotencyKey,
+            providerRef: intent.id,
+            userId,
+            addressLine1: "",
+            addressCity: "",
+            addressPostalCode: "",
+            addressProvince: "",
+          },
+        });
+      } catch (err) {
+        if (!isUniqueConstraintViolation(err)) {
+          throw err;
+        }
+        const raced = await prisma.pendingCheckout.updateMany({
+          where: { fingerprint: idempotencyKey, userId },
+          data: { providerRef: intent.id },
+        });
+        if (raced.count === 0) {
+          throw err;
+        }
+      }
+    }
     return { clientSecret: intent.client_secret };
   } catch (err) {
     throw new PaymentIntentCreationError("Failed to create payment intent", err);
@@ -291,6 +358,9 @@ async function dispatchWebhookEvent(event: StripeEvent): Promise<void> {
       return;
     case "payment_intent.payment_failed":
       await handleFailedEvent(event);
+      return;
+    case "payment_intent.canceled":
+      await handleCanceledEvent(event);
       return;
     default:
       return;
@@ -357,12 +427,13 @@ function isUniqueConstraintViolation(err: unknown): boolean {
  */
 async function upsertNonTerminalPayment(
   providerRef: string,
-  status: "FAILED" | "PENDING",
+  status: "FAILED" | "PENDING" | "CANCELED",
   amount: DecimalValue,
+  userId: string | undefined,
 ): Promise<void> {
   const updated = await prisma.payment.updateMany({
-    where: { providerRef, status: { not: "SUCCEEDED" } },
-    data: { status, amount },
+    where: { providerRef, status: { notIn: ["SUCCEEDED", "CANCELED"] } },
+    data: { status, amount, userId },
   });
   if (updated.count > 0) {
     return;
@@ -376,18 +447,17 @@ async function upsertNonTerminalPayment(
   }
 
   try {
-    await prisma.payment.create({ data: { providerRef, status, amount } });
+    await prisma.payment.create({ data: { providerRef, status, amount, userId } });
   } catch (err) {
     if (!isUniqueConstraintViolation(err)) {
       throw err;
     }
     // Race: a concurrent event created the row between the check above and
-    // this create — retry the update-only path once; if that row turned out
-    // to be SUCCEEDED in the meantime, the `not: "SUCCEEDED"` where clause
-    // makes this a safe no-op instead of a downgrade.
+    // this create — retry the update-only path once. Terminal SUCCEEDED and
+    // CANCELED rows remain safe no-ops instead of being downgraded.
     await prisma.payment.updateMany({
-      where: { providerRef, status: { not: "SUCCEEDED" } },
-      data: { status, amount },
+      where: { providerRef, status: { notIn: ["SUCCEEDED", "CANCELED"] } },
+      data: { status, amount, userId },
     });
   }
 }
@@ -405,7 +475,13 @@ async function upsertNonTerminalPayment(
 async function handleFailedEvent(event: StripeEvent): Promise<void> {
   const intent = extractPaymentIntentPayload(event);
   const amount = new PrismaValue.Decimal(centsToEuros(intent.amount));
-  await upsertNonTerminalPayment(intent.id, "FAILED", amount);
+  await upsertNonTerminalPayment(intent.id, "FAILED", amount, intent.metadata?.["userId"]);
+}
+
+async function handleCanceledEvent(event: StripeEvent): Promise<void> {
+  const intent = extractPaymentIntentPayload(event);
+  const amount = new PrismaValue.Decimal(centsToEuros(intent.amount));
+  await upsertNonTerminalPayment(intent.id, "CANCELED", amount, intent.metadata?.["userId"]);
 }
 
 /**
@@ -547,7 +623,7 @@ async function handleSucceededEvent(event: StripeEvent): Promise<void> {
       // refused charge (`FAILED`). `upsertNonTerminalPayment` also guards
       // against downgrading an already-SUCCEEDED row on a replayed
       // mismatch event.
-      await upsertNonTerminalPayment(intent.id, "PENDING", chargedAmount);
+      await upsertNonTerminalPayment(intent.id, "PENDING", chargedAmount, userId);
       // Intentional loud audit signal — this module has no structured
       // logger yet; `no-console` is not enforced by this project's ESLint
       // config, so no disable directive is needed here.
@@ -576,7 +652,9 @@ async function handleSucceededEvent(event: StripeEvent): Promise<void> {
   const attempt = (): Promise<OrderDetailView> =>
     prisma.$transaction(async (tx) => {
       await tx.payment.deleteMany({ where: { providerRef: intent.id, status: "FAILED" } });
-      return createOrderFromPayment(intent.id, cartView, deliverySelections, tx);
+      const order = await createOrderFromPayment(intent.id, cartView, deliverySelections, tx);
+      await tx.payment.updateMany({ where: { providerRef: intent.id }, data: { userId } });
+      return order;
     });
 
   try {

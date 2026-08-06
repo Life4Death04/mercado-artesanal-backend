@@ -196,6 +196,7 @@ export async function cleanupPaymentsFixtures(db: PrismaClient, cleanup: Payment
   await db.subOrder.deleteMany({ where: { order: { userId: { in: cleanup.userIds } } } });
   await db.order.deleteMany({ where: { userId: { in: cleanup.userIds } } });
   await db.payment.deleteMany({ where: { providerRef: { in: cleanup.providerRefs } } });
+  await db.pendingCheckout.deleteMany({ where: { userId: { in: cleanup.userIds } } });
 
   await db.cartItem.deleteMany({ where: { cart: { userId: { in: cleanup.userIds } } } });
   await db.cart.deleteMany({ where: { userId: { in: cleanup.userIds } } });

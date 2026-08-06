@@ -74,6 +74,10 @@ vi.mock("@/shared/utils/prisma", () => ({
     deliveryMode: {
       findMany: vi.fn(),
     },
+    pendingCheckout: {
+      updateMany: vi.fn(),
+      create: vi.fn(),
+    },
   },
 }));
 
@@ -120,6 +124,8 @@ import * as paymentsService from "@/modules/payments/services/payments.service";
 const mockedGetCartForCheckout = vi.mocked(getCartForCheckout);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedDeliveryMode = vi.mocked(prisma).deliveryMode as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedPendingCheckout = vi.mocked(prisma).pendingCheckout as any;
 const mockedCreatePaymentIntent = vi.mocked(stripeClient.createPaymentIntent);
 
 // ---------------------------------------------------------------------------
@@ -170,6 +176,7 @@ function makeSelection(overrides: Partial<DeliverySelection> = {}): DeliverySele
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockedPendingCheckout.updateMany.mockResolvedValue({ count: 1 });
 });
 
 // ---------------------------------------------------------------------------
@@ -477,5 +484,8 @@ describe("payments.service.createPaymentIntent", () => {
     const result = await paymentsService.createPaymentIntent("user_001", [makeSelection()]);
 
     expect(result).toEqual({ clientSecret: "secret_999" });
+    expect(mockedPendingCheckout.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ userId: "user_001" }), data: { providerRef: "pi_999" } }),
+    );
   });
 });
