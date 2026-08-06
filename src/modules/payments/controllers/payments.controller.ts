@@ -34,6 +34,7 @@ import type { NextFunction, Request, Response } from "express";
 
 import { validateBody } from "@/shared/validation/zod";
 
+import * as deliveryModesService from "../../delivery-modes/services/delivery-modes.service";
 import { CreatePaymentIntentSchema } from "../dto/payments.dto";
 import * as paymentsService from "../services/payments.service";
 
@@ -46,6 +47,20 @@ export async function createIntent(req: Request, res: Response, next: NextFuncti
     const body = validateBody(CreatePaymentIntentSchema, req.body);
     const result = await paymentsService.createPaymentIntent(req.user!.id, body.deliverySelections);
     res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** GET /api/v1/pagos/delivery-modes — active checkout options by cart producer. */
+export async function getDeliveryModes(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const deliveryModes = await deliveryModesService.findActiveForCartProducers(req.user!.id);
+    res.status(200).json(deliveryModes);
   } catch (err) {
     next(err);
   }
