@@ -1120,3 +1120,158 @@ describe("POST /api/v1/pagos/webhook — reconciliation guard: unverifiable tota
     20000,
   );
 });
+
+// ===========================================================================
+// [WU1] checkout-contracts additive migration — schema-inspection coverage
+// (Cycle 5 checkout-contracts WU1: nullable `Payment.userId`, six nullable
+// `SubOrder.shipTo*` columns, new `PendingCheckout` table with a unique
+// `fingerprint` and a unique `providerRef` correlation column).
+//
+// These assertions inspect the REAL Postgres information_schema after
+// `prisma migrate deploy` — they do not exercise any HTTP route or service
+// (none exists yet for WU1). They exist to prove the migration itself is
+// additive/nullable and structurally correct BEFORE any WU2/WU3/WU4 code
+// reads or writes these columns.
+//
+// Spec references: BE2-R1 (payment-status ownership — design Fork 2),
+// BE3-R3 (immutable snapshot migration presence — design Fork 1/Fork 4).
+// ===========================================================================
+
+interface ColumnInfo {
+  column_name: string;
+  is_nullable: "YES" | "NO";
+}
+
+async function columnInfo(table: string, column: string): Promise<ColumnInfo | undefined> {
+  const rows = await db.$queryRaw<ColumnInfo[]>`
+    SELECT column_name, is_nullable
+    FROM information_schema.columns
+    WHERE table_name = ${table} AND column_name = ${column}
+  `;
+  return rows[0];
+}
+
+// Prisma's `@unique` on Postgres materializes as a bare `CREATE UNIQUE
+// INDEX` (see the WU1 migration.sql), NOT a named `CONSTRAINT ... UNIQUE`,
+// so `information_schema.table_constraints` does not surface it. Walking
+// pg_index/pg_attribute directly is the robust way to detect ANY unique
+// index covering the column, regardless of how it was declared.
+async function hasUniqueConstraintOnColumn(table: string, column: string): Promise<boolean> {
+  const rows = await db.$queryRaw<{ index_name: string }[]>`
+    SELECT i.relname AS index_name
+    FROM pg_index ix
+    JOIN pg_class i ON i.oid = ix.indexrelid
+    JOIN pg_class t ON t.oid = ix.indrelid
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+    WHERE t.relname = ${table}
+      AND a.attname = ${column}
+      AND ix.indisunique = true
+  `;
+  return rows.length > 0;
+}
+
+async function tableExists(table: string): Promise<boolean> {
+  const rows = await db.$queryRaw<{ table_name: string }[]>`
+    SELECT table_name FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = ${table}
+  `;
+  return rows.length > 0;
+}
+
+describe("[WU1] checkout-contracts migration — Payment.userId", () => {
+  it(
+    "[WU1-1] payments.user_id is a nullable additive column",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      const column = await columnInfo("payments", "user_id");
+      expect(column).toBeDefined();
+      expect(column?.is_nullable).toBe("YES");
+    },
+    20000,
+  );
+});
+
+describe("[WU1] checkout-contracts migration — SubOrder.shipTo* snapshot columns", () => {
+  const shipToColumns = [
+    "ship_to_line1",
+    "ship_to_line2",
+    "ship_to_city",
+    "ship_to_postal_code",
+    "ship_to_province",
+    "ship_to_country",
+  ];
+
+  for (const column of shipToColumns) {
+    it(
+      `[WU1-2] sub_orders.${column} is a nullable additive column`,
+      async (ctx) => {
+        if (!dbReachable) {
+          ctx.skip();
+          return;
+        }
+        const info = await columnInfo("sub_orders", column);
+        expect(info).toBeDefined();
+        expect(info?.is_nullable).toBe("YES");
+      },
+      20000,
+    );
+  }
+});
+
+describe("[WU1] checkout-contracts migration — PendingCheckout table", () => {
+  it(
+    "[WU1-3] pending_checkouts table exists",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      expect(await tableExists("pending_checkouts")).toBe(true);
+    },
+    20000,
+  );
+
+  it(
+    "[WU1-4] pending_checkouts.fingerprint has a UNIQUE constraint",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      expect(await hasUniqueConstraintOnColumn("pending_checkouts", "fingerprint")).toBe(true);
+    },
+    20000,
+  );
+
+  it(
+    "[WU1-5] pending_checkouts.provider_ref is nullable AND has a UNIQUE constraint (BE-2 ownership correlation — resolves the PROCESSING-before-Payment-row ambiguity without a live Stripe read)",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      const column = await columnInfo("pending_checkouts", "provider_ref");
+      expect(column).toBeDefined();
+      expect(column?.is_nullable).toBe("YES");
+      expect(await hasUniqueConstraintOnColumn("pending_checkouts", "provider_ref")).toBe(true);
+    },
+    20000,
+  );
+
+  it(
+    "[WU1-6] pending_checkouts.user_id is a required (NOT NULL) column — ownership is known at snapshot time",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      const column = await columnInfo("pending_checkouts", "user_id");
+      expect(column).toBeDefined();
+      expect(column?.is_nullable).toBe("NO");
+    },
+    20000,
+  );
+});
