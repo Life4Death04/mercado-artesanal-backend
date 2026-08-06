@@ -45,6 +45,7 @@ const paymentsGuard = [authenticate, loadUser, onboardingGate, requireRole("CONS
 // ---------------------------------------------------------------------------
 
 paymentsRouter.post("/pagos/intent", ...paymentsGuard, paymentsController.createIntent);
+paymentsRouter.get("/pagos/delivery-modes", ...paymentsGuard, paymentsController.getDeliveryModes);
 
 // ---------------------------------------------------------------------------
 // Payments routes — WU2 (unauthenticated — see file header)

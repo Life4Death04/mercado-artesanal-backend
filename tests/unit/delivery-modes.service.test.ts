@@ -61,21 +61,30 @@ vi.mock("@/shared/utils/prisma", () => {
   };
 });
 
+vi.mock("@/modules/cart/services/cart.service", () => ({
+  getCartForCheckout: vi.fn(),
+}));
+
 import type { DeliveryModeType } from "@prisma/client";
 import { Decimal } from "@prisma/client/runtime/library";
 import { prisma } from "@/shared/utils/prisma";
+import { getCartForCheckout } from "@/modules/cart/services/cart.service";
 import {
   DeliveryModeNotFoundError,
   ProducerHasActiveOrdersError,
   ValidationFailedError,
 } from "@/shared/errors/errors";
 import * as deliveryModesService from "@/modules/delivery-modes/services/delivery-modes.service";
-import { DeliveryModeTypeSchema } from "@/modules/delivery-modes/dto/delivery-modes.dto";
+import {
+  DeliveryModeTypeSchema,
+  mapDeliveryModeConsumerView,
+} from "@/modules/delivery-modes/dto/delivery-modes.dto";
 
 // ---------------------------------------------------------------------------
 // Typed mock accessors
 // ---------------------------------------------------------------------------
 const mockedPrisma = vi.mocked(prisma);
+const mockedGetCartForCheckout = vi.mocked(getCartForCheckout);
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -421,5 +430,69 @@ describe("DeliveryModeTypeSchema — enum boundary (enum widening rejected in re
       const result = DeliveryModeTypeSchema.safeParse(unknown);
       expect(result.success).toBe(false);
     }
+  });
+});
+
+// ===========================================================================
+// Checkout delivery modes — BE1-R2..R4 (WU2 RED)
+// ===========================================================================
+
+describe("checkout delivery mode consumer view", () => {
+  it("maps shipping and pickup modes to the exact four-field consumer DTO", () => {
+    const shipping = mapDeliveryModeConsumerView(makeDeliveryMode({ cost: new Decimal("5.50") }));
+    const pickup = mapDeliveryModeConsumerView(
+      makeDeliveryMode({
+        id: "dm_pickup",
+        type: "PICKUP" as DeliveryModeType,
+        cost: new Decimal("0.00"),
+        pickupLocation: "Private location",
+      }),
+    );
+
+    expect(shipping).toEqual({ id: "dm_001", name: "Shipping", type: "shipping", price: "5.50" });
+    expect(Object.keys(shipping)).toEqual(["id", "name", "type", "price"]);
+    expect(pickup).toEqual({ id: "dm_pickup", name: "Pickup", type: "pickup", price: "0.00" });
+  });
+});
+
+describe("deliveryModesService.findActiveForCartProducers", () => {
+  it("queries active modes only for distinct cart producers and preserves empty producer groups", async () => {
+    mockedGetCartForCheckout.mockResolvedValueOnce({
+      cartId: "cart_001",
+      userId: "user_001",
+      items: [
+        { producerId: "prod_a" },
+        { producerId: "prod_b" },
+        { producerId: "prod_a" },
+      ],
+    } as Awaited<ReturnType<typeof getCartForCheckout>>);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.deliveryMode as any).findMany.mockResolvedValueOnce([
+      makeDeliveryMode({ producerId: "prod_a", cost: new Decimal("3.00") }),
+    ]);
+
+    const result = await deliveryModesService.findActiveForCartProducers("user_001");
+
+    expect(mockedPrisma.deliveryMode.findMany).toHaveBeenCalledWith({
+      where: { producerId: { in: ["prod_a", "prod_b"] }, isActive: true },
+      orderBy: { createdAt: "asc" },
+    });
+    expect(result).toEqual([
+      { producerId: "prod_a", modes: [{ id: "dm_001", name: "Shipping", type: "shipping", price: "3.00" }] },
+      { producerId: "prod_b", modes: [] },
+    ]);
+  });
+
+  it("returns no groups and makes no delivery-mode query for an empty cart", async () => {
+    mockedGetCartForCheckout.mockResolvedValueOnce({
+      cartId: "cart_001",
+      userId: "user_001",
+      items: [],
+    } as Awaited<ReturnType<typeof getCartForCheckout>>);
+
+    const result = await deliveryModesService.findActiveForCartProducers("user_001");
+
+    expect(result).toEqual([]);
+    expect(mockedPrisma.deliveryMode.findMany).not.toHaveBeenCalled();
   });
 });
