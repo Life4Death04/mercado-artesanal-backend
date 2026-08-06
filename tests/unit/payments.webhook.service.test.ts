@@ -189,7 +189,7 @@ describe("payments.service — payment_intent.payment_failed dispatch [WHU-FAILE
     await paymentsService.handleWebhookEvent(RAW_BODY, SIGNATURE, makeClient(event));
 
     expect(mockedUpdateMany).toHaveBeenCalledWith({
-      where: { providerRef: "pi_fail_001", status: { not: "SUCCEEDED" } },
+      where: { providerRef: "pi_fail_001", status: { notIn: ["SUCCEEDED", "CANCELED"] } },
       data: { status: "FAILED", amount: expect.anything() },
     });
     expect(mockedCreate).toHaveBeenCalledTimes(1);
@@ -217,7 +217,7 @@ describe("payments.service — payment_intent.payment_failed dispatch [WHU-FAILE
     await paymentsService.handleWebhookEvent(RAW_BODY, SIGNATURE, makeClient(event));
 
     expect(mockedUpdateMany).toHaveBeenCalledWith({
-      where: { providerRef: "pi_fail_downgrade", status: { not: "SUCCEEDED" } },
+      where: { providerRef: "pi_fail_downgrade", status: { notIn: ["SUCCEEDED", "CANCELED"] } },
       data: { status: "FAILED", amount: expect.anything() },
     });
     expect(mockedCreate).not.toHaveBeenCalled();
@@ -248,6 +248,7 @@ describe("payments.service — payment_intent.succeeded dispatch [WHU-SUCCESS]",
           callOrder.push("deleteMany");
           return { count: 1 };
         }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       },
     };
     mockedTransaction.mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) => fn(fakeTx));
@@ -273,7 +274,7 @@ describe("payments.service — payment_intent.succeeded dispatch [WHU-SUCCESS]",
   });
 
   it("[WHU-SUCCESS-METADATA] re-derives cartView via getCartForCheckout(metadata.userId) and parses deliverySelections from metadata", async () => {
-    const fakeTx = { payment: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }) } };
+    const fakeTx = { payment: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }), updateMany: vi.fn() } };
     mockedTransaction.mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) => fn(fakeTx));
     mockedCreateOrderFromPayment.mockResolvedValueOnce({} as OrderDetailView);
     // `cartId: "cart_xyz"` matches the event metadata below — the Bug 2
@@ -317,7 +318,7 @@ describe("payments.service — payment_intent.succeeded dispatch [WHU-SUCCESS]",
       if (attempt === 1) {
         throw Object.assign(new Error("Unique constraint failed on providerRef"), { code: "P2002" });
       }
-      return fn({ payment: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }) } });
+      return fn({ payment: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }), updateMany: vi.fn() } });
     });
     mockedCreateOrderFromPayment.mockResolvedValue({} as OrderDetailView);
     mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView());
