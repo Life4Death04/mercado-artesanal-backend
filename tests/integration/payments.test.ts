@@ -239,7 +239,7 @@ describe("POST /api/v1/pagos/intent — happy path [PH1]", () => {
       }
       vi.clearAllMocks();
 
-      const { producer, deliveryMode } = await seedCheckoutReadyCart(db, cleanup, {
+      const { producer, deliveryMode, addressId } = await seedCheckoutReadyCart(db, cleanup, {
         namePrefix: "ph1",
         nif: "B20000011",
       });
@@ -252,7 +252,10 @@ describe("POST /api/v1/pagos/intent — happy path [PH1]", () => {
       const res = await request
         .post("/api/v1/pagos/intent")
         .set("x-test-auth", consumerAuthHeaderFor("ph1"))
-        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
+        .send({
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+          addressId,
+        });
 
       expect(res.status).toBe(201);
       expect(res.body).toEqual({ clientSecret: "secret_ph1" });
@@ -399,7 +402,7 @@ describe("POST /api/v1/pagos/intent — 409 INSUFFICIENT_STOCK [PH6]", () => {
       }
       vi.clearAllMocks();
 
-      const { producer, deliveryMode, product } = await seedCheckoutReadyCart(db, cleanup, {
+      const { producer, deliveryMode, product, addressId } = await seedCheckoutReadyCart(db, cleanup, {
         namePrefix: "ph6",
         nif: "B20000061",
         stock: 2,
@@ -412,7 +415,10 @@ describe("POST /api/v1/pagos/intent — 409 INSUFFICIENT_STOCK [PH6]", () => {
       const res = await request
         .post("/api/v1/pagos/intent")
         .set("x-test-auth", consumerAuthHeaderFor("ph6"))
-        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
+        .send({
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+          addressId,
+        });
 
       expect(res.status).toBe(409);
       expect(res.body).toMatchObject({ code: "INSUFFICIENT_STOCK" });
@@ -436,7 +442,7 @@ describe("POST /api/v1/pagos/intent — 502 PAYMENT_INTENT_CREATION_FAILED [PH7]
       }
       vi.clearAllMocks();
 
-      const { producer, deliveryMode, consumer } = await seedCheckoutReadyCart(db, cleanup, {
+      const { producer, deliveryMode, consumer, addressId } = await seedCheckoutReadyCart(db, cleanup, {
         namePrefix: "ph7",
         nif: "B20000071",
       });
@@ -446,7 +452,10 @@ describe("POST /api/v1/pagos/intent — 502 PAYMENT_INTENT_CREATION_FAILED [PH7]
       const res = await request
         .post("/api/v1/pagos/intent")
         .set("x-test-auth", consumerAuthHeaderFor("ph7"))
-        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
+        .send({
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+          addressId,
+        });
 
       expect(res.status).toBe(502);
       expect(res.body).toMatchObject({ code: "PAYMENT_INTENT_CREATION_FAILED" });
@@ -475,14 +484,17 @@ describe("POST /api/v1/pagos/intent — stable idempotency key across repeat req
       }
       vi.clearAllMocks();
 
-      const { producer, deliveryMode } = await seedCheckoutReadyCart(db, cleanup, {
+      const { producer, deliveryMode, addressId } = await seedCheckoutReadyCart(db, cleanup, {
         namePrefix: "ph8",
         nif: "B20000081",
       });
 
       mockedCreatePaymentIntent.mockResolvedValue({ id: "pi_ph8", client_secret: "secret_ph8" });
 
-      const body = { deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] };
+      const body = {
+        deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        addressId,
+      };
       const authSet = consumerAuthHeaderFor("ph8");
 
       await request.post("/api/v1/pagos/intent").set("x-test-auth", authSet).send(body);
@@ -627,7 +639,7 @@ describe("POST /api/v1/pagos/intent — still parses JSON after webhook raw-body
       }
       vi.clearAllMocks();
 
-      const { producer, deliveryMode } = await seedCheckoutReadyCart(db, cleanup, {
+      const { producer, deliveryMode, addressId } = await seedCheckoutReadyCart(db, cleanup, {
         namePrefix: "wu2json",
         nif: "B20000091",
       });
@@ -640,7 +652,10 @@ describe("POST /api/v1/pagos/intent — still parses JSON after webhook raw-body
       const res = await request
         .post("/api/v1/pagos/intent")
         .set("x-test-auth", consumerAuthHeaderFor("wu2json"))
-        .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
+        .send({
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+          addressId,
+        });
 
       expect(res.status).toBe(201);
       expect(res.body).toEqual({ clientSecret: "secret_wu2json" });
@@ -1370,7 +1385,7 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R3 five states", () 
   it("[BE2-R3-PROCESSING-INTENT] returns PROCESSING immediately after the owner creates an intent", async (ctx) => {
     if (!dbReachable) return ctx.skip();
     vi.clearAllMocks();
-    const { producer, deliveryMode } = await seedCheckoutReadyCart(db, cleanup, {
+    const { producer, deliveryMode, addressId } = await seedCheckoutReadyCart(db, cleanup, {
       namePrefix: "be2-intent-processing", nif: "B20000204",
     });
     const providerRef = "pi_be2_intent_processing";
@@ -1379,7 +1394,10 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R3 five states", () 
     const intent = await request
       .post("/api/v1/pagos/intent")
       .set("x-test-auth", consumerAuthHeaderFor("be2-intent-processing"))
-      .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
+      .send({
+        deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        addressId,
+      });
     expect(intent.status).toBe(201);
     expect(intent.body).toEqual({ clientSecret: "secret_be2_processing" });
 
@@ -1588,5 +1606,389 @@ describe("POST /api/v1/pagos/webhook — BE2-R5 canceled handling", () => {
     expect(res.status).toBe(200);
     expect((await db.payment.findUnique({ where: { providerRef } }))?.status).toBe("SUCCEEDED");
     expect(await db.order.count({ where: { payment: { providerRef } } })).toBe(ordersBefore);
+  });
+});
+
+// ===========================================================================
+// checkout-contracts WU4 — BE-3 immutable address snapshot [BE3]
+//
+// BE3-R1 (schema): addressId is additive+optional; the SERVICE requires it
+//   WHEN any selected DeliveryMode.type is SHIPPING_FLAT_RATE, and ignores
+//   it for an all-pickup cart. BE3-R2: ownership no-leak (unknown/unowned
+//   both 422, same body shape). BE3-R3: the resolved address CONTENT is
+//   snapshotted into PendingCheckout at intent time, then copied into
+//   SHIPPING_FLAT_RATE SubOrders only at webhook time, and survives a later
+//   `PATCH /users/me/addresses/:id`. BE3-R4: a replayed succeeded event
+//   writes no duplicate snapshot.
+//
+// BE3-R3's "migration ships the snapshot storage" scenario is NOT
+// duplicated here — it is already proven by [WU1-1]/[WU1-2]/[WU1-3] above
+// (Payment.userId, SubOrder.shipTo* columns, and the pending_checkouts
+// table all predate WU4; no new migration was needed for BE-3). The two
+// MODIFIED-requirement scenarios ("other event type is still a no-op" /
+// "canceled is now handled") are likewise NOT duplicated — they are already
+// exercised end-to-end by [WU2-3] and [BE2-R5-PERSISTS] above.
+// ===========================================================================
+
+describe("POST /api/v1/pagos/intent — BE3-R1 addressId required only for shipping", () => {
+  it("[BE3-R1-SHIPPING-NO-ADDRESS] shipping cart without addressId -> 422 VALIDATION_FAILED, no Stripe call, no PendingCheckout row", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode, consumer } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "be3-no-addr",
+      nif: "B20000301",
+    });
+
+    const res = await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("be3-no-addr"))
+      .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+    expect(await db.pendingCheckout.count({ where: { userId: consumer.id } })).toBe(0);
+  });
+
+  it("[BE3-R1-PICKUP-IGNORED] pickup-only cart with a supplied addressId -> 201, addressId ignored, no address snapshot content written", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, category } = await seedProducer(db, cleanup, "be3-pickup", "B20000302");
+    const consumer = await seedConsumer(db, cleanup, "be3-pickup");
+    const deliveryMode = await db.deliveryMode.create({
+      data: { producerId: producer.id, type: "PICKUP", cost: 0, isActive: true },
+    });
+    const product = await db.product.create({
+      data: { producerId: producer.id, categoryId: category.id, name: "BE3 Pickup", description: "d", price: 5.0, stock: 10, isActive: true },
+    });
+    await cartService.addItem(consumer.id, product.id, 1);
+    const address = await db.address.create({
+      data: { userId: consumer.id, line1: "Calle Ignorada 1", city: "Bilbao", postalCode: "48001", province: "Bizkaia", isDefault: true },
+    });
+
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_be3_pickup", client_secret: "secret_be3_pickup" });
+    cleanup.providerRefs.push("pi_be3_pickup");
+
+    const res = await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("be3-pickup"))
+      .send({
+        deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        addressId: address.id,
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ clientSecret: "secret_be3_pickup" });
+    const pendingCheckout = await db.pendingCheckout.findFirst({ where: { providerRef: "pi_be3_pickup" } });
+    expect(pendingCheckout).not.toBeNull();
+    expect(pendingCheckout?.addressLine1).toBe("");
+    expect(pendingCheckout?.addressCity).toBe("");
+  });
+
+  it("[BE3-R1-SHIPPING-SUCCEEDS] shipping cart with a valid, owned addressId -> 201 { clientSecret }, PendingCheckout carries the resolved address content", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode, addressId } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "be3-ship-ok",
+      nif: "B20000303",
+    });
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_be3_ship_ok", client_secret: "secret_be3_ship_ok" });
+    cleanup.providerRefs.push("pi_be3_ship_ok");
+
+    const res = await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("be3-ship-ok"))
+      .send({
+        deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        addressId,
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ clientSecret: "secret_be3_ship_ok" });
+    const pendingCheckout = await db.pendingCheckout.findFirst({ where: { providerRef: "pi_be3_ship_ok" } });
+    expect(pendingCheckout).toMatchObject({
+      addressLine1: "Calle Envio 1",
+      addressCity: "Valencia",
+      addressPostalCode: "46001",
+      addressProvince: "Valencia",
+      addressCountry: "ES",
+    });
+  });
+});
+
+describe("POST /api/v1/pagos/intent — BE3-R2 addressId ownership no-leak", () => {
+  it("[BE3-R2-UNOWNED] addressId belonging to another user -> 422, identical error shape to an unknown id", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "be3-unowned",
+      nif: "B20000304",
+    });
+    const otherConsumer = await seedConsumer(db, cleanup, "be3-other-owner");
+    const otherAddress = await db.address.create({
+      data: { userId: otherConsumer.id, line1: "No es tuya 1", city: "Zaragoza", postalCode: "50001", province: "Zaragoza", isDefault: true },
+    });
+
+    const unowned = await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("be3-unowned"))
+      .send({
+        deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        addressId: otherAddress.id,
+      });
+    const unknown = await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("be3-unowned"))
+      .send({
+        deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        addressId: "addr_does_not_exist_at_all",
+      });
+
+    expect(unowned.status).toBe(422);
+    expect(unknown.status).toBe(422);
+    expect(unowned.body).toMatchObject({ code: "VALIDATION_FAILED" });
+    // Indistinguishable (spec "MUST be indistinguishable from the non-owned
+    // rejection") — same code/title/errors shape; `instance` is a per-request
+    // correlation id (errorMiddleware.ts) and is intentionally excluded.
+    expect({ ...unowned.body, instance: undefined }).toEqual({ ...unknown.body, instance: undefined });
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/v1/pagos/webhook — BE3-R3 immutable snapshot", () => {
+  it("[BE3-R3-SNAPSHOT-SHIPPING-ONLY] mixed cart: shipping producer carries the snapshot, pickup producer stays null", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+
+    const { producer: shippingProducer, category: shippingCategory } = await seedProducer(db, cleanup, "be3-mix-ship", "B20000305");
+    const { producer: pickupProducer, category: pickupCategory } = await seedProducer(db, cleanup, "be3-mix-pick", "B20000306");
+    const consumer = await seedConsumer(db, cleanup, "be3-mix");
+
+    const shippingMode = await db.deliveryMode.create({
+      data: { producerId: shippingProducer.id, type: "SHIPPING_FLAT_RATE", cost: 2.0, isActive: true },
+    });
+    const pickupMode = await db.deliveryMode.create({
+      data: { producerId: pickupProducer.id, type: "PICKUP", cost: 0, isActive: true },
+    });
+    const shippingProduct = await db.product.create({
+      data: { producerId: shippingProducer.id, categoryId: shippingCategory.id, name: "BE3 Mix Ship", description: "d", price: 5.0, stock: 10, isActive: true },
+    });
+    const pickupProduct = await db.product.create({
+      data: { producerId: pickupProducer.id, categoryId: pickupCategory.id, name: "BE3 Mix Pickup", description: "d", price: 3.0, stock: 10, isActive: true },
+    });
+    await cartService.addItem(consumer.id, shippingProduct.id, 1);
+    await cartService.addItem(consumer.id, pickupProduct.id, 1);
+    const address = await db.address.create({
+      data: { userId: consumer.id, line1: "Calle Mixta 9", city: "Bilbao", postalCode: "48001", province: "Bizkaia", isDefault: true },
+    });
+    const cartView = await cartService.getCartForCheckout(consumer.id);
+
+    const providerRef = "pi_be3_mix";
+    cleanup.providerRefs.push(providerRef);
+    const deliverySelections = [
+      { producerId: shippingProducer.id, deliveryModeId: shippingMode.id },
+      { producerId: pickupProducer.id, deliveryModeId: pickupMode.id },
+    ];
+
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: providerRef, client_secret: "secret_be3_mix" });
+    const intentRes = await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("be3-mix"))
+      .send({ deliverySelections, addressId: address.id });
+    expect(intentRes.status).toBe(201);
+
+    mockedConstructEvent.mockReturnValueOnce(
+      makeSucceededEvent({ intentId: providerRef, amountCents: 1000, userId: consumer.id, cartId: cartView.cartId, deliverySelections }),
+    );
+    const webhookRes = await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+    expect(webhookRes.status).toBe(200);
+
+    const order = await db.order.findFirst({ where: { payment: { providerRef } } });
+    expect(order).not.toBeNull();
+    const subOrders = await db.subOrder.findMany({ where: { orderId: order!.id } });
+    const shippingSubOrder = subOrders.find((s) => s.producerId === shippingProducer.id);
+    const pickupSubOrder = subOrders.find((s) => s.producerId === pickupProducer.id);
+
+    expect(shippingSubOrder).toMatchObject({
+      shipToLine1: "Calle Mixta 9",
+      shipToCity: "Bilbao",
+      shipToPostalCode: "48001",
+      shipToProvince: "Bizkaia",
+      shipToCountry: "ES",
+    });
+    expect(pickupSubOrder?.shipToLine1).toBeNull();
+    expect(pickupSubOrder?.shipToCity).toBeNull();
+  });
+
+  it("[BE3-R3-IMMUTABLE] editing the address after ordering does not mutate the already-recorded SubOrder snapshot", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode, consumer, cartId, addressId } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "be3-immutable",
+      nif: "B20000307",
+    });
+    const providerRef = "pi_be3_immutable";
+    cleanup.providerRefs.push(providerRef);
+    const deliverySelections = [{ producerId: producer.id, deliveryModeId: deliveryMode.id }];
+
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: providerRef, client_secret: "secret_be3_immutable" });
+    const intentRes = await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("be3-immutable"))
+      .send({ deliverySelections, addressId });
+    expect(intentRes.status).toBe(201);
+
+    mockedConstructEvent.mockReturnValueOnce(
+      makeSucceededEvent({ intentId: providerRef, amountCents: 700, userId: consumer.id, cartId, deliverySelections }),
+    );
+    await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+
+    const orderBefore = await db.order.findFirstOrThrow({ where: { payment: { providerRef } } });
+    const subOrderBefore = await db.subOrder.findFirstOrThrow({ where: { orderId: orderBefore.id } });
+    expect(subOrderBefore.shipToLine1).toBe("Calle Envio 1");
+    expect(subOrderBefore.shipToCity).toBe("Valencia");
+
+    const patchRes = await request
+      .patch(`/api/v1/users/me/addresses/${addressId}`)
+      .set("x-test-auth", consumerAuthHeaderFor("be3-immutable"))
+      .send({ line1: "Nueva Direccion 99", city: "Sevilla" });
+    expect(patchRes.status).toBe(200);
+
+    const patchedAddress = await db.address.findUniqueOrThrow({ where: { id: addressId } });
+    expect(patchedAddress.line1).toBe("Nueva Direccion 99");
+
+    const subOrderAfter = await db.subOrder.findUniqueOrThrow({ where: { id: subOrderBefore.id } });
+    expect(subOrderAfter.shipToLine1).toBe("Calle Envio 1");
+    expect(subOrderAfter.shipToCity).toBe("Valencia");
+  });
+});
+
+describe("POST /api/v1/pagos/webhook — BE3-R4 replay writes no duplicate snapshot", () => {
+  it("[BE3-R4-REPLAY-NO-DUP-SNAPSHOT] a replayed succeeded event for an intent that already produced a shipping snapshot creates no second order or duplicate snapshot", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode, consumer, cartId, addressId } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "be3-replay",
+      nif: "B20000308",
+    });
+    const providerRef = "pi_be3_replay";
+    cleanup.providerRefs.push(providerRef);
+    const deliverySelections = [{ producerId: producer.id, deliveryModeId: deliveryMode.id }];
+
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: providerRef, client_secret: "secret_be3_replay" });
+    await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("be3-replay"))
+      .send({ deliverySelections, addressId });
+
+    const event = makeSucceededEvent({ intentId: providerRef, amountCents: 700, userId: consumer.id, cartId, deliverySelections });
+    mockedConstructEvent.mockReturnValueOnce(event);
+    const first = await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+    expect(first.status).toBe(200);
+
+    const orderBefore = await db.order.findFirstOrThrow({ where: { payment: { providerRef } } });
+    const subOrderBefore = await db.subOrder.findFirstOrThrow({ where: { orderId: orderBefore.id } });
+    expect(subOrderBefore.shipToLine1).toBe("Calle Envio 1");
+
+    mockedConstructEvent.mockReturnValueOnce(event);
+    const replay = await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+    expect(replay.status).toBe(200);
+
+    expect(await db.order.count({ where: { payment: { providerRef } } })).toBe(1);
+    expect(await db.subOrder.count({ where: { orderId: orderBefore.id } })).toBe(1);
+    const subOrderAfter = await db.subOrder.findUniqueOrThrow({ where: { id: subOrderBefore.id } });
+    expect(subOrderAfter.shipToLine1).toBe("Calle Envio 1");
+  });
+});
+
+// ===========================================================================
+// R1-001/R3-001 correction (review lineage review-bf06f52e2bf5b337): the
+// create-payment-intent idempotency fingerprint previously EXCLUDED the
+// shipping address. A repeat shipping intent for the SAME cart/total/
+// delivery but a DIFFERENT owned addressId collided on the fingerprint, so
+// the repeat-path `updateMany` only refreshed `providerRef` and left the
+// FIRST address's stale snapshot in place — the order shipped to the wrong
+// address. addressId is now part of the fingerprint, so a different address
+// yields a NEW PendingCheckout row with the correct snapshot, while a
+// genuine retry with the SAME addressId still dedupes onto the same row.
+// ===========================================================================
+
+describe("POST /api/v1/pagos/webhook — R1-001/R3-001 fingerprint includes shipping address", () => {
+  it("[FIX-ADDR-FP-DIFFERENT-ADDRESS] same cart/total/delivery but a different owned addressId does not ship to the stale first address", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode, consumer, cartId, addressId: addressA } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "fix-addr-fp",
+      nif: "B20000401",
+    });
+    const addressB = await db.address.create({
+      data: { userId: consumer.id, line1: "Calle Nueva 42", city: "Sevilla", postalCode: "41001", province: "Sevilla", isDefault: false },
+    });
+    const deliverySelections = [{ producerId: producer.id, deliveryModeId: deliveryMode.id }];
+    const providerRefA = "pi_fix_addr_a";
+    const providerRefB = "pi_fix_addr_b";
+    cleanup.providerRefs.push(providerRefA, providerRefB);
+
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: providerRefA, client_secret: "secret_fix_addr_a" });
+    const firstIntent = await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("fix-addr-fp"))
+      .send({ deliverySelections, addressId: addressA });
+    expect(firstIntent.status).toBe(201);
+
+    // SAME cart/total/deliverySelections, ONLY the addressId changes.
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: providerRefB, client_secret: "secret_fix_addr_b" });
+    const secondIntent = await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("fix-addr-fp"))
+      .send({ deliverySelections, addressId: addressB.id });
+    expect(secondIntent.status).toBe(201);
+
+    // A distinct PendingCheckout row must exist for the second providerRef,
+    // carrying address B's content — not the mutated, stale address-A row.
+    const pendingB = await db.pendingCheckout.findFirst({ where: { providerRef: providerRefB } });
+    expect(pendingB).toMatchObject({ addressLine1: "Calle Nueva 42", addressCity: "Sevilla" });
+
+    mockedConstructEvent.mockReturnValueOnce(
+      makeSucceededEvent({ intentId: providerRefB, amountCents: 700, userId: consumer.id, cartId, deliverySelections }),
+    );
+    const webhookRes = await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+    expect(webhookRes.status).toBe(200);
+
+    const order = await db.order.findFirstOrThrow({ where: { payment: { providerRef: providerRefB } } });
+    const subOrder = await db.subOrder.findFirstOrThrow({ where: { orderId: order.id } });
+    expect(subOrder.shipToLine1).toBe("Calle Nueva 42");
+    expect(subOrder.shipToCity).toBe("Sevilla");
+  });
+
+  it("[FIX-ADDR-FP-SAME-ADDRESS-DEDUPES] a genuine retry with the SAME addressId still reuses the same fingerprint and PendingCheckout row", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode, addressId } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "fix-addr-fp-same",
+      nif: "B20000402",
+    });
+    const deliverySelections = [{ producerId: producer.id, deliveryModeId: deliveryMode.id }];
+    const providerRefFirst = "pi_fix_addr_same_1";
+    const providerRefRetry = "pi_fix_addr_same_2";
+    cleanup.providerRefs.push(providerRefFirst, providerRefRetry);
+
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: providerRefFirst, client_secret: "secret_same_1" });
+    await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("fix-addr-fp-same"))
+      .send({ deliverySelections, addressId });
+
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: providerRefRetry, client_secret: "secret_same_2" });
+    await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("fix-addr-fp-same"))
+      .send({ deliverySelections, addressId });
+
+    // Same fingerprint -> the retry-path `updateMany` moved `providerRef`
+    // onto the SAME row instead of creating a second one.
+    expect(await db.pendingCheckout.count({ where: { providerRef: providerRefFirst } })).toBe(0);
+    const row = await db.pendingCheckout.findFirstOrThrow({ where: { providerRef: providerRefRetry } });
+    expect(row.addressLine1).toBe("Calle Envio 1");
   });
 });

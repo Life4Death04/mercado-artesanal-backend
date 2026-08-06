@@ -47,7 +47,7 @@
  */
 import { createHash } from "node:crypto";
 
-import type { Prisma } from "@prisma/client";
+import type { DeliveryModeType, Prisma } from "@prisma/client";
 import { Prisma as PrismaValue } from "@prisma/client";
 
 import { getCartForCheckout } from "@/modules/cart/services/cart.service";
@@ -74,10 +74,32 @@ import { centsToEuros, stripeClient } from "./stripe.client";
 import type { StripeClient, StripeEvent, StripePaymentIntentObject } from "./stripe.client";
 
 type DecimalValue = InstanceType<typeof PrismaValue.Decimal>;
-type DeliveryModeRow = { id: string; producerId: string; isActive: boolean; cost: Prisma.Decimal };
+type DeliveryModeRow = {
+  id: string;
+  producerId: string;
+  isActive: boolean;
+  type: DeliveryModeType;
+  cost: Prisma.Decimal;
+};
 
 export interface PaymentIntentResult {
   clientSecret: string;
+}
+
+/**
+ * Resolved, server-authored address CONTENT (never a live FK) captured at
+ * intent-creation time (checkout-contracts BE-3, design Fork 1). `null`
+ * means the cart is all-pickup and no snapshot is written — the caller MUST
+ * NOT persist placeholder content in that case (spec "Pickup-only cart
+ * ignores a supplied addressId").
+ */
+interface AddressSnapshot {
+  addressLine1: string;
+  addressLine2: string | null;
+  addressCity: string;
+  addressPostalCode: string;
+  addressProvince: string;
+  addressCountry: string;
 }
 
 export async function getPaymentStatus(userId: string, paymentIntentId: string): Promise<PaymentStatusView | null> {
@@ -122,6 +144,9 @@ export async function getPaymentStatus(userId: string, paymentIntentId: string):
  * @param deliverySelections - validated request body shape (Zod-checked by
  *   the controller); bijection/ownership/isActive are re-validated here
  *   against LIVE `DeliveryMode` rows.
+ * @param addressId - OPTIONAL at this signature level (checkout-contracts
+ *   BE-3, design Fork 1). Required by Step 3c WHEN any resolved selection
+ *   is `SHIPPING_FLAT_RATE`; ignored for an all-pickup cart.
  * @param client - injectable `StripeClient` (defaults to the module
  *   singleton); tests supply a mock via the `@/modules/payments/services/stripe.client`
  *   module mock rather than this parameter, but the parameter keeps the
@@ -130,6 +155,7 @@ export async function getPaymentStatus(userId: string, paymentIntentId: string):
 export async function createPaymentIntent(
   userId: string,
   deliverySelections: DeliverySelection[],
+  addressId?: string,
   client: StripeClient = stripeClient,
 ): Promise<PaymentIntentResult> {
   // Step 1: frozen read contract — 404 no cart (NotFoundError thrown by cart.service).
@@ -208,6 +234,52 @@ export async function createPaymentIntent(
     );
   }
 
+  // Step 3c (checkout-contracts BE-3, design Fork 1): resolve the
+  // required-when-shipping `addressId` and snapshot its CONTENT — never a
+  // live FK — so a later profile edit or a Stripe replay can never alter an
+  // already-recorded order (spec "Address content is snapshotted
+  // immutably"). An `addressId` supplied for an all-pickup cart is IGNORED
+  // (spec "Pickup-only cart ignores a supplied addressId") — `addressSnapshot`
+  // stays `null` and Step 7 below writes no address content for it.
+  const requiresAddress = [...deliveryModeByProducer.values()].some(
+    (modeId) => modesById.get(modeId)?.type === "SHIPPING_FLAT_RATE",
+  );
+  let addressSnapshot: AddressSnapshot | null = null;
+  if (requiresAddress) {
+    if (!addressId) {
+      throw new ValidationFailedError(
+        [
+          {
+            path: "addressId",
+            message: "addressId is required when the cart includes a shipping delivery mode",
+          },
+        ],
+        "Invalid delivery selections",
+      );
+    }
+    // Ownership: findFirst({id,userId,deletedAt:null}) -> null -> 422
+    // no-leak, matching the addresses.service.ts update()/softDelete() idiom
+    // (spec "Server validates addressId ownership with no-leak semantics") —
+    // an unknown id and a non-owned id MUST be indistinguishable.
+    const address = await prisma.address.findFirst({
+      where: { id: addressId, userId, deletedAt: null },
+    });
+    if (!address) {
+      throw new ValidationFailedError(
+        [{ path: "addressId", message: "addressId is unknown or not owned by the caller" }],
+        "Invalid delivery selections",
+      );
+    }
+    addressSnapshot = {
+      addressLine1: address.line1,
+      addressLine2: address.line2,
+      addressCity: address.city,
+      addressPostalCode: address.postalCode,
+      addressProvince: address.province,
+      addressCountry: address.country,
+    };
+  }
+
   // Step 3b: availability gate, all-or-nothing (mirrors orders.service.ts's
   // base checkout guard) — a soft-deleted/inactive/producer-deleted product
   // must never be charged, even if its stock snapshot still looks sufficient.
@@ -238,9 +310,17 @@ export async function createPaymentIntent(
   // Cart identity is preserved across clear/repopulate (cart.service.ts
   // clear-then-repopulate flow), so a raw cartId key would make a CHANGED
   // checkout reuse a stale prior intent's client_secret. A sha256 digest over
-  // {cartId, total, sorted item set, deliverySelections} is deterministic: a
-  // genuine retry of the SAME content reuses the key (Stripe dedupes
-  // correctly); any change in items/amount/delivery yields a new key.
+  // {cartId, total, sorted item set, deliverySelections, addressId} is
+  // deterministic: a genuine retry of the SAME content reuses the key
+  // (Stripe dedupes correctly); any change in items/amount/delivery/address
+  // yields a new key.
+  //
+  // R1-001/R3-001 correction: `addressId` MUST be part of the fingerprint.
+  // Without it, a repeat shipping intent for the SAME cart/total/delivery
+  // but a DIFFERENT owned address collided on the fingerprint — the repeat
+  // path below only refreshes `providerRef`, never the address snapshot, so
+  // the order would ship to the stale FIRST address. Normalizing an absent
+  // addressId to `null` keeps an all-pickup cart's fingerprint stable.
   const itemFingerprint = cartView.items
     .map((item) => `${item.productId}:${item.quantity}`)
     .sort()
@@ -252,6 +332,7 @@ export async function createPaymentIntent(
         total: total.toString(),
         items: itemFingerprint,
         deliverySelections: deliverySelectionsMetadata,
+        addressId: addressId ?? null,
       }),
     )
     .digest("hex");
@@ -268,23 +349,33 @@ export async function createPaymentIntent(
         deliverySelections: deliverySelectionsMetadata,
       },
     });
-    // Bind an existing WU4 snapshot when present; until then, create the
-    // fingerprint-bound ownership row needed for owner-scoped PROCESSING.
+    // Bind an existing fingerprint-keyed row (a genuine retry of the SAME
+    // checkout content — spec "Webhook replay creates no duplicate
+    // snapshot") to the new providerRef; the row's address content, once
+    // written, is NEVER rewritten here (immutability — spec "Editing the
+    // address after ordering does not mutate the order").
     const updated = await prisma.pendingCheckout.updateMany({
       where: { fingerprint: idempotencyKey, userId },
       data: { providerRef: intent.id },
     });
     if (updated.count === 0) {
       try {
+        // Address content: real snapshot for a shipping cart with a
+        // resolved `addressSnapshot` (Step 3c above); empty placeholders
+        // otherwise (all-pickup, or the BE-2 ownership-only row shape WU1
+        // already relied on) — spec "no PendingCheckout address snapshot
+        // MUST be written" for an ignored/absent addressId.
         await prisma.pendingCheckout.create({
           data: {
             fingerprint: idempotencyKey,
             providerRef: intent.id,
             userId,
-            addressLine1: "",
-            addressCity: "",
-            addressPostalCode: "",
-            addressProvince: "",
+            addressLine1: addressSnapshot?.addressLine1 ?? "",
+            addressLine2: addressSnapshot?.addressLine2 ?? null,
+            addressCity: addressSnapshot?.addressCity ?? "",
+            addressPostalCode: addressSnapshot?.addressPostalCode ?? "",
+            addressProvince: addressSnapshot?.addressProvince ?? "",
+            ...(addressSnapshot ? { addressCountry: addressSnapshot.addressCountry } : {}),
           },
         });
       } catch (err) {

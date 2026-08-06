@@ -139,6 +139,13 @@ export async function seedConsumer(db: PrismaClient, cleanup: PaymentsFixtureCle
  * anticipated WU2/WU3 succeeded/failed webhook scenarios that need the same
  * starting fixture before the webhook fires.
  *
+ * checkout-contracts WU4 (BE-3, design Fork 1): the delivery mode this
+ * helper creates is always `SHIPPING_FLAT_RATE`, so BE-3 now requires an
+ * `addressId` on `POST /pagos/intent` for every caller of this composed
+ * helper. An owned `Address` is seeded alongside the consumer and its id is
+ * returned as `addressId` so existing PH1/PH6/PH7/PH8/WU2-4/BE2-R3-* call
+ * sites can pass it through unchanged in shape, just with one more field.
+ *
  * Callers that need a DIFFERENT shape (no delivery mode, no cart item, an
  * empty cart, etc. — e.g. PH3/PH4/PH5) use `seedProducer`/`seedConsumer`
  * directly instead of this composed helper.
@@ -177,13 +184,33 @@ export async function seedCheckoutReadyCart(
 
   await cartService.addItem(consumer.id, product.id, quantity);
 
+  const address = await db.address.create({
+    data: {
+      userId: consumer.id,
+      line1: "Calle Envio 1",
+      city: "Valencia",
+      postalCode: "46001",
+      province: "Valencia",
+      isDefault: true,
+    },
+  });
+
   // WU3 rework: `cartId` is exposed so webhook-event fixtures can build a
   // `metadata.cartId` that matches what `getCartForCheckout` will ACTUALLY
   // resolve at webhook time (Bug 2 fix — the reconciliation guard compares
   // `cartView.cartId === metadata.cartId`).
   const cartView = await cartService.getCartForCheckout(consumer.id);
 
-  return { producer, category, consumer, deliveryMode, product, quantity, cartId: cartView.cartId };
+  return {
+    producer,
+    category,
+    consumer,
+    deliveryMode,
+    product,
+    quantity,
+    cartId: cartView.cartId,
+    addressId: address.id,
+  };
 }
 
 export async function cleanupPaymentsFixtures(db: PrismaClient, cleanup: PaymentsFixtureCleanup): Promise<void> {
@@ -200,6 +227,10 @@ export async function cleanupPaymentsFixtures(db: PrismaClient, cleanup: Payment
 
   await db.cartItem.deleteMany({ where: { cart: { userId: { in: cleanup.userIds } } } });
   await db.cart.deleteMany({ where: { userId: { in: cleanup.userIds } } });
+  // checkout-contracts WU4: seedCheckoutReadyCart now seeds an owned Address
+  // (Address.userId is onDelete: Restrict) — must be cleared before the
+  // user delete below, or that delete would fail with a FK violation.
+  await db.address.deleteMany({ where: { userId: { in: cleanup.userIds } } });
   await db.deliveryMode.deleteMany({ where: { producerId: { in: cleanup.producerIds } } });
   await db.product.deleteMany({ where: { producerId: { in: cleanup.producerIds } } });
   await db.producer.deleteMany({ where: { id: { in: cleanup.producerIds } } });
