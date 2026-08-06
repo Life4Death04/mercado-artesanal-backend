@@ -18,6 +18,7 @@
  *   error-handling §"Zod .strict() policy for unknown keys" (Cycle 2)
  *   design — Architecture Decision #1 (strictObject project-wide)
  */
+import type { DeliveryMode } from "@prisma/client";
 import { z } from "zod";
 
 import { strictObject } from "@/shared/validation/zod";
@@ -86,3 +87,28 @@ export const UpdateDeliveryModeBodySchema = strictObject({
 });
 
 export type UpdateDeliveryModeBody = z.infer<typeof UpdateDeliveryModeBodySchema>;
+
+// ---------------------------------------------------------------------------
+// Consumer checkout read model
+// ---------------------------------------------------------------------------
+
+export interface DeliveryModeConsumerView {
+  id: string;
+  name: string;
+  type: "shipping" | "pickup";
+  price: string;
+}
+
+/** Maps the persisted delivery configuration to the minimal checkout DTO. */
+export function mapDeliveryModeConsumerView(
+  mode: Pick<DeliveryMode, "id" | "type" | "cost">,
+): DeliveryModeConsumerView {
+  const isShipping = mode.type === "SHIPPING_FLAT_RATE";
+
+  return {
+    id: mode.id,
+    name: isShipping ? "Shipping" : "Pickup",
+    type: isShipping ? "shipping" : "pickup",
+    price: mode.cost.toFixed(2),
+  };
+}

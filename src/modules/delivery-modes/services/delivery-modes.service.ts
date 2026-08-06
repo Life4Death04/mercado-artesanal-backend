@@ -28,6 +28,7 @@
  */
 import type { DeliveryMode, SubOrderStatus } from "@prisma/client";
 
+import { getCartForCheckout } from "@/modules/cart/services/cart.service";
 import {
   DeliveryModeNotFoundError,
   ProducerHasActiveOrdersError,
@@ -37,8 +38,15 @@ import { prisma } from "@/shared/utils/prisma";
 
 import type {
   CreateDeliveryModeBody,
+  DeliveryModeConsumerView,
   UpdateDeliveryModeBody,
 } from "../dto/delivery-modes.dto";
+import { mapDeliveryModeConsumerView } from "../dto/delivery-modes.dto";
+
+export interface DeliveryModesForProducerView {
+  producerId: string;
+  modes: DeliveryModeConsumerView[];
+}
 
 // ---------------------------------------------------------------------------
 // Active SubOrder statuses for the delete guard
@@ -125,6 +133,33 @@ export async function findAll(producerId: string): Promise<DeliveryMode[]> {
     where: { producerId },
     orderBy: { createdAt: "asc" },
   });
+}
+
+/**
+ * Returns active checkout options for each distinct producer in a user's cart.
+ * The cart read is intentionally composed through the frozen checkout contract.
+ */
+export async function findActiveForCartProducers(
+  userId: string,
+): Promise<DeliveryModesForProducerView[]> {
+  const cart = await getCartForCheckout(userId);
+  const producerIds = [...new Set(cart.items.map((item) => item.producerId))];
+
+  if (producerIds.length === 0) {
+    return [];
+  }
+
+  const activeModes = await prisma.deliveryMode.findMany({
+    where: { producerId: { in: producerIds }, isActive: true },
+    orderBy: { createdAt: "asc" },
+  });
+
+  return producerIds.map((producerId) => ({
+    producerId,
+    modes: activeModes
+      .filter((mode) => mode.producerId === producerId && mode.isActive)
+      .map(mapDeliveryModeConsumerView),
+  }));
 }
 
 // ---------------------------------------------------------------------------

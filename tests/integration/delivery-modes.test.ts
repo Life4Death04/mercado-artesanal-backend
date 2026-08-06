@@ -76,6 +76,7 @@ vi.mock("@/shared/utils/prisma", () => {
       $disconnect: vi.fn().mockResolvedValue(undefined),
       $transaction: vi.fn(),
       user: { findUnique: vi.fn() },
+      cart: { findUnique: vi.fn() },
       deliveryMode: {
         create: vi.fn(),
         findMany: vi.fn(),
@@ -101,6 +102,8 @@ const mockedPrisma = vi.mocked(prisma);
 const mockedUser = mockedPrisma.user as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedDeliveryMode = mockedPrisma.deliveryMode as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedCart = mockedPrisma.cart as any;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -132,6 +135,39 @@ function makeDeliveryMode(overrides: Record<string, unknown> = {}) {
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
+  };
+}
+
+function makeConsumerUser(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "cuid_consumer_001",
+    role: "CONSUMER",
+    email: "consumer@example.com",
+    ...overrides,
+  };
+}
+
+function makeCartForCheckout(producerIds: string[]) {
+  return {
+    id: "cart_001",
+    userId: "cuid_consumer_001",
+    items: producerIds.map((producerId, index) => ({
+      id: `cart_item_${index}`,
+      productId: `product_${index}`,
+      quantity: 1,
+      unitPriceSnapshot: new Decimal("10.00"),
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      product: {
+        id: `product_${index}`,
+        name: `Product ${index}`,
+        price: new Decimal("10.00"),
+        stock: 10,
+        isActive: true,
+        deletedAt: null,
+        producer: { id: producerId, deletedAt: null },
+      },
+    })),
   };
 }
 
@@ -522,5 +558,125 @@ describe("Enum widening rejection — unknown type rejected at API boundary", ()
 
     expect(res.status).toBe(422);
     expect(res.body.code).toBe("VALIDATION_FAILED");
+  });
+});
+
+// ===========================================================================
+// GET /api/v1/pagos/delivery-modes — checkout-delivery-modes (WU2 RED)
+// ===========================================================================
+
+describe("GET /api/v1/pagos/delivery-modes — consumer delivery modes", () => {
+  it("[BE1-R1a] returns 401 without authentication", async () => {
+    const res = await request.get("/api/v1/pagos/delivery-modes");
+
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe("UNAUTHORIZED");
+  });
+
+  it("[BE1-R1b] returns 403 ONBOARDING_REQUIRED for a pending caller", async () => {
+    const sub = "auth0|pending-consumer";
+    mockLoadUser(makeConsumerUser({ auth0Sub: sub, role: "PENDING_ROLE" }) as ReturnType<typeof makeProducerUser>);
+
+    const res = await request
+      .get("/api/v1/pagos/delivery-modes")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("ONBOARDING_REQUIRED");
+  });
+
+  it("[BE1-R2] returns one active-mode group for each distinct producer in a multi-producer cart", async () => {
+    const sub = "auth0|consumer001";
+    mockLoadUser(makeConsumerUser({ auth0Sub: sub }) as ReturnType<typeof makeProducerUser>);
+    mockedCart.findUnique.mockResolvedValueOnce(makeCartForCheckout(["prod_a", "prod_b", "prod_a"]));
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([
+      makeDeliveryMode({ id: "dm_shipping", producerId: "prod_a", cost: new Decimal("5.50") }),
+      makeDeliveryMode({
+        id: "dm_pickup",
+        producerId: "prod_b",
+        type: "PICKUP" as DeliveryModeType,
+        cost: new Decimal("0.00"),
+        pickupLocation: "Calle Mayor 1",
+      }),
+    ]);
+
+    const res = await request
+      .get("/api/v1/pagos/delivery-modes")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      { producerId: "prod_a", modes: [{ id: "dm_shipping", name: "Shipping", type: "shipping", price: "5.50" }] },
+      { producerId: "prod_b", modes: [{ id: "dm_pickup", name: "Pickup", type: "pickup", price: "0.00" }] },
+    ]);
+  });
+
+  it("[BE1-R2b] returns an empty array for an existing empty cart", async () => {
+    const sub = "auth0|consumer001";
+    mockLoadUser(makeConsumerUser({ auth0Sub: sub }) as ReturnType<typeof makeProducerUser>);
+    mockedCart.findUnique.mockResolvedValueOnce(makeCartForCheckout([]));
+
+    const res = await request
+      .get("/api/v1/pagos/delivery-modes")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+    expect(mockedDeliveryMode.findMany).not.toHaveBeenCalled();
+  });
+
+  it("[BE1-R3a] excludes inactive and unrelated producer modes", async () => {
+    const sub = "auth0|consumer001";
+    mockLoadUser(makeConsumerUser({ auth0Sub: sub }) as ReturnType<typeof makeProducerUser>);
+    mockedCart.findUnique.mockResolvedValueOnce(makeCartForCheckout(["prod_a"]));
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([
+      makeDeliveryMode({ id: "dm_active", producerId: "prod_a" }),
+      makeDeliveryMode({ id: "dm_inactive", producerId: "prod_a", isActive: false }),
+      makeDeliveryMode({ id: "dm_unrelated", producerId: "prod_other" }),
+    ]);
+
+    const res = await request
+      .get("/api/v1/pagos/delivery-modes")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      { producerId: "prod_a", modes: [{ id: "dm_active", name: "Shipping", type: "shipping", price: "5.00" }] },
+    ]);
+    expect(mockedDeliveryMode.findMany).toHaveBeenCalledWith({
+      where: { producerId: { in: ["prod_a"] }, isActive: true },
+      orderBy: { createdAt: "asc" },
+    });
+  });
+
+  it("[BE1-R3b] preserves a cart producer group with no active modes", async () => {
+    const sub = "auth0|consumer001";
+    mockLoadUser(makeConsumerUser({ auth0Sub: sub }) as ReturnType<typeof makeProducerUser>);
+    mockedCart.findUnique.mockResolvedValueOnce(makeCartForCheckout(["prod_a"]));
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([]);
+
+    const res = await request
+      .get("/api/v1/pagos/delivery-modes")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([{ producerId: "prod_a", modes: [] }]);
+  });
+
+  it("[BE1-R4] serializes exactly four DTO fields and performs no write", async () => {
+    const sub = "auth0|consumer001";
+    mockLoadUser(makeConsumerUser({ auth0Sub: sub }) as ReturnType<typeof makeProducerUser>);
+    mockedCart.findUnique.mockResolvedValueOnce(makeCartForCheckout(["prod_a"]));
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryMode({ producerId: "prod_a" })]);
+
+    const res = await request
+      .get("/api/v1/pagos/delivery-modes")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body[0].modes[0])).toEqual(["id", "name", "type", "price"]);
+    expect(mockedDeliveryMode.create).not.toHaveBeenCalled();
+    expect(mockedDeliveryMode.update).not.toHaveBeenCalled();
+    expect(mockedDeliveryMode.delete).not.toHaveBeenCalled();
   });
 });
