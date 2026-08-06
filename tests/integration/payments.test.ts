@@ -194,12 +194,35 @@ function makeSucceededEvent(args: {
   };
 }
 
-function makeFailedEvent(args: { intentId: string; amountCents: number }): StripeEvent {
+function makeFailedEvent(args: { intentId: string; amountCents: number; userId?: string }): StripeEvent {
   return {
     id: `evt_${args.intentId}`,
     type: "payment_intent.payment_failed",
-    data: { object: { id: args.intentId, amount: args.amountCents } },
+    data: { object: { id: args.intentId, amount: args.amountCents, metadata: { userId: args.userId ?? "" } } },
   };
+}
+
+function makeCanceledEvent(args: { intentId: string; amountCents: number; userId: string }): StripeEvent {
+  return {
+    id: `evt_${args.intentId}`,
+    type: "payment_intent.canceled",
+    data: { object: { id: args.intentId, amount: args.amountCents, metadata: { userId: args.userId } } },
+  };
+}
+
+async function seedProcessingCheckout(userId: string, providerRef: string): Promise<void> {
+  await db.pendingCheckout.create({
+    data: {
+      fingerprint: `fingerprint_${providerRef}`,
+      providerRef,
+      userId,
+      addressLine1: "Pending checkout address",
+      addressCity: "Alicante",
+      addressPostalCode: "03001",
+      addressProvince: "Alicante",
+      addressCountry: "ES",
+    },
+  });
 }
 
 // ===========================================================================
@@ -571,7 +594,7 @@ describe("POST /api/v1/pagos/webhook — unhandled event type is a no-op [WU2-3]
 
       mockedConstructEvent.mockReturnValueOnce({
         id: "evt_wu2_unhandled",
-        type: "payment_intent.canceled",
+        type: "charge.refunded",
         data: { object: {} },
       });
 
@@ -581,7 +604,7 @@ describe("POST /api/v1/pagos/webhook — unhandled event type is a no-op [WU2-3]
       const res = await request
         .post("/api/v1/pagos/webhook")
         .set("stripe-signature", "t=1,v1=validlooking")
-        .send({ id: "evt_wu2_unhandled", type: "payment_intent.canceled" });
+        .send({ id: "evt_wu2_unhandled", type: "charge.refunded" });
 
       expect(res.status).toBe(200);
 
@@ -1274,4 +1297,296 @@ describe("[WU1] checkout-contracts migration — PendingCheckout table", () => {
     },
     20000,
   );
+});
+
+// ===========================================================================
+// checkout-contracts WU3 — BE-2 payment status and canceled webhook [BE2]
+// ===========================================================================
+
+describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R1 guards", () => {
+  it("[BE2-R1-OWNER] allows an onboarded owner to read a persisted payment status", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const consumer = await seedConsumer(db, cleanup, "be2-owner-read");
+    const providerRef = "pi_be2_owner_read";
+    cleanup.providerRefs.push(providerRef);
+    await db.payment.create({ data: { providerRef, userId: consumer.id, status: "FAILED", amount: 7 } });
+    const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-owner-read"));
+    expect(res.body).toEqual({ state: "FAILED", orderId: null, code: "PAYMENT_FAILED" });
+  });
+
+  it("[BE2-R1-401] rejects an unauthenticated status poll", async () => {
+    const res = await request.get("/api/v1/pagos/status/pi_be2_unauthenticated");
+    expect(res.status).toBe(401);
+  });
+
+  it("[BE2-R1-403] rejects an authenticated caller who has not completed onboarding", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const user = await db.user.create({
+      data: { auth0Sub: "test-payments-be2-pending", email: "be2-pending@test.local", role: "PENDING_ROLE" },
+    });
+    cleanup.userIds.push(user.id);
+
+    const res = await request
+      .get("/api/v1/pagos/status/pi_be2_pending")
+      .set("x-test-auth", authHeader(consumerClaim("test-payments-be2-pending")));
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "ONBOARDING_REQUIRED" });
+  });
+});
+
+describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R2 no-leak 404", () => {
+  it("[BE2-R2-UNKNOWN] returns NOT_FOUND for an unknown payment intent id", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    await seedConsumer(db, cleanup, "be2-unknown");
+    const res = await request.get("/api/v1/pagos/status/pi_be2_absent").set("x-test-auth", consumerAuthHeaderFor("be2-unknown"));
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("[BE2-R2] returns byte-identical NOT_FOUND bodies for unknown and unowned intent ids", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const owner = await seedConsumer(db, cleanup, "be2-owner");
+    const other = await seedConsumer(db, cleanup, "be2-other");
+    const providerRef = "pi_be2_unowned";
+    cleanup.providerRefs.push(providerRef);
+    await db.payment.create({ data: { providerRef, userId: owner.id, status: "FAILED", amount: 7 } });
+
+    const unknown = await request
+      .get("/api/v1/pagos/status/pi_be2_unknown")
+      .set("x-test-auth", consumerAuthHeaderFor("be2-other"));
+    const unowned = await request
+      .get(`/api/v1/pagos/status/${providerRef}`)
+      .set("x-test-auth", consumerAuthHeaderFor("be2-other"));
+
+    expect(other.id).not.toBe(owner.id);
+    expect(unknown.status).toBe(404);
+    expect(unowned.status).toBe(404);
+    expect(unowned.text).toBe(unknown.text);
+    expect(unknown.body).toMatchObject({ code: "NOT_FOUND" });
+  });
+});
+
+describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R3 five states", () => {
+  it("[BE2-R3-PROCESSING-INTENT] returns PROCESSING immediately after the owner creates an intent", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "be2-intent-processing", nif: "B20000204",
+    });
+    const providerRef = "pi_be2_intent_processing";
+    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: providerRef, client_secret: "secret_be2_processing" });
+
+    const intent = await request
+      .post("/api/v1/pagos/intent")
+      .set("x-test-auth", consumerAuthHeaderFor("be2-intent-processing"))
+      .send({ deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }] });
+    expect(intent.status).toBe(201);
+    expect(intent.body).toEqual({ clientSecret: "secret_be2_processing" });
+
+    const status = await request
+      .get(`/api/v1/pagos/status/${providerRef}`)
+      .set("x-test-auth", consumerAuthHeaderFor("be2-intent-processing"));
+    expect(status.status).toBe(200);
+    expect(status.body).toEqual({ state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" });
+  });
+
+  it("[BE2-R3-PROCESSING] returns PROCESSING for an owner-bound PendingCheckout before a Payment row exists", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const consumer = await seedConsumer(db, cleanup, "be2-processing");
+    const providerRef = "pi_be2_processing";
+    await seedProcessingCheckout(consumer.id, providerRef);
+
+    const res = await request
+      .get(`/api/v1/pagos/status/${providerRef}`)
+      .set("x-test-auth", consumerAuthHeaderFor("be2-processing"));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" });
+  });
+
+  it("[BE2-R3-SUCCEEDED] returns SUCCEEDED with the linked order id", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "be2-succeeded", nif: "B20000201",
+    });
+    const providerRef = "pi_be2_succeeded";
+    cleanup.providerRefs.push(providerRef);
+    mockedConstructEvent.mockReturnValueOnce(makeSucceededEvent({
+      intentId: providerRef, amountCents: 700, userId: consumer.id, cartId,
+      deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+    }));
+    await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+
+    const order = await db.order.findFirst({ where: { payment: { providerRef } } });
+    const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-succeeded"));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ state: "SUCCEEDED", orderId: order?.id, code: "PAYMENT_SUCCEEDED" });
+  });
+
+  it("[BE2-R3-FAILED] returns FAILED for an owner-bound failed webhook payment", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const consumer = await seedConsumer(db, cleanup, "be2-failed");
+    const providerRef = "pi_be2_failed";
+    cleanup.providerRefs.push(providerRef);
+    mockedConstructEvent.mockReturnValueOnce(makeFailedEvent({ intentId: providerRef, amountCents: 700, userId: consumer.id }));
+    await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+
+    const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-failed"));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ state: "FAILED", orderId: null, code: "PAYMENT_FAILED" });
+    expect(consumer.id).toBeTruthy();
+  });
+
+  it("[BE2-R3-PENDING] returns PENDING for a reconciliation-mismatch payment", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "be2-pending-status", nif: "B20000202",
+    });
+    const providerRef = "pi_be2_pending_status";
+    cleanup.providerRefs.push(providerRef);
+    mockedConstructEvent.mockReturnValueOnce(makeSucceededEvent({
+      intentId: providerRef, amountCents: 999, userId: consumer.id, cartId,
+      deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+    }));
+    await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+
+    const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-pending-status"));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" });
+  });
+
+  it("[BE2-R3-CANCELED] returns CANCELED for an owner-bound canceled webhook payment", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const consumer = await seedConsumer(db, cleanup, "be2-canceled-status");
+    const providerRef = "pi_be2_canceled_status";
+    cleanup.providerRefs.push(providerRef);
+    mockedConstructEvent.mockReturnValueOnce(makeCanceledEvent({ intentId: providerRef, amountCents: 700, userId: consumer.id }));
+    await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+
+    const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-canceled-status"));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ state: "CANCELED", orderId: null, code: "PAYMENT_CANCELED" });
+  });
+
+  it("[BE2-R3-REFUNDED] maps a persisted refund to the documented review state", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const consumer = await seedConsumer(db, cleanup, "be2-refunded-status");
+    const providerRef = "pi_be2_refunded_status";
+    cleanup.providerRefs.push(providerRef);
+    await db.payment.create({ data: { providerRef, userId: consumer.id, status: "REFUNDED", amount: 7 } });
+
+    const res = await request
+      .get(`/api/v1/pagos/status/${providerRef}`)
+      .set("x-test-auth", consumerAuthHeaderFor("be2-refunded-status"));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" });
+  });
+});
+
+describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R4 pure polling", () => {
+  it("[BE2-R4-NO-WRITES] repeated owner polls create or modify no rows and never call the Stripe boundary", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const consumer = await seedConsumer(db, cleanup, "be2-pure-read");
+    const providerRef = "pi_be2_pure_read";
+    await seedProcessingCheckout(consumer.id, providerRef);
+    const before = { payments: await db.payment.count(), orders: await db.order.count(), carts: await db.cart.count() };
+    vi.clearAllMocks();
+
+    const first = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-pure-read"));
+    const second = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-pure-read"));
+    expect(first.body).toEqual({ state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" });
+    expect(second.body).toEqual(first.body);
+    expect(await db.payment.count()).toBe(before.payments);
+    expect(await db.order.count()).toBe(before.orders);
+    expect(await db.cart.count()).toBe(before.carts);
+    expect(mockedConstructEvent).not.toHaveBeenCalled();
+  });
+
+  it("[BE2-R4-REDIRECT] reports PROCESSING rather than inferring success from a browser return", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const consumer = await seedConsumer(db, cleanup, "be2-redirect");
+    const providerRef = "pi_be2_redirect";
+    await seedProcessingCheckout(consumer.id, providerRef);
+    const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-redirect"));
+    expect(res.body).toEqual({ state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" });
+  });
+});
+
+describe("POST /api/v1/pagos/webhook — BE2-R5 canceled handling", () => {
+  it("[BE2-R5-PERSISTS] persists exactly one CANCELED payment without creating an order", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const consumer = await seedConsumer(db, cleanup, "be2-cancel-persist");
+    const providerRef = "pi_be2_cancel_persist";
+    cleanup.providerRefs.push(providerRef);
+    mockedConstructEvent.mockReturnValueOnce(makeCanceledEvent({ intentId: providerRef, amountCents: 700, userId: consumer.id }));
+    const res = await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+    expect(res.status).toBe(200);
+    expect(await db.payment.count({ where: { providerRef, status: "CANCELED" } })).toBe(1);
+    expect(await db.order.count({ where: { payment: { providerRef } } })).toBe(0);
+  });
+
+  it("[BE2-R5-SIGNATURE] rejects an invalid canceled signature before any write", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    mockedConstructEvent.mockImplementationOnce(() => { throw new Error("invalid signature"); });
+    const before = await db.payment.count();
+    const res = await request.post("/api/v1/pagos/webhook").set("stripe-signature", "bad").send({});
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: "WEBHOOK_SIGNATURE_INVALID" });
+    expect(await db.payment.count()).toBe(before);
+  });
+
+  it("[BE2-R5-REPLAY] makes a duplicate verified canceled event a no-op", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const consumer = await seedConsumer(db, cleanup, "be2-cancel-replay");
+    const providerRef = "pi_be2_cancel_replay";
+    cleanup.providerRefs.push(providerRef);
+    const event = makeCanceledEvent({ intentId: providerRef, amountCents: 700, userId: consumer.id });
+    mockedConstructEvent.mockReturnValue(event);
+    expect((await request.post("/api/v1/pagos/webhook").set("stripe-signature", "valid").send({})).status).toBe(200);
+    expect((await request.post("/api/v1/pagos/webhook").set("stripe-signature", "valid").send({})).status).toBe(200);
+    expect(await db.payment.count({ where: { providerRef } })).toBe(1);
+  });
+
+  it("[BE2-R5-ORDER] ignores a delayed verified failure after cancellation", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const consumer = await seedConsumer(db, cleanup, "be2-cancel-then-fail");
+    const providerRef = "pi_be2_cancel_then_fail";
+    cleanup.providerRefs.push(providerRef);
+    mockedConstructEvent
+      .mockReturnValueOnce(makeCanceledEvent({ intentId: providerRef, amountCents: 700, userId: consumer.id }))
+      .mockReturnValueOnce(makeFailedEvent({ intentId: providerRef, amountCents: 700, userId: consumer.id }));
+
+    expect((await request.post("/api/v1/pagos/webhook").set("stripe-signature", "valid").send({})).status).toBe(200);
+    expect((await request.post("/api/v1/pagos/webhook").set("stripe-signature", "valid").send({})).status).toBe(200);
+    expect((await db.payment.findUnique({ where: { providerRef } }))?.status).toBe("CANCELED");
+    expect(await db.order.count({ where: { payment: { providerRef } } })).toBe(0);
+  });
+
+  it("[BE2-R5-TERMINAL] ignores a verified canceled event after success and leaves the order unchanged", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "be2-cancel-terminal", nif: "B20000203",
+    });
+    const providerRef = "pi_be2_cancel_terminal";
+    cleanup.providerRefs.push(providerRef);
+    mockedConstructEvent.mockReturnValueOnce(makeSucceededEvent({
+      intentId: providerRef, amountCents: 700, userId: consumer.id, cartId,
+      deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+    }));
+    await request.post("/api/v1/pagos/webhook").set("stripe-signature", "valid").send({});
+    const ordersBefore = await db.order.count({ where: { payment: { providerRef } } });
+    mockedConstructEvent.mockReturnValueOnce(makeCanceledEvent({ intentId: providerRef, amountCents: 700, userId: consumer.id }));
+    const res = await request.post("/api/v1/pagos/webhook").set("stripe-signature", "valid").send({});
+    expect(res.status).toBe(200);
+    expect((await db.payment.findUnique({ where: { providerRef } }))?.status).toBe("SUCCEEDED");
+    expect(await db.order.count({ where: { payment: { providerRef } } })).toBe(ordersBefore);
+  });
 });

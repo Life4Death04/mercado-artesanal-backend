@@ -66,6 +66,31 @@ export async function getDeliveryModes(
   }
 }
 
+/** GET /api/v1/pagos/status/:paymentIntentId — owner-scoped payment polling. */
+export async function getPaymentStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const rawPaymentIntentId = req.params["paymentIntentId"];
+    const paymentIntentId = Array.isArray(rawPaymentIntentId) ? rawPaymentIntentId[0] ?? "" : rawPaymentIntentId ?? "";
+    const status = await paymentsService.getPaymentStatus(req.user!.id, paymentIntentId);
+    if (!status) {
+      // The no-leak contract requires unknown and unowned ids to produce the
+      // same bytes, including an invariant problem instance value.
+      res.status(404).type("application/problem+json").json({
+        type: "/errors/not-found",
+        title: "Not found",
+        status: 404,
+        detail: "Payment not found",
+        code: "NOT_FOUND",
+        instance: "payment-status",
+      });
+      return;
+    }
+    res.status(200).json(status);
+  } catch (err) {
+    next(err);
+  }
+}
+
 /**
  * POST /api/v1/pagos/webhook
  * Unauthenticated (server-to-server) — verifies the Stripe signature over

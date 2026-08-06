@@ -81,7 +81,7 @@ type DecimalValue = InstanceType<typeof PrismaValue.Decimal>;
 
 export type OrderStatusValue = "PENDING" | "PARTIAL" | "FULFILLED" | "CANCELLED";
 export type SubOrderStatusValue = "pending" | "preparing" | "sent" | "delivered" | "cancelled";
-export type PaymentStatusValue = "PENDING" | "SUCCEEDED" | "FAILED" | "REFUNDED";
+export type PaymentStatusValue = "PENDING" | "SUCCEEDED" | "FAILED" | "CANCELED" | "REFUNDED";
 
 export interface DeliverySelection {
   producerId: string;
