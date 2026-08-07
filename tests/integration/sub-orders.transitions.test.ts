@@ -15,9 +15,15 @@
  *   [SO-T1] PATCH /producers/me/sub-orders/:id — 200 valid transition (pending→preparing)
  *   [SO-T2] PATCH /producers/me/sub-orders/:id — 409 INVALID_ORDER_TRANSITION (pending→delivered)
  *   [SO-T3] PATCH /producers/me/sub-orders/:id — 200 idempotent no-op (preparing→preparing)
- *   [SO-T4] PATCH /producers/me/sub-orders/:id — 422 VALIDATION_FAILED when trackingNumber sent
+ *   [SO-T4] PATCH /producers/me/sub-orders/:id — 422 VALIDATION_FAILED, PICKUP sub-order rejects trackingNumber
  *   [SO-T5] PATCH /producers/me/sub-orders/:id — 404 cross-producer (no-leak)
+ *   [SO-T6] PATCH /producers/me/sub-orders/:id — 200 shipping sub-order persists trackingNumber on →sent
+ *   [SO-T7] PATCH /producers/me/sub-orders/:id — 422 VALIDATION_FAILED, shipping sub-order missing trackingNumber on →sent
  *   [SO-T-unauth] PATCH /producers/me/sub-orders/:id — 401 unauthenticated
+ *
+ * NOTE — [SO-T4] formally supersedes the Cycle 2 "Attempt to set trackingNumber rejected"
+ * scenario (order-fulfillment §"Tracking number deferred", now REMOVED). This delta
+ * un-defers trackingNumber; see order-fulfillment §"Tracking number on shipment" (MODIFIED).
  *
  * Spec references:
  *   order-fulfillment §"State machine"
@@ -25,8 +31,10 @@
  *   order-fulfillment scenario "Invalid transition rejected"
  *   order-fulfillment §"Idempotent transitions"
  *   order-fulfillment scenario "Idempotent no-op does not touch the row"
- *   order-fulfillment §"Tracking number deferred"
- *   order-fulfillment scenario "Attempt to set trackingNumber rejected"
+ *   order-fulfillment §"Tracking number on shipment" (MODIFIED)
+ *   order-fulfillment scenario "PICKUP sub-order rejects trackingNumber"
+ *   order-fulfillment scenario "Shipping sub-order transitions to sent with a valid trackingNumber"
+ *   order-fulfillment scenario "Shipping sub-order to sent without trackingNumber rejected"
  */
 import supertest from "supertest";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -118,6 +126,7 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
     status: "pending" as SubOrderStatus,
     shippingCostSnapshot: new Decimal("5.00"),
     trackingNumber: null,
+    deliveryMode: { type: "SHIPPING_FLAT_RATE" },
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
@@ -269,22 +278,85 @@ describe("PATCH /api/v1/producers/me/sub-orders/:id — state machine transition
     expect(new Date(res.body.updatedAt as string).getTime()).toBe(t0.getTime());
   });
 
-  it("[SO-T4] returns 422 VALIDATION_FAILED when trackingNumber is in PATCH body", async () => {
-    // Spec: order-fulfillment §"Tracking number deferred"
-    // Spec scenario: "Attempt to set trackingNumber rejected"
-    // GIVEN S1(status=preparing)
-    // WHEN P1 PATCHes S1 with { trackingNumber: "TN1" }
-    // THEN Zod MUST reject the payload with VALIDATION_FAILED (422)
-    // (strictObject() treats trackingNumber as an unrecognized key)
+  it("[SO-T4] returns 422 VALIDATION_FAILED when a PICKUP sub-order carries a trackingNumber", async () => {
+    // Spec: order-fulfillment §"Tracking number on shipment" (MODIFIED)
+    // Spec scenario: "PICKUP sub-order rejects trackingNumber"
+    // Formally supersedes the Cycle 2 "Attempt to set trackingNumber rejected" scenario.
+    // GIVEN S1(status=preparing, deliveryMode.type=PICKUP)
+    // WHEN P1 PATCHes S1 with { status: "sent", trackingNumber: "TN1" }
+    // THEN the response MUST be 422 with code: "VALIDATION_FAILED"
     const sub = "auth0|producer001";
     const user = makeProducerUser({ auth0Sub: sub });
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
 
     mockLoadUser(user);
+    mockTransition(current); // gate rejects before update is ever called
 
     const res = await request
       .patch("/api/v1/producers/me/sub-orders/so_001")
       .set("X-Test-Auth", authHeader({ sub }))
-      .send({ trackingNumber: "TN1" });
+      .send({ status: "sent", trackingNumber: "TN1" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("VALIDATION_FAILED");
+  });
+
+  it("[SO-T6] returns 200 and persists trackingNumber when a shipping sub-order enters 'sent'", async () => {
+    // Spec: order-fulfillment §"Tracking number on shipment" (MODIFIED)
+    // Spec scenario: "Shipping sub-order transitions to sent with a valid trackingNumber"
+    // GIVEN S1(status=preparing, deliveryMode.type=SHIPPING_FLAT_RATE)
+    // WHEN P1 PATCHes S1 with { status: "sent", trackingNumber: "TN1" }
+    // THEN the response MUST be 200 with S1.status = "sent" and S1.trackingNumber = "TN1"
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: null,
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: "TN1",
+    });
+
+    mockLoadUser(user);
+    mockTransition(current, updated);
+
+    const res = await request
+      .patch("/api/v1/producers/me/sub-orders/so_001")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({ status: "sent", trackingNumber: "TN1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("sent");
+    expect(res.body.trackingNumber).toBe("TN1");
+  });
+
+  it("[SO-T7] returns 422 VALIDATION_FAILED when a shipping sub-order enters 'sent' without trackingNumber", async () => {
+    // Spec: order-fulfillment §"Tracking number on shipment" (MODIFIED)
+    // Spec scenario: "Shipping sub-order to sent without trackingNumber rejected"
+    // GIVEN S1(status=preparing, deliveryMode.type=SHIPPING_FLAT_RATE)
+    // WHEN P1 PATCHes S1 with { status: "sent" }
+    // THEN the response MUST be 422 with code: "VALIDATION_FAILED"
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: null,
+    });
+
+    mockLoadUser(user);
+    mockTransition(current);
+
+    const res = await request
+      .patch("/api/v1/producers/me/sub-orders/so_001")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({ status: "sent" });
 
     expect(res.status).toBe(422);
     expect(res.body.code).toBe("VALIDATION_FAILED");
