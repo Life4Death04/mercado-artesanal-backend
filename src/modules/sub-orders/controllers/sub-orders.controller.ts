@@ -16,7 +16,7 @@
  *   order-fulfillment §"Producer read of own SubOrders"
  *   order-fulfillment §"State machine"
  *   order-fulfillment §"Idempotent transitions"
- *   order-fulfillment §"Tracking number deferred"
+ *   order-fulfillment §"Tracking number on shipment" (MODIFIED)
  *   design — API surface table, Controller layer is thin
  */
 import type { NextFunction, Request, Response } from "express";
@@ -91,10 +91,16 @@ export async function getSubOrder(
  * Transitions SubOrder status via state machine. Returns 200 with updated SubOrder.
  * Returns 404 NOT_FOUND for cross-producer or missing IDs.
  * Returns 409 INVALID_ORDER_TRANSITION for invalid transitions.
- * Returns 422 VALIDATION_FAILED when body contains `trackingNumber` or unknown keys.
+ * Returns 422 VALIDATION_FAILED when body contains an unknown key, or when
+ * `trackingNumber` violates the tracking gate (wrong transition, PICKUP,
+ * immutable overwrite, or missing on a shipping `→sent`).
  *
- * Spec: order-fulfillment §"Tracking number deferred"
- * Scenario: "Attempt to set trackingNumber rejected"
+ * Spec: order-fulfillment §"Tracking number on shipment" (MODIFIED)
+ * Scenarios: "Shipping sub-order transitions to sent with a valid
+ * trackingNumber", "Shipping sub-order to sent without trackingNumber
+ * rejected", "PICKUP sub-order rejects trackingNumber", "Already-set
+ * trackingNumber cannot be overwritten", "trackingNumber rejected on a
+ * non-sent transition", "Same-status no-op cannot set trackingNumber"
  */
 export async function patchSubOrder(
   req: Request,
