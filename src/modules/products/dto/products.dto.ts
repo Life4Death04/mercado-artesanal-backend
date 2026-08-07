@@ -87,7 +87,10 @@ export type ReportProductBody = z.infer<typeof ReportProductSchema>;
  */
 export const ListPublicProductsQuerySchema = strictObject({
   categoryId: nonEmptyString.optional(),
-  available: z.coerce.boolean().optional(),
+  available: z
+    .enum(["true", "false"])
+    .transform((value) => value === "true")
+    .optional(),
   sort: z.enum(["asc", "desc"]).optional(),
 });
 

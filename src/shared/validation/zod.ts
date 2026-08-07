@@ -73,7 +73,11 @@ export const spanishPostalCodeSchema = z
  * Usage inside a controller or service:
  *   const body = validateBody(ConsumerOnboardingSchema, req.body);
  */
-export function validateBody<T>(schema: z.ZodType<T>, data: unknown): T {
+export function validateBody<S extends z.ZodTypeAny>(
+  schema: S,
+  data: unknown,
+  status: 400 | 422 = 422,
+): z.output<S> {
   const result = schema.safeParse(data);
 
   if (!result.success) {
@@ -81,7 +85,7 @@ export function validateBody<T>(schema: z.ZodType<T>, data: unknown): T {
       path: issue.path.map(String).join("."),
       message: issue.message,
     }));
-    throw new ValidationFailedError(errors);
+    throw new ValidationFailedError(errors, "Validation failed", status);
   }
 
   return result.data;

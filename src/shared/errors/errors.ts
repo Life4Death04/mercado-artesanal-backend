@@ -78,13 +78,18 @@ export class NifAlreadyRegisteredError extends AppError {
 
 export class ValidationFailedError extends AppError {
   readonly code = "VALIDATION_FAILED" as const;
-  readonly status = 422;
+  readonly status: 400 | 422;
   readonly title = "Validation failed";
   readonly errors: Array<{ path: string; message: string }>;
 
-  constructor(errors: Array<{ path: string; message: string }>, detail = "Validation failed") {
+  constructor(
+    errors: Array<{ path: string; message: string }>,
+    detail = "Validation failed",
+    status: 400 | 422 = 422,
+  ) {
     super(detail);
     this.errors = errors;
+    this.status = status;
   }
 }
 

@@ -196,7 +196,7 @@ export async function listPublicProducts(
   next: NextFunction,
 ): Promise<void> {
   try {
-    const query = validateBody(ListPublicProductsQuerySchema, req.query);
+    const query = validateBody(ListPublicProductsQuerySchema, req.query, 400);
     const products = await productsService.findAllPublic(query);
     res.status(200).json(products);
   } catch (err) {

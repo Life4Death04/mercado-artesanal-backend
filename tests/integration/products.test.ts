@@ -839,6 +839,25 @@ describe("GET /api/v1/products — public unauthenticated list", () => {
     );
   });
 
+  it("[PUB-L3b] available=false does not filter by stock", async () => {
+    mockedProduct.findMany.mockResolvedValueOnce([]);
+
+    await request.get("/api/v1/products?available=false").expect(200);
+
+    expect(mockedProduct.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.not.objectContaining({ stock: expect.anything() }),
+      }),
+    );
+  });
+
+  it("[PUB-L3c] rejects invalid available values", async () => {
+    const res = await request.get("/api/v1/products?available=invalid").expect(400);
+
+    expect(res.body.code).toBe("VALIDATION_FAILED");
+    expect(mockedProduct.findMany).not.toHaveBeenCalled();
+  });
+
   it("[PUB-L4] sort=asc orders results by price ascending (DB-level)", async () => {
     mockedProduct.findMany.mockResolvedValueOnce([]);
 
