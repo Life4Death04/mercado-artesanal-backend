@@ -72,3 +72,23 @@ export const ReportProductSchema = strictObject({
 });
 
 export type ReportProductBody = z.infer<typeof ReportProductSchema>;
+
+// ---------------------------------------------------------------------------
+// Public product list query (public-catalog capability — unauthenticated)
+// ---------------------------------------------------------------------------
+
+/**
+ * Query params for `GET /api/v1/products` (public, unauthenticated).
+ *
+ * `sort` values are `asc`/`desc` — matching spec public-catalog §"PUB-R1"
+ * exact scenario `GET /api/v1/products?sort=asc`, ordering by price.
+ *
+ * Spec: public-catalog §"PUB-R1 — Public product list".
+ */
+export const ListPublicProductsQuerySchema = strictObject({
+  categoryId: nonEmptyString.optional(),
+  available: z.coerce.boolean().optional(),
+  sort: z.enum(["asc", "desc"]).optional(),
+});
+
+export type ListPublicProductsQuery = z.infer<typeof ListPublicProductsQuerySchema>;

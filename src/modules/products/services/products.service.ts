@@ -31,7 +31,7 @@
  *            Decision #3 (DB-level ordering), Decision #4 (service maps, controller thin),
  *            Decision #5 (introduce ProductWithImages)
  */
-import type { ModerationStatus, Product, SubOrderStatus } from "@prisma/client";
+import type { ModerationStatus, Prisma, Product, SubOrderStatus } from "@prisma/client";
 
 import {
   CategoryNotFoundError,
@@ -40,6 +40,8 @@ import {
 } from "@/shared/errors/errors";
 import { toImageUrl } from "@/shared/utils/image-url";
 import { prisma } from "@/shared/utils/prisma";
+
+import type { ListPublicProductsQuery } from "../dto/products.dto";
 
 // ---------------------------------------------------------------------------
 // Response types (Slice 3 — image exposure)
@@ -353,4 +355,199 @@ export async function report(
       },
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Public catalog projection (public-catalog capability)
+// ---------------------------------------------------------------------------
+
+/**
+ * Public-safe producer summary — nested address shape mirrors
+ * producers.service.ts::PublicProducerProjection. PII fields (nif,
+ * addressLine1/2, addressPostalCode, userId) are never selected — defense
+ * in depth via the `select` whitelist below.
+ */
+export interface PublicProducerSummary {
+  id: string;
+  businessName: string;
+  description: string;
+  address: {
+    city: string;
+    province: string;
+    country: string;
+  };
+}
+
+/** Public-safe category summary. */
+export interface PublicCategorySummary {
+  id: string;
+  slug: string;
+  name: string;
+}
+
+/**
+ * Public product projection returned by findAllPublic/findPublicById.
+ * Spec: product-catalog... see public-catalog §"PUB-R4 — PII-safe projection shape".
+ */
+export interface PublicProductProjection {
+  id: string;
+  name: string;
+  description: string;
+  price: Product["price"];
+  stock: number;
+  ingredients: string | null;
+  allergens: string[];
+  weight: number | null;
+  presentation: string | null;
+  categoryId: string;
+  createdAt: Date;
+  images: ProductImageResponse[];
+  category: PublicCategorySummary;
+  producer: PublicProducerSummary;
+}
+
+/**
+ * Visibility filter (SECURITY-CRITICAL) shared by findAllPublic and
+ * findPublicById. A product is publicly visible ONLY when ALL four
+ * conditions hold — dropping any condition is a security defect.
+ * Spec: public-catalog §"PUB-R3 — Visibility exclusion filter".
+ */
+const PUBLIC_PRODUCT_WHERE = {
+  deletedAt: null,
+  isActive: true,
+  moderationStatus: "OK" as ModerationStatus,
+  producer: { deletedAt: null },
+};
+
+/**
+ * Select whitelist for the public catalog projection.
+ * `producer.select` is a PII-safety whitelist — NEVER replace with `include`.
+ * Mirrors producers.service.ts::findPublicById's defense-in-depth approach.
+ * Spec: public-catalog §"PUB-R4 — PII-safe projection shape".
+ */
+const PUBLIC_PRODUCT_SELECT = {
+  id: true,
+  name: true,
+  description: true,
+  price: true,
+  stock: true,
+  ingredients: true,
+  allergens: true,
+  weight: true,
+  presentation: true,
+  categoryId: true,
+  createdAt: true,
+  images: {
+    orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+    select: { id: true, position: true, s3Key: true },
+  },
+  category: { select: { id: true, slug: true, name: true } },
+  producer: {
+    select: {
+      id: true,
+      businessName: true,
+      description: true,
+      addressCity: true,
+      addressProvince: true,
+      addressCountry: true,
+    },
+  },
+} satisfies Prisma.ProductSelect;
+
+type PublicProductRow = Prisma.ProductGetPayload<{ select: typeof PUBLIC_PRODUCT_SELECT }>;
+
+/**
+ * Map a raw public-select Prisma row to the wire-safe projection.
+ * Reuses mapImageRow (s3Key → url) — single source of truth for image mapping.
+ */
+function mapPublicProduct(row: PublicProductRow): PublicProductProjection {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    price: row.price,
+    stock: row.stock,
+    ingredients: row.ingredients,
+    allergens: row.allergens,
+    weight: row.weight,
+    presentation: row.presentation,
+    categoryId: row.categoryId,
+    createdAt: row.createdAt,
+    images: row.images.map(mapImageRow),
+    category: row.category,
+    producer: {
+      id: row.producer.id,
+      businessName: row.producer.businessName,
+      description: row.producer.description,
+      address: {
+        city: row.producer.addressCity,
+        province: row.producer.addressProvince,
+        country: row.producer.addressCountry,
+      },
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// findAllPublic
+// ---------------------------------------------------------------------------
+
+/**
+ * List publicly visible products with optional category/availability
+ * filters and price sort. No default filter beyond the four-condition
+ * visibility gate — category is a filter param only (LOCKED design decision:
+ * no active-category gate).
+ *
+ * Spec: public-catalog §"PUB-R1", §"PUB-R3", §"PUB-R4".
+ */
+export async function findAllPublic(
+  query: ListPublicProductsQuery,
+): Promise<PublicProductProjection[]> {
+  const where: Prisma.ProductWhereInput = {
+    ...PUBLIC_PRODUCT_WHERE,
+    ...(query.categoryId !== undefined && { categoryId: query.categoryId }),
+    ...(query.available === true && { stock: { gt: 0 } }),
+  };
+
+  const orderBy: Prisma.ProductOrderByWithRelationInput =
+    query.sort === "asc"
+      ? { price: "asc" }
+      : query.sort === "desc"
+        ? { price: "desc" }
+        : { createdAt: "desc" };
+
+  const products = await prisma.product.findMany({
+    where,
+    orderBy,
+    select: PUBLIC_PRODUCT_SELECT,
+  });
+
+  return products.map(mapPublicProduct);
+}
+
+// ---------------------------------------------------------------------------
+// findPublicById
+// ---------------------------------------------------------------------------
+
+/**
+ * Get a single publicly visible product by id.
+ *
+ * Hidden (soft-deleted, inactive, REPORTED/REMOVED moderation, or
+ * soft-deleted producer) and non-existent ids both resolve to the same
+ * ProductNotFoundError (404, no-leak) — identical pattern to
+ * producers.service.ts::findPublicById.
+ *
+ * Spec: public-catalog §"PUB-R2", §"PUB-R3", §"PUB-R4".
+ */
+export async function findPublicById(id: string): Promise<PublicProductProjection> {
+  const product = await prisma.product.findFirst({
+    where: { id, ...PUBLIC_PRODUCT_WHERE },
+    select: PUBLIC_PRODUCT_SELECT,
+  });
+
+  if (!product) {
+    throw new ProductNotFoundError("Product not found");
+  }
+
+  return mapPublicProduct(product);
 }
