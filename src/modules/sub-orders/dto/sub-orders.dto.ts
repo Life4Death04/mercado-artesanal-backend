@@ -1,21 +1,26 @@
 /**
  * Sub-orders DTOs — Zod schemas for request body and query validation.
  *
- * All Cycle 2 DTOs use `strictObject()` to enforce the strict DTO policy
- * (rejects unknown keys with VALIDATION_FAILED 422 via global errorMap).
+ * All DTOs use `strictObject()` to enforce the strict DTO policy (rejects
+ * unknown keys with VALIDATION_FAILED 422 via global errorMap).
  *
  * Key design decisions:
- *   - PatchSubOrderBodySchema accepts only `status`. `trackingNumber` is
- *     intentionally ABSENT — it is deferred to Cycle 3 (COURIER mode / RF-21).
- *     Any payload containing `trackingNumber` hits the `.strict()` guard and
- *     is rejected with VALIDATION_FAILED (422).
+ *   - PatchSubOrderBodySchema accepts `status` and an optional `trackingNumber`.
+ *     `trackingNumber` is SHAPE-ONLY here (`z.string().min(1).optional()`, no
+ *     trim/normalization, persisted verbatim). The business rules — mandatory
+ *     for shipping on `→sent`, rejected for PICKUP, immutable once set, only
+ *     accepted on the PATCH that transitions into `sent` — are enforced in
+ *     `sub-orders.service.ts` `transition()`, NOT here, because they depend on
+ *     `deliveryMode.type` (a DB row) and the currently persisted `trackingNumber`,
+ *     neither of which is available at the schema boundary (design Decision #1).
  *
  * Spec references:
  *   order-fulfillment §"State machine"
- *   order-fulfillment §"Tracking number deferred" — trackingNumber MUST NOT be settable in Cycle 2.
- *   order-fulfillment scenario "Attempt to set trackingNumber rejected"
- *   error-handling §"Zod .strict() policy for unknown keys" (Cycle 2)
- *   design — Architecture Decision #1 (strictObject project-wide)
+ *   order-fulfillment §"Tracking number on shipment" (MODIFIED)
+ *   order-fulfillment scenario "Shipping sub-order transitions to sent with a valid trackingNumber"
+ *   order-fulfillment scenario "PICKUP sub-order rejects trackingNumber"
+ *   error-handling §"Zod .strict() policy for unknown keys"
+ *   design — Architecture Decision #1 (strictObject project-wide) and #5 (no trim/normalization)
  */
 import { z } from "zod";
 
@@ -71,18 +76,21 @@ export type ListSubOrdersQuery = z.infer<typeof ListSubOrdersQuerySchema>;
 /**
  * Body for PATCH /producers/me/sub-orders/:id.
  *
- * Accepts ONLY `status`. The absence of `trackingNumber` here is deliberate —
- * it is a DEFERRED field per spec order-fulfillment §"Tracking number deferred".
+ * Accepts `status` and an optional `trackingNumber`. `trackingNumber` is
+ * shape-only here — `.min(1)` blocks an empty string; no trim/normalization
+ * (persisted verbatim per design Decision #5). The business rules (mandatory
+ * for shipping on `→sent`, rejected for PICKUP, immutable once set, only
+ * accepted on the PATCH transitioning into `sent`) are enforced in
+ * `sub-orders.service.ts` `transition()` — see design Decision #1.
  *
- * Any body containing `trackingNumber` or any other unknown key WILL be
- * rejected by the .strict() guard with VALIDATION_FAILED (422). This is
- * enforced at the DTO level (schema boundary), not the service level.
+ * Any other unknown key is still rejected by the .strict() guard with
+ * VALIDATION_FAILED (422).
  *
- * Spec: order-fulfillment §"State machine", §"Tracking number deferred"
- * Spec scenario: "Attempt to set trackingNumber rejected"
+ * Spec: order-fulfillment §"State machine", §"Tracking number on shipment" (MODIFIED)
  */
 export const PatchSubOrderBodySchema = strictObject({
   status: SubOrderStatusSchema,
+  trackingNumber: z.string().min(1).optional(),
 });
 
 export type PatchSubOrderBody = z.infer<typeof PatchSubOrderBodySchema>;

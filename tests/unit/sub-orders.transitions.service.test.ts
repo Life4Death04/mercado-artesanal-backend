@@ -8,9 +8,10 @@
  *   - idempotent no-op does NOT call update (SQL no-update assertion)
  *   - terminal state transitions are rejected
  *
- * Note: trackingNumber rejection is covered at the DTO level (integration test [SO-T4]).
- * The service itself never sees the trackingNumber field because the controller's
- * validateBody(PatchSubOrderBodySchema) rejects it before calling service.transition().
+ * trackingNumber gate (order-fulfillment MODIFIED — "Tracking number on shipment"):
+ * the service enforces the tracking rules itself (design Decision #1) using the
+ * `deliveryMode.type` loaded alongside the ownership `findFirst`. The gate runs
+ * BEFORE the idempotent same-status no-op early-return (design Decision #3).
  *
  * Scenarios covered (specs: order-fulfillment):
  *
@@ -35,12 +36,28 @@
  *   - throws NotFoundError when SubOrder not owned by producer (cross-producer)
  *   - throws NotFoundError when SubOrder id does not exist
  *
+ * transition — trackingNumber gate:
+ *   - PICKUP sub-order + trackingNumber → ValidationFailedError (422)
+ *   - shipping sub-order entering "sent" without trackingNumber → ValidationFailedError (422)
+ *   - trackingNumber present on a non-"sent" target → ValidationFailedError (422)
+ *   - already-set trackingNumber cannot be overwritten → ValidationFailedError (422)
+ *   - same-status "sent → sent" no-op with trackingNumber → ValidationFailedError (422),
+ *     gate runs BEFORE the no-op early-return (update MUST NOT be called)
+ *   - valid shipping sub-order entering "sent" persists trackingNumber in the update payload
+ *
  * Spec references:
  *   order-fulfillment §"State machine"
  *   order-fulfillment scenario "Valid transition succeeds"
  *   order-fulfillment scenario "Invalid transition rejected"
  *   order-fulfillment §"Idempotent transitions"
  *   order-fulfillment scenario "Idempotent no-op does not touch the row"
+ *   order-fulfillment §"Tracking number on shipment" (MODIFIED)
+ *   order-fulfillment scenario "Shipping sub-order transitions to sent with a valid trackingNumber"
+ *   order-fulfillment scenario "Shipping sub-order to sent without trackingNumber rejected"
+ *   order-fulfillment scenario "PICKUP sub-order rejects trackingNumber"
+ *   order-fulfillment scenario "Already-set trackingNumber cannot be overwritten"
+ *   order-fulfillment scenario "trackingNumber rejected on a non-sent transition"
+ *   order-fulfillment scenario "Same-status no-op cannot set trackingNumber"
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -63,7 +80,7 @@ vi.mock("@/shared/utils/prisma", () => {
 import type { SubOrderStatus } from "@prisma/client";
 import { Decimal } from "@prisma/client/runtime/library";
 import { prisma } from "@/shared/utils/prisma";
-import { InvalidOrderTransitionError, NotFoundError } from "@/shared/errors/errors";
+import { InvalidOrderTransitionError, NotFoundError, ValidationFailedError } from "@/shared/errors/errors";
 import * as subOrdersService from "@/modules/sub-orders/services/sub-orders.service";
 
 // ---------------------------------------------------------------------------
@@ -84,6 +101,7 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
     status: "pending" as SubOrderStatus,
     shippingCostSnapshot: new Decimal("5.00"),
     trackingNumber: null,
+    deliveryMode: { type: "SHIPPING_FLAT_RATE" },
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
@@ -139,9 +157,13 @@ describe("subOrdersService.transition — valid transitions", () => {
     });
   });
 
-  it("transitions preparing → sent", async () => {
-    const current = makeSubOrder({ status: "preparing" as SubOrderStatus });
-    const updated = makeSubOrder({ status: "sent" as SubOrderStatus });
+  it("transitions preparing → sent (PICKUP — no trackingNumber required)", async () => {
+    // PICKUP sub-orders never require trackingNumber (order-fulfillment MODIFIED).
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
+    const updated = makeSubOrder({ status: "sent" as SubOrderStatus, deliveryMode: { type: "PICKUP" } });
     mockTransaction(current, updated);
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "sent" });
@@ -270,5 +292,112 @@ describe("subOrdersService.transition — 404 no-leak", () => {
     await expect(
       subOrdersService.transition("prod_001", "nonexistent_id", { status: "preparing" }),
     ).rejects.toThrow(NotFoundError);
+  });
+});
+
+// ===========================================================================
+// transition — trackingNumber gate (order-fulfillment MODIFIED)
+// ===========================================================================
+
+describe("subOrdersService.transition — trackingNumber gate", () => {
+  it("throws ValidationFailedError when PICKUP sub-order carries a trackingNumber", async () => {
+    // Spec scenario: "PICKUP sub-order rejects trackingNumber"
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", { status: "sent", trackingNumber: "TN1" }),
+    ).rejects.toThrow(ValidationFailedError);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws ValidationFailedError when a shipping sub-order enters 'sent' without trackingNumber", async () => {
+    // Spec scenario: "Shipping sub-order to sent without trackingNumber rejected"
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", { status: "sent" }),
+    ).rejects.toThrow(ValidationFailedError);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws ValidationFailedError when trackingNumber is present on a non-'sent' target", async () => {
+    // Spec scenario: "trackingNumber rejected on a non-sent transition"
+    const current = makeSubOrder({
+      status: "pending" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", { status: "preparing", trackingNumber: "TN1" }),
+    ).rejects.toThrow(ValidationFailedError);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws ValidationFailedError when an already-set trackingNumber is overwritten", async () => {
+    // Spec scenario: "Already-set trackingNumber cannot be overwritten"
+    const current = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: "TN1",
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", { status: "sent", trackingNumber: "TN2" }),
+    ).rejects.toThrow(ValidationFailedError);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws ValidationFailedError on a same-status 'sent → sent' no-op carrying trackingNumber (gate runs before no-op)", async () => {
+    // Spec scenario: "Same-status no-op cannot set trackingNumber"
+    const current = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: null,
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", { status: "sent", trackingNumber: "TN1" }),
+    ).rejects.toThrow(ValidationFailedError);
+    // Gate runs BEFORE the idempotent no-op early-return AND before update.
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("persists trackingNumber when a shipping sub-order validly enters 'sent'", async () => {
+    // Spec scenario: "Shipping sub-order transitions to sent with a valid trackingNumber"
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: null,
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: "TN1",
+    });
+    const mockUpdate = mockTransaction(current, updated);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", {
+      status: "sent",
+      trackingNumber: "TN1",
+    });
+
+    expect(result.status).toBe("sent");
+    expect(result.trackingNumber).toBe("TN1");
+    expect(mockUpdate).toHaveBeenCalledOnce();
+    expect(mockUpdate).toHaveBeenCalledWith({
+      where: { id: "so_001" },
+      data: { status: "sent", trackingNumber: "TN1" },
+    });
   });
 });
