@@ -1238,6 +1238,92 @@ describe("GET /api/v1/pedidos/:id — exact spec fixture: 2 SubOrders, 3 OrderLi
 });
 
 // ===========================================================================
+// order-tracking WU2 — consumer read exposes trackingNumber + deliveryMode.type
+// ===========================================================================
+
+describe("GET /api/v1/pedidos/:id — trackingNumber and deliveryMode.type exposure [OH-TRACK]", () => {
+  it(
+    "[OH-TRACK] consumer detail exposes trackingNumber (set on a shipping sub-order after it ships) and deliveryMode.type per sub-order; trackingNumber stays null for PICKUP",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer: producerShip, category } = await seedProducer("ohtrk-ship", "B10000101");
+      const { producer: producerPickup } = await seedProducer("ohtrk-pickup", "B10000102");
+      const owner = await seedConsumer("ohtrk-owner");
+
+      const dmShip = await db.deliveryMode.create({
+        data: { producerId: producerShip.id, type: "SHIPPING_FLAT_RATE", cost: 2.0, isActive: true },
+      });
+      const dmPickup = await db.deliveryMode.create({
+        data: { producerId: producerPickup.id, type: "PICKUP", cost: 0, isActive: true },
+      });
+
+      const productShip = await db.product.create({
+        data: { producerId: producerShip.id, categoryId: category.id, name: "OHTrack Product Ship", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+      const productPickup = await db.product.create({
+        data: { producerId: producerPickup.id, categoryId: category.id, name: "OHTrack Product Pickup", description: "d", price: 8.0, stock: 10, isActive: true },
+      });
+
+      await cartService.addItem(owner.id, productShip.id, 1);
+      await cartService.addItem(owner.id, productPickup.id, 1);
+      const cartView = await cartService.getCartForCheckout(owner.id);
+      const created = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_ohtrack_tracking_exposure",
+          cartView,
+          [
+            { producerId: producerShip.id, deliveryModeId: dmShip.id },
+            { producerId: producerPickup.id, deliveryModeId: dmPickup.id },
+          ],
+          tx,
+        ),
+      );
+
+      const shippingSubOrderId = created.subOrders.find(
+        (s) => s.producerId === producerShip.id,
+      )!.id;
+
+      // Producer ships the SHIPPING_FLAT_RATE sub-order — the full write-path
+      // gate (trackingNumber mandatory/immutable/PICKUP-forbidden) is already
+      // proven in tests/unit/sub-orders.transitions.service.test.ts and
+      // tests/integration/sub-orders.transitions.test.ts (WU1); this test
+      // proves ONLY the consumer READ side, so it writes the post-gate state
+      // directly rather than re-driving the PATCH transition.
+      await db.subOrder.update({
+        where: { id: shippingSubOrderId },
+        data: { status: "sent", trackingNumber: "TN1" },
+      });
+
+      const ownerAuth = authHeader({ sub: owner.auth0Sub });
+      const detailRes = await request
+        .get(`/api/v1/pedidos/${created.id}`)
+        .set("x-test-auth", ownerAuth);
+
+      expect(detailRes.status).toBe(200);
+      const subOrders = detailRes.body.subOrders as Array<{
+        producerId: string;
+        trackingNumber: string | null;
+        deliveryMode: { type: string };
+      }>;
+      expect(subOrders).toHaveLength(2);
+
+      const shippingView = subOrders.find((s) => s.producerId === producerShip.id)!;
+      expect(shippingView.trackingNumber).toBe("TN1");
+      expect(shippingView.deliveryMode).toEqual({ type: "SHIPPING_FLAT_RATE" });
+
+      const pickupView = subOrders.find((s) => s.producerId === producerPickup.id)!;
+      expect(pickupView.trackingNumber).toBeNull();
+      expect(pickupView.deliveryMode).toEqual({ type: "PICKUP" });
+    },
+    30000,
+  );
+});
+
+// ===========================================================================
 // WU4 (Cancellation, real Postgres + Supertest) — design Decision 3
 // ===========================================================================
 
