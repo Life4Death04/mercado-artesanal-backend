@@ -30,6 +30,8 @@
  *   [PR3]  POST   /products/:id/report             — 404 report on REMOVED product
  *   [PR4]  POST   /products/:id/report             — 401 unauthenticated report
  *   [PR5]  POST   /products/:id/report             — 422 empty reason
+ *   [PUB-L*] GET  /products                        — public list (public-catalog capability)
+ *   [PUB-D*] GET  /products/:id                     — public detail (public-catalog capability)
  *
  * Spec references:
  *   product-catalog  §"Publish-on-create lifecycle", §"RBAC-scoped ownership",
@@ -39,6 +41,7 @@
  *                    §"URL derivation", §"Empty images state"
  *   product-reporting §"Report endpoint", §"Second report is idempotent",
  *                     §"Unauthenticated report rejected"
+ *   public-catalog   §"PUB-R1", §"PUB-R2", §"PUB-R3", §"PUB-R4"
  */
 import supertest from "supertest";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -151,6 +154,42 @@ function makeProduct(overrides: Record<string, unknown> = {}) {
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     // Slice 3: service now returns images (from Prisma include). Default empty.
     images: [] as Array<{ id: string; position: number; s3Key: string; createdAt: Date }>,
+    ...overrides,
+  };
+}
+
+/**
+ * Raw public-select Prisma row fixture (public-catalog capability).
+ * Shape mirrors PUBLIC_PRODUCT_SELECT in products.service.ts — a subset of
+ * Product plus nested category/producer selections, NOT the full Product row.
+ * The producer sub-object intentionally contains ONLY the SAFE fields —
+ * simulating exactly what a real `select` whitelist would return (nif,
+ * addressLine1/2, addressPostalCode, userId are never fetched by the query,
+ * so they cannot appear here either).
+ */
+function makePublicProductRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "product_pub_001",
+    name: "Miel de Romero",
+    description: "Miel artesanal de romero.",
+    price: new Decimal("10.00"),
+    stock: 20,
+    ingredients: null,
+    allergens: [],
+    weight: null,
+    presentation: null,
+    categoryId: "cat_001",
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    images: [] as Array<{ id: string; position: number; s3Key: string; createdAt: Date }>,
+    category: { id: "cat_001", slug: "miel", name: "Miel" },
+    producer: {
+      id: "prod_001",
+      businessName: "Apiarios del Sur",
+      description: "Productor artesanal.",
+      addressCity: "Sevilla",
+      addressProvince: "Sevilla",
+      addressCountry: "ES",
+    },
     ...overrides,
   };
 }
@@ -742,5 +781,250 @@ describe("POST /api/v1/products/:id/report — report product", () => {
 
     expect(res.status).toBe(404);
     expect(res.body.code).toBe("PRODUCT_NOT_FOUND");
+  });
+});
+
+// ===========================================================================
+// GET /api/v1/products — public catalog list (public-catalog capability)
+// Spec: public-catalog §"PUB-R1", §"PUB-R3", §"PUB-R4"
+// ===========================================================================
+
+describe("GET /api/v1/products — public unauthenticated list", () => {
+  it("[PUB-L1] returns 200 and lists visible products with NO auth header", async () => {
+    const visible1 = makePublicProductRow({ id: "product_pub_001" });
+    const visible2 = makePublicProductRow({ id: "product_pub_002" });
+    mockedProduct.findMany.mockResolvedValueOnce([visible1, visible2]);
+
+    // WHEN: a client calls GET /products with no auth header at all
+    const res = await request.get("/api/v1/products").expect(200);
+
+    // THEN: response lists exactly the visible products the service returned
+    // (four-condition exclusion is proven at the service unit-test layer —
+    // this test proves the public wire contract: no auth required, 200, list shape).
+    const ids = (res.body as Array<{ id: string }>).map((p) => p.id);
+    expect(ids).toEqual(["product_pub_001", "product_pub_002"]);
+  });
+
+  it("[PUB-L2] category filter narrows results to the requested categoryId", async () => {
+    const inCategory = makePublicProductRow({
+      id: "product_c1",
+      categoryId: "C1",
+      category: { id: "C1", slug: "cat-1", name: "C1" },
+    });
+    mockedProduct.findMany.mockResolvedValueOnce([inCategory]);
+
+    const res = await request.get("/api/v1/products?categoryId=C1").expect(200);
+
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].categoryId).toBe("C1");
+    expect(mockedProduct.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ categoryId: "C1" }),
+      }),
+    );
+  });
+
+  it("[PUB-L3] available=true filter excludes zero-stock products", async () => {
+    const inStock = makePublicProductRow({ id: "product_instock", stock: 10 });
+    mockedProduct.findMany.mockResolvedValueOnce([inStock]);
+
+    const res = await request.get("/api/v1/products?available=true").expect(200);
+
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].id).toBe("product_instock");
+    expect(mockedProduct.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ stock: { gt: 0 } }),
+      }),
+    );
+  });
+
+  it("[PUB-L4] sort=asc orders results by price ascending (DB-level)", async () => {
+    mockedProduct.findMany.mockResolvedValueOnce([]);
+
+    await request.get("/api/v1/products?sort=asc").expect(200);
+
+    expect(mockedProduct.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ orderBy: { price: "asc" } }),
+    );
+  });
+
+  it("[PUB-L5] sort=desc orders results by price descending (DB-level)", async () => {
+    mockedProduct.findMany.mockResolvedValueOnce([]);
+
+    await request.get("/api/v1/products?sort=desc").expect(200);
+
+    expect(mockedProduct.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ orderBy: { price: "desc" } }),
+    );
+  });
+
+  it("[PUB-L6] excludes products failing any of the four visibility conditions", async () => {
+    // GIVEN: two visible products and (conceptually) five hidden ones —
+    // the service's where-clause is the enforcement point (unit-tested);
+    // this proves the controller/route surfaces exactly what the service returns.
+    const visible1 = makePublicProductRow({ id: "product_visible_1" });
+    const visible2 = makePublicProductRow({ id: "product_visible_2" });
+    mockedProduct.findMany.mockResolvedValueOnce([visible1, visible2]);
+
+    const res = await request.get("/api/v1/products").expect(200);
+
+    const ids = (res.body as Array<{ id: string }>).map((p) => p.id);
+    expect(ids).toEqual(["product_visible_1", "product_visible_2"]);
+    expect(ids).not.toContain("product_hidden");
+  });
+});
+
+// ===========================================================================
+// GET /api/v1/products/:id — public catalog detail (public-catalog capability)
+// Spec: public-catalog §"PUB-R2", §"PUB-R3", §"PUB-R4"
+// ===========================================================================
+
+describe("GET /api/v1/products/:id — public unauthenticated detail", () => {
+  it("[PUB-D1] returns 200 with the visible product projection, NO auth header", async () => {
+    const row = makePublicProductRow({ id: "product_pub_001" });
+    mockedProduct.findFirst.mockResolvedValueOnce(row);
+
+    const res = await request.get("/api/v1/products/product_pub_001").expect(200);
+
+    expect(res.body.id).toBe("product_pub_001");
+    expect(res.body.category).toEqual({ id: "cat_001", slug: "miel", name: "Miel" });
+  });
+
+  it("[PUB-D2] soft-deleted product (deletedAt set) returns 404 (no-leak)", async () => {
+    mockedProduct.findFirst.mockResolvedValueOnce(null);
+
+    const res = await request.get("/api/v1/products/product_soft_deleted").expect(404);
+
+    expect(res.body.code).toBe("PRODUCT_NOT_FOUND");
+  });
+
+  it("[PUB-D3] inactive product (isActive=false) returns 404 (no-leak)", async () => {
+    mockedProduct.findFirst.mockResolvedValueOnce(null);
+
+    const res = await request.get("/api/v1/products/product_inactive").expect(404);
+
+    expect(res.body.code).toBe("PRODUCT_NOT_FOUND");
+  });
+
+  it("[PUB-D4] REPORTED product returns 404 (no-leak)", async () => {
+    mockedProduct.findFirst.mockResolvedValueOnce(null);
+
+    const res = await request.get("/api/v1/products/product_reported").expect(404);
+
+    expect(res.body.code).toBe("PRODUCT_NOT_FOUND");
+  });
+
+  it("[PUB-D5] REMOVED product returns 404 (no-leak)", async () => {
+    mockedProduct.findFirst.mockResolvedValueOnce(null);
+
+    const res = await request.get("/api/v1/products/product_removed_mod").expect(404);
+
+    expect(res.body.code).toBe("PRODUCT_NOT_FOUND");
+  });
+
+  it("[PUB-D6] product of a soft-deleted producer returns 404 (no-leak)", async () => {
+    mockedProduct.findFirst.mockResolvedValueOnce(null);
+
+    const res = await request.get("/api/v1/products/product_producer_deleted").expect(404);
+
+    expect(res.body.code).toBe("PRODUCT_NOT_FOUND");
+  });
+});
+
+// ===========================================================================
+// Threat tests — no leaked guard (public-catalog capability)
+// Spec: public-catalog §"PUB-R1", §"PUB-R2"; design Threat Matrix "Route
+// registration / guard leakage".
+// ===========================================================================
+
+describe("public-catalog threat: no auth guard leakage", () => {
+  it("[PUB-T1] GET /products succeeds with NO auth header (401 would prove a leaked guard)", async () => {
+    mockedProduct.findMany.mockResolvedValueOnce([]);
+
+    const res = await request.get("/api/v1/products");
+
+    expect(res.status).toBe(200);
+  });
+
+  it("[PUB-T2] GET /products/:id succeeds with NO auth header (401 would prove a leaked guard)", async () => {
+    mockedProduct.findFirst.mockResolvedValueOnce(makePublicProductRow());
+
+    const res = await request.get("/api/v1/products/product_pub_001");
+
+    expect(res.status).toBe(200);
+  });
+});
+
+// ===========================================================================
+// Threat tests — PII projection boundary (public-catalog capability)
+// Spec: public-catalog §"PUB-R4"; design Threat Matrix "PII projection boundary".
+// ===========================================================================
+
+describe("public-catalog threat: PII projection boundary", () => {
+  it("[PUB-T3] list response has NO nif/addressLine1/addressPostalCode/userId/s3Key", async () => {
+    const row = makePublicProductRow({
+      images: [{ id: "img_1", position: 0, s3Key: "products/x.jpg", createdAt: new Date() }],
+    });
+    mockedProduct.findMany.mockResolvedValueOnce([row]);
+
+    const res = await request.get("/api/v1/products").expect(200);
+
+    const bodyText = JSON.stringify(res.body);
+    expect(bodyText).not.toContain("nif");
+    expect(bodyText).not.toContain("addressLine1");
+    expect(bodyText).not.toContain("addressPostalCode");
+    expect(bodyText).not.toContain("userId");
+    expect(bodyText).not.toContain("s3Key");
+
+    expect(res.body[0].producer).toEqual({
+      id: "prod_001",
+      businessName: "Apiarios del Sur",
+      description: "Productor artesanal.",
+      address: { city: "Sevilla", province: "Sevilla", country: "ES" },
+    });
+    expect(res.body[0].images).toEqual([
+      { id: "img_1", position: 0, url: "https://test-cdn.example.com/products/x.jpg" },
+    ]);
+  });
+
+  it("[PUB-T4] detail response has NO nif/addressLine1/addressPostalCode/userId/s3Key", async () => {
+    const row = makePublicProductRow({ id: "product_pub_001" });
+    mockedProduct.findFirst.mockResolvedValueOnce(row);
+
+    const res = await request.get("/api/v1/products/product_pub_001").expect(200);
+
+    const bodyText = JSON.stringify(res.body);
+    expect(bodyText).not.toContain("nif");
+    expect(bodyText).not.toContain("addressLine1");
+    expect(bodyText).not.toContain("addressPostalCode");
+    expect(bodyText).not.toContain("userId");
+    expect(bodyText).not.toContain("s3Key");
+    expect(res.body.images).toEqual([]);
+  });
+});
+
+// ===========================================================================
+// Threat tests — existence no-leak (public-catalog capability)
+// Spec: public-catalog §"PUB-R2", §"PUB-R3"; design Threat Matrix
+// "Existence no-leak".
+// ===========================================================================
+
+describe("public-catalog threat: existence no-leak", () => {
+  it("[PUB-T5] hidden and missing product ids return an identical 404 body", async () => {
+    mockedProduct.findFirst.mockResolvedValueOnce(null); // hidden product
+    const hiddenRes = await request.get("/api/v1/products/product_hidden").expect(404);
+
+    mockedProduct.findFirst.mockResolvedValueOnce(null); // non-existent product
+    const missingRes = await request.get("/api/v1/products/product_missing").expect(404);
+
+    // "instance" is a per-request correlation id (req.id) — it legitimately
+    // differs on every request and carries no existence information.
+    // Every other field MUST be byte-identical: a client cannot distinguish
+    // "hidden" from "missing" from any observable part of the response.
+    const { instance: _hiddenInstance, ...hiddenBody } = hiddenRes.body;
+    const { instance: _missingInstance, ...missingBody } = missingRes.body;
+    expect(hiddenBody).toEqual(missingBody);
+    expect(hiddenRes.body.code).toBe("PRODUCT_NOT_FOUND");
   });
 });

@@ -14,6 +14,8 @@
  *   PATCH  /producers/me/products/:id    → 200 updated product
  *   DELETE /producers/me/products/:id    → 204 No Content
  *   POST   /products/:id/report          → 200 { productId, moderationStatus, reportedAt }
+ *   GET    /products                     → 200 public list (public-catalog, no auth)
+ *   GET    /products/:id                 → 200 public detail (public-catalog, no auth)
  *
  * Slice 3: listProducts and getProduct now return ProductWithImages shapes
  * (images: ProductImageResponse[]). Controller stays thin — passes service output through.
@@ -31,6 +33,7 @@ import { validateBody } from "@/shared/validation/zod";
 
 import {
   CreateProductSchema,
+  ListPublicProductsQuerySchema,
   ReportProductSchema,
   UpdateProductSchema,
 } from "../dto/products.dto";
@@ -171,6 +174,52 @@ export async function reportProduct(
       moderationStatus: product.moderationStatus,
       reportedAt: product.reportedAt,
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public (unauthenticated) controllers — public-catalog capability
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/v1/products
+ * Public unauthenticated product list. NO req.user access — this handler is
+ * mounted via public-products.routes.ts, which imports no auth middleware.
+ * Optional query: categoryId, available, sort (asc|desc by price).
+ * Spec: public-catalog §"PUB-R1 — Public product list".
+ */
+export async function listPublicProducts(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = validateBody(ListPublicProductsQuerySchema, req.query);
+    const products = await productsService.findAllPublic(query);
+    res.status(200).json(products);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/v1/products/:id
+ * Public unauthenticated product detail. NO req.user access.
+ * Hidden (moderation/soft-delete/inactive/soft-deleted producer) or
+ * non-existent ids both resolve to 404 PRODUCT_NOT_FOUND (no-leak).
+ * Spec: public-catalog §"PUB-R2 — Public product detail".
+ */
+export async function getPublicProduct(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { id } = req.params as { id: string };
+    const product = await productsService.findPublicById(id);
+    res.status(200).json(product);
   } catch (err) {
     next(err);
   }
