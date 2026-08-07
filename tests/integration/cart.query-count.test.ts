@@ -109,6 +109,15 @@ beforeAll(async () => {
   });
   productId = product.id;
 
+  await db.productImage.create({
+    data: {
+      productId,
+      position: 0,
+      s3Key: "tests/cart-query-count/main.jpg",
+      mimeType: "image/jpeg",
+    },
+  });
+
   // Populate the cart via the real service (uses the shared `prisma` singleton).
   await cartService.addItem(userId, productId, 1);
 });
@@ -141,6 +150,13 @@ describe("cart NFR-1 — GET /carrito issues exactly ONE SQL query [Q1]", () => 
       const view = await cartService.getCartView(userId);
 
       expect(view.items).toHaveLength(1);
+      expect(view.items[0]!.product.images).toEqual([
+        {
+          id: expect.any(String),
+          position: 0,
+          url: "https://test-cdn.example.com/tests/cart-query-count/main.jpg",
+        },
+      ]);
       // Filter out transaction-control statements (BEGIN/COMMIT/ROLLBACK/
       // DEALLOCATE). These are not data queries — Vitest's "forks" pool
       // reuses the same worker process (and thus the same imported `prisma`

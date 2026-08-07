@@ -35,6 +35,7 @@
 import type { Prisma } from "@prisma/client";
 
 import { NotFoundError, ProductInactiveError, QuantityExceedsStockError } from "@/shared/errors/errors";
+import { toImageUrl } from "@/shared/utils/image-url";
 import { prisma } from "@/shared/utils/prisma";
 
 // ---------------------------------------------------------------------------
@@ -53,6 +54,11 @@ export interface CartItemView {
     price: string;
     stock: number;
     isActive: boolean;
+    images: Array<{
+      id: string;
+      position: number;
+      url: string;
+    }>;
     producer: {
       id: string;
       isActive: boolean;
@@ -100,6 +106,7 @@ export interface CartForCheckout {
 // ---------------------------------------------------------------------------
 
 type ProducerRow = { id: string; deletedAt: Date | null };
+type ProductImageRow = { id: string; position: number; s3Key: string };
 type ProductRow = {
   id: string;
   name: string;
@@ -109,6 +116,7 @@ type ProductRow = {
   deletedAt: Date | null;
   producer: ProducerRow;
 };
+type ProductWithImagesRow = ProductRow & { images: ProductImageRow[] };
 type CartItemRow = {
   id: string;
   productId: string;
@@ -118,6 +126,7 @@ type CartItemRow = {
   updatedAt: Date;
   product: ProductRow;
 };
+type CartItemViewRow = Omit<CartItemRow, "product"> & { product: ProductWithImagesRow };
 
 /**
  * Computes item availability: product is not soft-deleted, is active, AND
@@ -129,7 +138,7 @@ function computeIsAvailable(product: ProductRow): boolean {
 }
 
 /** Maps a Prisma CartItem row (with nested product+producer) to the wire shape. */
-function mapCartItemView(item: CartItemRow): CartItemView {
+function mapCartItemView(item: CartItemViewRow): CartItemView {
   const { product } = item;
   return {
     id: item.id,
@@ -143,6 +152,11 @@ function mapCartItemView(item: CartItemRow): CartItemView {
       price: product.price.toFixed(2),
       stock: product.stock,
       isActive: product.isActive,
+      images: product.images.map((image) => ({
+        id: image.id,
+        position: image.position,
+        url: toImageUrl(image.s3Key),
+      })),
       producer: {
         id: product.producer.id,
         isActive: product.producer.deletedAt === null,
@@ -205,7 +219,15 @@ export async function getCartView(userId: string): Promise<CartReadView> {
     include: {
       items: {
         include: {
-          product: { include: { producer: true } },
+          product: {
+            include: {
+              producer: true,
+              images: {
+                orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+                select: { id: true, position: true, s3Key: true },
+              },
+            },
+          },
         },
       },
     },
@@ -219,7 +241,7 @@ export async function getCartView(userId: string): Promise<CartReadView> {
   return {
     id: cart.id,
     userId: cart.userId,
-    items: cart.items.map((item) => mapCartItemView(item as CartItemRow)),
+    items: cart.items.map((item) => mapCartItemView(item as CartItemViewRow)),
     createdAt: cart.createdAt.toISOString(),
     updatedAt: cart.updatedAt.toISOString(),
   };
@@ -275,7 +297,13 @@ export async function addItem(
 ): Promise<CartItemView> {
   const product = await prisma.product.findUnique({
     where: { id: productId, deletedAt: null, producer: { deletedAt: null } },
-    include: { producer: true },
+    include: {
+      producer: true,
+      images: {
+        orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+        select: { id: true, position: true, s3Key: true },
+      },
+    },
   });
 
   if (!product) {
@@ -356,7 +384,17 @@ export async function updateItemQuantity(
 ): Promise<CartItemView> {
   const item = await prisma.cartItem.findFirst({
     where: { id: itemId, cart: { userId } },
-    include: { product: { include: { producer: true } } },
+    include: {
+      product: {
+        include: {
+          producer: true,
+          images: {
+            orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+            select: { id: true, position: true, s3Key: true },
+          },
+        },
+      },
+    },
   });
 
   if (!item) {
@@ -369,7 +407,17 @@ export async function updateItemQuantity(
   const updated = await prisma.cartItem.update({
     where: { id: itemId },
     data: { quantity },
-    include: { product: { include: { producer: true } } },
+    include: {
+      product: {
+        include: {
+          producer: true,
+          images: {
+            orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+            select: { id: true, position: true, s3Key: true },
+          },
+        },
+      },
+    },
   });
 
   return mapCartItemView(updated);
