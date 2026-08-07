@@ -134,6 +134,7 @@ export async function findAll(
     },
     include: {
       orderLines: true,
+      deliveryMode: { select: { type: true } },
     },
     orderBy: { createdAt: "desc" },
     skip,
@@ -164,7 +165,7 @@ export async function findById(
 ): Promise<SubOrder & { orderLines: unknown[] }> {
   const subOrder = await prisma.subOrder.findFirst({
     where: { id, producerId },
-    include: { orderLines: true },
+    include: { orderLines: true, deliveryMode: { select: { type: true } } },
   });
 
   if (!subOrder) {
