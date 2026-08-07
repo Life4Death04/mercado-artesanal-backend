@@ -383,7 +383,10 @@ model Order {
 }
 
 /// Producer-scoped slice of a consumer Order. One SubOrder per producer per Order.
-/// trackingNumber MUST remain null in Cycle 2 — settable only after COURIER mode ships (RF-21).
+/// trackingNumber is settable via the producer transition API only on the PATCH
+/// that moves a SubOrder INTO `sent` (order-fulfillment §"Tracking number on
+/// shipment"): mandatory for shipping (non-PICKUP) delivery modes, forbidden
+/// for PICKUP, and immutable once non-null. Always null until then.
 /// shippingCostSnapshot is written by Cycle 3 checkout from DeliveryMode.cost at order time.
 /// Idempotent PATCH: if current.status === target, return current with no UPDATE issued.
 ///

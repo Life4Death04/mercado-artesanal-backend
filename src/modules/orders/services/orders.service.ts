@@ -82,6 +82,7 @@ type DecimalValue = InstanceType<typeof PrismaValue.Decimal>;
 export type OrderStatusValue = "PENDING" | "PARTIAL" | "FULFILLED" | "CANCELLED";
 export type SubOrderStatusValue = "pending" | "preparing" | "sent" | "delivered" | "cancelled";
 export type PaymentStatusValue = "PENDING" | "SUCCEEDED" | "FAILED" | "CANCELED" | "REFUNDED";
+export type DeliveryModeTypeValue = "PICKUP" | "SHIPPING_FLAT_RATE";
 
 export interface DeliverySelection {
   producerId: string;
@@ -101,6 +102,8 @@ export interface SubOrderView {
   status: SubOrderStatusValue;
   shippingCostSnapshot: string;
   deliveryModeId: string;
+  trackingNumber: string | null;
+  deliveryMode: { type: DeliveryModeTypeValue };
   orderLines: OrderLineView[];
 }
 
@@ -174,6 +177,8 @@ interface ExistingSubOrderRow {
   status: string;
   shippingCostSnapshot: DecimalValue;
   deliveryModeId: string;
+  trackingNumber: string | null;
+  deliveryMode: { type: DeliveryModeTypeValue };
   orderLines: ExistingOrderLineRow[];
 }
 
@@ -200,6 +205,8 @@ function mapSubOrderView(subOrder: ExistingSubOrderRow): SubOrderView {
     status: subOrder.status as SubOrderStatusValue,
     shippingCostSnapshot: subOrder.shippingCostSnapshot.toFixed(2),
     deliveryModeId: subOrder.deliveryModeId,
+    trackingNumber: subOrder.trackingNumber,
+    deliveryMode: subOrder.deliveryMode,
     orderLines: subOrder.orderLines.map(mapOrderLineView),
   };
 }
@@ -280,7 +287,9 @@ export async function createOrderFromPayment(
     include: {
       order: {
         include: {
-          subOrders: { include: { orderLines: true } },
+          subOrders: {
+            include: { orderLines: true, deliveryMode: { select: { type: true } } },
+          },
         },
       },
     },
@@ -493,14 +502,22 @@ export async function createOrderFromPayment(
   // Step 9: snapshot-scoped cart clear — NOT userId-scoped.
   await tx.cartItem.deleteMany({ where: { id: { in: checkoutedCartItemIds } } });
 
-  const subOrders: SubOrderView[] = [...itemsByProducer.keys()].map((producerId) => ({
-    id: subOrderIdByProducer.get(producerId)!,
-    producerId,
-    status: subOrderStatusByProducer.get(producerId)!,
-    shippingCostSnapshot: shippingByProducer.get(producerId)!.toFixed(2),
-    deliveryModeId: deliveryModeByProducer.get(producerId)!,
-    orderLines: orderLinesByProducer.get(producerId) ?? [],
-  }));
+  const subOrders: SubOrderView[] = [...itemsByProducer.keys()].map((producerId) => {
+    const deliveryModeId = deliveryModeByProducer.get(producerId)!;
+    return {
+      id: subOrderIdByProducer.get(producerId)!,
+      producerId,
+      status: subOrderStatusByProducer.get(producerId)!,
+      shippingCostSnapshot: shippingByProducer.get(producerId)!.toFixed(2),
+      deliveryModeId,
+      // A freshly created SubOrder never has a trackingNumber yet — it is
+      // only ever set later by a producer transition() into "sent" (see
+      // sub-orders.service.ts trackingNumber gate).
+      trackingNumber: null,
+      deliveryMode: { type: modesById.get(deliveryModeId)!.type as DeliveryModeTypeValue },
+      orderLines: orderLinesByProducer.get(producerId) ?? [],
+    };
+  });
 
   return {
     id: order.id,
@@ -576,7 +593,9 @@ export async function getOrderDetail(userId: string, orderId: string): Promise<O
     where: { id: orderId, userId },
     include: {
       payment: { select: { status: true } },
-      subOrders: { include: { orderLines: true } },
+      subOrders: {
+        include: { orderLines: true, deliveryMode: { select: { type: true } } },
+      },
     },
   });
 
@@ -643,7 +662,9 @@ export async function cancelOrder(userId: string, orderId: string): Promise<Orde
       where: { id: orderId, userId },
       include: {
         payment: { select: { status: true } },
-        subOrders: { include: { orderLines: true } },
+        subOrders: {
+          include: { orderLines: true, deliveryMode: { select: { type: true } } },
+        },
       },
     });
 
