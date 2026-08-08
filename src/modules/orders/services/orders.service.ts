@@ -55,6 +55,7 @@ import type { Prisma } from "@prisma/client";
 import { Prisma as PrismaValue } from "@prisma/client";
 
 import type { CartForCheckout, CartItemForCheckout } from "@/modules/cart/services/cart.service";
+import { requiresDestinationAddress } from "@/modules/delivery-modes/delivery-mode.policy";
 import { decrementStock, restockProduct } from "@/modules/inventory/services/inventory.service";
 import {
   CartItemNotAvailableError,
@@ -82,7 +83,7 @@ type DecimalValue = InstanceType<typeof PrismaValue.Decimal>;
 export type OrderStatusValue = "PENDING" | "PARTIAL" | "FULFILLED" | "CANCELLED";
 export type SubOrderStatusValue = "pending" | "preparing" | "sent" | "delivered" | "cancelled";
 export type PaymentStatusValue = "PENDING" | "SUCCEEDED" | "FAILED" | "CANCELED" | "REFUNDED";
-export type DeliveryModeTypeValue = "PICKUP" | "SHIPPING_FLAT_RATE";
+export type DeliveryModeTypeValue = "PERSONAL_DELIVERY" | "PICKUP" | "SHIPPING_FLAT_RATE";
 
 export interface DeliverySelection {
   producerId: string;
@@ -296,10 +297,7 @@ export async function createOrderFromPayment(
   });
 
   if (existingPayment?.order) {
-    return mapExistingOrderDetailView(
-      existingPayment.order,
-      existingPayment.status,
-    );
+    return mapExistingOrderDetailView(existingPayment.order, existingPayment.status);
   }
 
   // Step 1: empty cart rejection.
@@ -372,7 +370,12 @@ export async function createOrderFromPayment(
     const mode = modesById.get(selection.deliveryModeId);
     if (!mode) {
       throw new ValidationFailedError(
-        [{ path: "deliverySelections", message: `Unknown deliveryModeId: ${selection.deliveryModeId}` }],
+        [
+          {
+            path: "deliverySelections",
+            message: `Unknown deliveryModeId: ${selection.deliveryModeId}`,
+          },
+        ],
         "Invalid delivery selections",
       );
     }
@@ -396,7 +399,12 @@ export async function createOrderFromPayment(
   // Bijection completeness — every cart producerId MUST have exactly one selection.
   if (deliveryModeByProducer.size !== cartProducerIds.size) {
     throw new ValidationFailedError(
-      [{ path: "deliverySelections", message: "Missing a deliverySelection for one or more cart producers" }],
+      [
+        {
+          path: "deliverySelections",
+          message: "Missing a deliverySelection for one or more cart producers",
+        },
+      ],
       "Invalid delivery selections",
     );
   }
@@ -452,17 +460,18 @@ export async function createOrderFromPayment(
   const subOrderStatusByProducer = new Map<string, SubOrderStatusValue>();
   for (const producerId of itemsByProducer.keys()) {
     const deliveryModeId = deliveryModeByProducer.get(producerId)!;
-    // Snapshot flows to SHIPPING_FLAT_RATE SubOrders only (spec "Snapshot
-    // flows to shipping SubOrders only") — PICKUP SubOrders leave every
+    // Snapshot flows to delivery modes that require a destination address.
+    // PICKUP SubOrders leave every
     // `shipTo*` column null, matching the schema default.
-    const isShippingProducer = modesById.get(deliveryModeId)?.type === "SHIPPING_FLAT_RATE";
+    const modeType = modesById.get(deliveryModeId)!.type;
+    const needsDestinationAddress = requiresDestinationAddress(modeType);
     const subOrder = await tx.subOrder.create({
       data: {
         orderId: order.id,
         producerId,
         deliveryModeId,
         shippingCostSnapshot: shippingByProducer.get(producerId)!,
-        ...(isShippingProducer && pendingCheckout
+        ...(needsDestinationAddress && pendingCheckout
           ? {
               shipToLine1: pendingCheckout.addressLine1,
               shipToLine2: pendingCheckout.addressLine2,
@@ -514,7 +523,7 @@ export async function createOrderFromPayment(
       // only ever set later by a producer transition() into "sent" (see
       // sub-orders.service.ts trackingNumber gate).
       trackingNumber: null,
-      deliveryMode: { type: modesById.get(deliveryModeId)!.type as DeliveryModeTypeValue },
+      deliveryMode: { type: modesById.get(deliveryModeId)!.type },
       orderLines: orderLinesByProducer.get(producerId) ?? [],
     };
   });
