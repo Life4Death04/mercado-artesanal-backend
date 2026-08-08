@@ -40,7 +40,8 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 // Mock: express-oauth2-jwt-bearer — same pattern as products.test.ts
 // ---------------------------------------------------------------------------
 vi.mock("express-oauth2-jwt-bearer", () => ({
-  auth: () =>
+  auth:
+    () =>
     (
       req: import("express").Request,
       _res: import("express").Response,
@@ -130,7 +131,14 @@ function makeDeliveryMode(overrides: Record<string, unknown> = {}) {
     type: "SHIPPING_FLAT_RATE" as DeliveryModeType,
     cost: new Decimal("5.00"),
     coverageZone: "Madrid",
+    carrierCompany: "Correos",
+    notes: "Shared notes",
     pickupLocation: null,
+    pickupLocationName: null,
+    pickupStreet: null,
+    pickupMunicipality: null,
+    pickupPostalCode: null,
+    pickupOpeningHours: null,
     isActive: true,
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
@@ -248,6 +256,79 @@ describe("POST /api/v1/producers/me/delivery-modes — create delivery mode", ()
 
     expect(res.status).toBe(422);
     expect(res.body.code).toBe("VALIDATION_FAILED");
+  });
+
+  it("creates PERSONAL_DELIVERY and exposes every new field with Decimal cost as a string", async () => {
+    const sub = "auth0|producer001";
+    mockLoadUser(makeProducerUser({ auth0Sub: sub }));
+    mockedDeliveryMode.create.mockResolvedValueOnce(
+      makeDeliveryMode({
+        type: "PERSONAL_DELIVERY" as DeliveryModeType,
+        cost: new Decimal("3.50"),
+        coverageZone: "Madrid city",
+        carrierCompany: null,
+        notes: "Call before delivery",
+      }),
+    );
+
+    const res = await request
+      .post("/api/v1/producers/me/delivery-modes")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({
+        type: "PERSONAL_DELIVERY",
+        cost: 3.5,
+        coverageZone: "Madrid city",
+        notes: "Call before delivery",
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual(
+      expect.objectContaining({
+        type: "PERSONAL_DELIVERY",
+        cost: "3.5",
+        coverageZone: "Madrid city",
+        carrierCompany: null,
+        notes: "Call before delivery",
+        pickupLocationName: null,
+        pickupStreet: null,
+        pickupMunicipality: null,
+        pickupPostalCode: null,
+        pickupOpeningHours: null,
+      }),
+    );
+  });
+
+  it("rejects an invalid pickupPostalCode at the strict API boundary", async () => {
+    const sub = "auth0|producer001";
+    mockLoadUser(makeProducerUser({ auth0Sub: sub }));
+
+    const res = await request
+      .post("/api/v1/producers/me/delivery-modes")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({
+        type: "PICKUP",
+        cost: 0,
+        pickupStreet: "Calle Mayor 1",
+        pickupPostalCode: "2800A",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("VALIDATION_FAILED");
+    expect(mockedDeliveryMode.create).not.toHaveBeenCalled();
+  });
+
+  it.each([1.001, 100_000_000])("rejects invalid Decimal(10,2) cost %s", async (cost) => {
+    const sub = "auth0|producer001";
+    mockLoadUser(makeProducerUser({ auth0Sub: sub }));
+
+    const res = await request
+      .post("/api/v1/producers/me/delivery-modes")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({ type: "SHIPPING_FLAT_RATE", cost });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("VALIDATION_FAILED");
+    expect(mockedDeliveryMode.create).not.toHaveBeenCalled();
   });
 
   it("[DM-unauth] returns 401 when no auth header", async () => {
@@ -391,6 +472,69 @@ describe("PATCH /api/v1/producers/me/delivery-modes/:id — update delivery mode
 
     expect(res.status).toBe(404);
     expect(res.body.code).toBe("DELIVERY_MODE_NOT_FOUND");
+  });
+
+  it("clears a nullable configuration field when PATCH explicitly sends null", async () => {
+    const sub = "auth0|producer001";
+    const updateSpy = vi.fn().mockResolvedValue(makeDeliveryMode({ notes: null }));
+    mockLoadUser(makeProducerUser({ auth0Sub: sub }));
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) =>
+        fn({
+          deliveryMode: {
+            findFirst: vi.fn().mockResolvedValue(makeDeliveryMode()),
+            update: updateSpy,
+          },
+        } as unknown as typeof prisma),
+    );
+
+    const res = await request
+      .patch("/api/v1/producers/me/delivery-modes/dm_001")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({ notes: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.notes).toBeNull();
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "dm_001" },
+      data: expect.objectContaining({ notes: null }),
+    });
+  });
+
+  it("applies an explicitly patched legacy pickupLocation on a structured PICKUP", async () => {
+    const sub = "auth0|producer001";
+    const updateSpy = vi
+      .fn()
+      .mockResolvedValue(
+        makeDeliveryMode({ type: "PICKUP" as DeliveryModeType, pickupLocation: "New point" }),
+      );
+    mockLoadUser(makeProducerUser({ auth0Sub: sub }));
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) =>
+        fn({
+          deliveryMode: {
+            findFirst: vi.fn().mockResolvedValue(
+              makeDeliveryMode({
+                type: "PICKUP" as DeliveryModeType,
+                pickupLocation: "Old generated point",
+                pickupStreet: "Old street 1",
+              }),
+            ),
+            update: updateSpy,
+          },
+        } as unknown as typeof prisma),
+    );
+
+    const res = await request
+      .patch("/api/v1/producers/me/delivery-modes/dm_001")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({ pickupLocation: "New point" });
+
+    expect(res.status).toBe(200);
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "dm_001" },
+      data: expect.objectContaining({ pickupLocation: "New point" }),
+    });
   });
 });
 
@@ -575,7 +719,11 @@ describe("GET /api/v1/pagos/delivery-modes — consumer delivery modes", () => {
 
   it("[BE1-R1b] returns 403 ONBOARDING_REQUIRED for a pending caller", async () => {
     const sub = "auth0|pending-consumer";
-    mockLoadUser(makeConsumerUser({ auth0Sub: sub, role: "PENDING_ROLE" }) as ReturnType<typeof makeProducerUser>);
+    mockLoadUser(
+      makeConsumerUser({ auth0Sub: sub, role: "PENDING_ROLE" }) as ReturnType<
+        typeof makeProducerUser
+      >,
+    );
 
     const res = await request
       .get("/api/v1/pagos/delivery-modes")
@@ -588,7 +736,9 @@ describe("GET /api/v1/pagos/delivery-modes — consumer delivery modes", () => {
   it("[BE1-R2] returns one active-mode group for each distinct producer in a multi-producer cart", async () => {
     const sub = "auth0|consumer001";
     mockLoadUser(makeConsumerUser({ auth0Sub: sub }) as ReturnType<typeof makeProducerUser>);
-    mockedCart.findUnique.mockResolvedValueOnce(makeCartForCheckout(["prod_a", "prod_b", "prod_a"]));
+    mockedCart.findUnique.mockResolvedValueOnce(
+      makeCartForCheckout(["prod_a", "prod_b", "prod_a"]),
+    );
     mockedDeliveryMode.findMany.mockResolvedValueOnce([
       makeDeliveryMode({ id: "dm_shipping", producerId: "prod_a", cost: new Decimal("5.50") }),
       makeDeliveryMode({
@@ -597,6 +747,13 @@ describe("GET /api/v1/pagos/delivery-modes — consumer delivery modes", () => {
         type: "PICKUP" as DeliveryModeType,
         cost: new Decimal("0.00"),
         pickupLocation: "Calle Mayor 1",
+        pickupLocationName: "Central Market",
+      }),
+      makeDeliveryMode({
+        id: "dm_personal",
+        producerId: "prod_a",
+        type: "PERSONAL_DELIVERY" as DeliveryModeType,
+        cost: new Decimal("2.50"),
       }),
     ]);
 
@@ -606,8 +763,22 @@ describe("GET /api/v1/pagos/delivery-modes — consumer delivery modes", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual([
-      { producerId: "prod_a", modes: [{ id: "dm_shipping", name: "Shipping", type: "shipping", price: "5.50" }] },
-      { producerId: "prod_b", modes: [{ id: "dm_pickup", name: "Pickup", type: "pickup", price: "0.00" }] },
+      {
+        producerId: "prod_a",
+        modes: [
+          { id: "dm_shipping", name: "Shipping", type: "shipping", price: "5.50" },
+          {
+            id: "dm_personal",
+            name: "Personal delivery",
+            type: "shipping",
+            price: "2.50",
+          },
+        ],
+      },
+      {
+        producerId: "prod_b",
+        modes: [{ id: "dm_pickup", name: "Central Market", type: "pickup", price: "0.00" }],
+      },
     ]);
   });
 
@@ -641,7 +812,10 @@ describe("GET /api/v1/pagos/delivery-modes — consumer delivery modes", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual([
-      { producerId: "prod_a", modes: [{ id: "dm_active", name: "Shipping", type: "shipping", price: "5.00" }] },
+      {
+        producerId: "prod_a",
+        modes: [{ id: "dm_active", name: "Shipping", type: "shipping", price: "5.00" }],
+      },
     ]);
     expect(mockedDeliveryMode.findMany).toHaveBeenCalledWith({
       where: { producerId: { in: ["prod_a"] }, isActive: true },
