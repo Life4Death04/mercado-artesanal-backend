@@ -43,7 +43,8 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 // Mock: express-oauth2-jwt-bearer — same pattern as delivery-modes.test.ts
 // ---------------------------------------------------------------------------
 vi.mock("express-oauth2-jwt-bearer", () => ({
-  auth: () =>
+  auth:
+    () =>
     (
       req: import("express").Request,
       _res: import("express").Response,
@@ -302,6 +303,48 @@ describe("PATCH /api/v1/producers/me/sub-orders/:id — state machine transition
 
     expect(res.status).toBe(422);
     expect(res.body.code).toBe("VALIDATION_FAILED");
+  });
+
+  it("returns 422 when PERSONAL_DELIVERY carries a trackingNumber", async () => {
+    const sub = "auth0|producer001";
+    mockLoadUser(makeProducerUser({ auth0Sub: sub }));
+    mockTransition(
+      makeSubOrder({
+        status: "preparing" as SubOrderStatus,
+        deliveryMode: { type: "PERSONAL_DELIVERY" },
+      }),
+    );
+
+    const res = await request
+      .patch("/api/v1/producers/me/sub-orders/so_001")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({ status: "sent", trackingNumber: "TN1" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("VALIDATION_FAILED");
+  });
+
+  it("returns 200 when PERSONAL_DELIVERY enters sent without trackingNumber", async () => {
+    const sub = "auth0|producer001";
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PERSONAL_DELIVERY" },
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "PERSONAL_DELIVERY" },
+    });
+    mockLoadUser(makeProducerUser({ auth0Sub: sub }));
+    mockTransition(current, updated);
+
+    const res = await request
+      .patch("/api/v1/producers/me/sub-orders/so_001")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({ status: "sent" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("sent");
+    expect(res.body.trackingNumber).toBeNull();
   });
 
   it("[SO-T6] returns 200 and persists trackingNumber when a shipping sub-order enters 'sent'", async () => {

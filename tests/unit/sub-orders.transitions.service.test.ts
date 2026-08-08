@@ -80,7 +80,11 @@ vi.mock("@/shared/utils/prisma", () => {
 import type { SubOrderStatus } from "@prisma/client";
 import { Decimal } from "@prisma/client/runtime/library";
 import { prisma } from "@/shared/utils/prisma";
-import { InvalidOrderTransitionError, NotFoundError, ValidationFailedError } from "@/shared/errors/errors";
+import {
+  InvalidOrderTransitionError,
+  NotFoundError,
+  ValidationFailedError,
+} from "@/shared/errors/errors";
 import * as subOrdersService from "@/modules/sub-orders/services/sub-orders.service";
 
 // ---------------------------------------------------------------------------
@@ -163,12 +167,34 @@ describe("subOrdersService.transition — valid transitions", () => {
       status: "preparing" as SubOrderStatus,
       deliveryMode: { type: "PICKUP" },
     });
-    const updated = makeSubOrder({ status: "sent" as SubOrderStatus, deliveryMode: { type: "PICKUP" } });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
     mockTransaction(current, updated);
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "sent" });
 
     expect(result.status).toBe("sent");
+  });
+
+  it("transitions PERSONAL_DELIVERY preparing → sent without trackingNumber", async () => {
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PERSONAL_DELIVERY" },
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "PERSONAL_DELIVERY" },
+    });
+    const mockUpdate = mockTransaction(current, updated);
+
+    await subOrdersService.transition("prod_001", "so_001", { status: "sent" });
+
+    expect(mockUpdate).toHaveBeenCalledWith({
+      where: { id: "so_001" },
+      data: { status: "sent" },
+    });
   });
 
   it("transitions sent → delivered", async () => {
@@ -314,6 +340,22 @@ describe("subOrdersService.transition — trackingNumber gate", () => {
     expect(mockUpdate).not.toHaveBeenCalled();
   });
 
+  it("throws ValidationFailedError when PERSONAL_DELIVERY carries a trackingNumber", async () => {
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PERSONAL_DELIVERY" },
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", {
+        status: "sent",
+        trackingNumber: "TN1",
+      }),
+    ).rejects.toThrow(ValidationFailedError);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
   it("throws ValidationFailedError when a shipping sub-order enters 'sent' without trackingNumber", async () => {
     // Spec scenario: "Shipping sub-order to sent without trackingNumber rejected"
     const current = makeSubOrder({
@@ -337,7 +379,10 @@ describe("subOrdersService.transition — trackingNumber gate", () => {
     const mockUpdate = mockTransaction(current);
 
     await expect(
-      subOrdersService.transition("prod_001", "so_001", { status: "preparing", trackingNumber: "TN1" }),
+      subOrdersService.transition("prod_001", "so_001", {
+        status: "preparing",
+        trackingNumber: "TN1",
+      }),
     ).rejects.toThrow(ValidationFailedError);
     expect(mockUpdate).not.toHaveBeenCalled();
   });

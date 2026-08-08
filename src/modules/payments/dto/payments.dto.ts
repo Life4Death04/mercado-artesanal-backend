@@ -43,7 +43,7 @@ export const DeliverySelectionSchema = strictObject({
  *     cannot see the cart).
  *   addressId — ADDITIVE, optional at the schema level (checkout-contracts
  *     BE-3, design Fork 1). The SERVICE (not this schema) enforces it is
- *     required WHEN any selected DeliveryMode.type is SHIPPING_FLAT_RATE,
+ *     required WHEN any selected DeliveryMode requires a destination address,
  *     and ignored for an all-pickup cart — Zod cannot see the resolved
  *     delivery modes. The schema stays `strictObject`: this is a new
  *     optional field, not a shape relaxation.
@@ -94,9 +94,7 @@ export const MAX_METADATA_DELIVERY_SELECTIONS_COUNT = 50;
  * Spec: payments §"Intent validates delivery selections"
  * Design: D1
  */
-export function serializeDeliverySelectionsForMetadata(
-  selections: DeliverySelection[],
-): string {
+export function serializeDeliverySelectionsForMetadata(selections: DeliverySelection[]): string {
   if (selections.length > MAX_METADATA_DELIVERY_SELECTIONS_COUNT) {
     throw new ValidationFailedError(
       [

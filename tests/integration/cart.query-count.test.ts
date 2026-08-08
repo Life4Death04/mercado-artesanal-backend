@@ -56,7 +56,11 @@ beforeAll(async () => {
 
   const category = await db.category.upsert({
     where: { slug: "test-cart-query-count-cat" },
-    create: { slug: "test-cart-query-count-cat", name: "Test Cart Query Count Category", isActive: true },
+    create: {
+      slug: "test-cart-query-count-cat",
+      name: "Test Cart Query Count Category",
+      isActive: true,
+    },
     update: {},
   });
 
@@ -132,44 +136,53 @@ afterAll(async () => {
 });
 
 describe("cart NFR-1 — GET /carrito issues exactly ONE SQL query [Q1]", () => {
-  it(
-    "[Q1] prisma.$on('query') observes exactly one SQL statement during getCartView",
-    async (ctx) => {
-      if (!dbReachable) {
-        ctx.skip();
-        return;
-      }
+  it("[Q1] prisma.$on('query') observes exactly one SQL statement during getCartView", async (ctx) => {
+    if (!dbReachable) {
+      ctx.skip();
+      return;
+    }
 
-      // PrismaClient exposes no $off — this listener lives for the process
-      // lifetime, acceptable since this is a single-test, single-purpose file.
-      const queries: string[] = [];
-      prisma.$on("query", (e) => {
-        queries.push(e.query);
-      });
+    // PrismaClient exposes no $off — this listener lives for the process
+    // lifetime, acceptable since this is a single-test, single-purpose file.
+    const queries: string[] = [];
+    prisma.$on("query", (e) => {
+      queries.push(e.query);
+    });
 
-      const view = await cartService.getCartView(userId);
+    const view = await cartService.getCartView(userId);
 
-      expect(view.items).toHaveLength(1);
-      expect(view.items[0]!.product.images).toEqual([
-        {
-          id: expect.any(String),
-          position: 0,
-          url: "https://test-cdn.example.com/tests/cart-query-count/main.jpg",
-        },
-      ]);
-      // Filter out transaction-control statements (BEGIN/COMMIT/ROLLBACK/
-      // DEALLOCATE). These are not data queries — Vitest's "forks" pool
-      // reuses the same worker process (and thus the same imported `prisma`
-      // module instance) across multiple integration test files, so a
-      // COMMIT emitted by an unrelated $transaction() finishing in that
-      // shared process can land on this listener while it is attached. The
-      // NFR-1 proof cares about SQL *data* statements only — one SELECT is
-      // the claim being verified, not the surrounding transaction chatter.
-      const dataQueries = queries.filter(
-        (query) => !/^(BEGIN|COMMIT|ROLLBACK|DEALLOCATE)\b/i.test(query.trim()),
-      );
-      expect(dataQueries).toHaveLength(1);
-    },
-    15000,
-  );
+    expect(view.items).toHaveLength(1);
+    expect(view.items[0]!.product.images).toEqual([
+      {
+        id: expect.any(String),
+        position: 0,
+        url: "https://test-cdn.example.com/tests/cart-query-count/main.jpg",
+      },
+    ]);
+    // Filter out transaction-control statements (BEGIN/COMMIT/ROLLBACK/
+    // DEALLOCATE). These are not data queries — Vitest's "forks" pool
+    // reuses the same worker process (and thus the same imported `prisma`
+    // module instance) across multiple integration test files, so a
+    // COMMIT emitted by an unrelated $transaction() finishing in that
+    // shared process can land on this listener while it is attached. The
+    // NFR-1 proof cares about SQL *data* statements only — one SELECT is
+    // the claim being verified, not the surrounding transaction chatter.
+    const dataQueries = (): string[] =>
+      queries.filter((query) => !/^(BEGIN|COMMIT|ROLLBACK|DEALLOCATE)\b/i.test(query.trim()));
+
+    // Prisma delivers `query` events asynchronously through an event
+    // emitter, so the SELECT issued by getCartView can arrive on a later
+    // tick than the awaited result. Under full-suite load the event loop is
+    // busy enough that a synchronous assertion can observe ZERO events — a
+    // false failure that passes in isolation. Poll a bounded window until
+    // the data query is delivered before asserting the NFR-1 count. Files
+    // run sequentially within a worker, so no other suite's SELECT can
+    // interleave into this window.
+    const deadline = Date.now() + 5000;
+    while (dataQueries().length < 1 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(dataQueries()).toHaveLength(1);
+  }, 15000);
 });

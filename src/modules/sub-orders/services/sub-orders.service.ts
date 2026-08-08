@@ -39,11 +39,11 @@
  *     (a) trackingNumber present && NOT entering sent (target !== "sent", OR
  *         current.status is already "sent" — covers the "sent → sent" no-op)
  *         → ValidationFailedError (422)
- *     (b) trackingNumber present && deliveryMode.type === "PICKUP"
+ *     (b) trackingNumber present && delivery mode does not require tracking
  *         → ValidationFailedError (422)
  *     (c) trackingNumber present && current.trackingNumber !== null (immutable)
  *         → ValidationFailedError (422)
- *     (d) trackingNumber absent && entering sent && shipping (non-PICKUP)
+ *     (d) trackingNumber absent && entering sent && type=SHIPPING_FLAT_RATE
  *         → ValidationFailedError (422) — mandatory for shipping
  *
  * Design references:
@@ -56,12 +56,21 @@
  *   spec order-fulfillment §"Idempotent transitions"
  *   spec order-fulfillment §"Tracking number on shipment" (MODIFIED)
  */
-import type { SubOrder, SubOrderStatus } from "@prisma/client";
+import type { SubOrder } from "@prisma/client";
 
-import { InvalidOrderTransitionError, NotFoundError, ValidationFailedError } from "@/shared/errors/errors";
+import { requiresTrackingNumber } from "@/modules/delivery-modes/delivery-mode.policy";
+import {
+  InvalidOrderTransitionError,
+  NotFoundError,
+  ValidationFailedError,
+} from "@/shared/errors/errors";
 import { prisma } from "@/shared/utils/prisma";
 
-import type { ListSubOrdersQuery, PatchSubOrderBody, SubOrderStatusValue } from "../dto/sub-orders.dto";
+import type {
+  ListSubOrdersQuery,
+  PatchSubOrderBody,
+  SubOrderStatusValue,
+} from "../dto/sub-orders.dto";
 
 // ---------------------------------------------------------------------------
 // State machine definition
@@ -130,7 +139,7 @@ export async function findAll(
   return prisma.subOrder.findMany({
     where: {
       producerId,
-      ...(query?.status !== undefined && { status: query.status as SubOrderStatus }),
+      ...(query?.status !== undefined && { status: query.status }),
     },
     include: {
       orderLines: true,
@@ -172,7 +181,7 @@ export async function findById(
     throw new NotFoundError("SubOrder not found");
   }
 
-  return subOrder as SubOrder & { orderLines: unknown[] };
+  return subOrder;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,9 +231,9 @@ export async function transition(
       throw new NotFoundError("SubOrder not found");
     }
 
-    const target = input.status as SubOrderStatusValue;
+    const target = input.status;
     const isEnteringSent = target === "sent" && current.status !== "sent";
-    const isPickup = current.deliveryMode.type === "PICKUP";
+    const trackingRequired = requiresTrackingNumber(current.deliveryMode.type);
 
     // Step 2: trackingNumber gate — MUST run before the no-op early-return.
     // Spec: order-fulfillment §"Tracking number on shipment" (MODIFIED)
@@ -235,28 +244,48 @@ export async function transition(
       //     trackingNumber").
       if (!isEnteringSent) {
         throw new ValidationFailedError(
-          [{ path: "trackingNumber", message: "trackingNumber is only accepted when transitioning to 'sent'" }],
+          [
+            {
+              path: "trackingNumber",
+              message: "trackingNumber is only accepted when transitioning to 'sent'",
+            },
+          ],
           "trackingNumber is only accepted when transitioning to 'sent'",
         );
       }
-      // (b) PICKUP sub-orders reject any trackingNumber.
-      if (isPickup) {
+      // (b) Only carrier shipping sub-orders accept a trackingNumber.
+      if (!trackingRequired) {
         throw new ValidationFailedError(
-          [{ path: "trackingNumber", message: "PICKUP sub-orders cannot have a trackingNumber" }],
-          "PICKUP sub-orders cannot have a trackingNumber",
+          [
+            {
+              path: "trackingNumber",
+              message: `${current.deliveryMode.type} sub-orders cannot have a trackingNumber`,
+            },
+          ],
+          `${current.deliveryMode.type} sub-orders cannot have a trackingNumber`,
         );
       }
       // (c) Immutability — a non-null trackingNumber cannot be overwritten.
       if (current.trackingNumber !== null) {
         throw new ValidationFailedError(
-          [{ path: "trackingNumber", message: "trackingNumber is already set and cannot be overwritten" }],
+          [
+            {
+              path: "trackingNumber",
+              message: "trackingNumber is already set and cannot be overwritten",
+            },
+          ],
           "trackingNumber is already set and cannot be overwritten",
         );
       }
-    } else if (isEnteringSent && !isPickup) {
-      // (d) Shipping (non-PICKUP) sub-orders MUST provide a trackingNumber to enter "sent".
+    } else if (isEnteringSent && trackingRequired) {
+      // (d) Carrier shipping sub-orders MUST provide a trackingNumber to enter "sent".
       throw new ValidationFailedError(
-        [{ path: "trackingNumber", message: "trackingNumber is required for shipping sub-orders entering 'sent'" }],
+        [
+          {
+            path: "trackingNumber",
+            message: "trackingNumber is required for shipping sub-orders entering 'sent'",
+          },
+        ],
         "trackingNumber is required for shipping sub-orders entering 'sent'",
       );
     }
@@ -281,7 +310,7 @@ export async function transition(
     return tx.subOrder.update({
       where: { id },
       data: {
-        status: target as SubOrderStatus,
+        status: target,
         ...(input.trackingNumber !== undefined && { trackingNumber: input.trackingNumber }),
       },
     });
