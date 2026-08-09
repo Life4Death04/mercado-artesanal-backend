@@ -220,7 +220,7 @@ async function invokeWithP2002Recovery(
   cartView: Awaited<ReturnType<typeof cartService.getCartForCheckout>>,
   deliverySelections: { producerId: string; deliveryModeId: string }[],
   options?: { onRecovery?: () => void; applicationNameTag?: string },
-): Promise<ordersService.OrderDetailView> {
+): Promise<ordersService.CreateOrderFromPaymentResult> {
   const { onRecovery, applicationNameTag } = options ?? {};
 
   const attempt = () =>
@@ -477,7 +477,7 @@ describe("createOrderFromPayment — two-producer create [O1]", () => {
 
       const cartBeforeCheckout = await db.cart.findUniqueOrThrow({ where: { userId: consumer.id } });
 
-      const result = await prisma.$transaction((tx) =>
+      const { order: result } = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment(
           "pi_o1_two_producer",
           cartView,
@@ -958,7 +958,7 @@ describe("createOrderFromPayment — duplicate webhook recovers via real P2002 [
       // calls happened to settle to the same order (which a purely
       // sequential idempotent no-op would also satisfy).
       expect(recoveryFired).toBe(true);
-      expect(aResult.id).toBe(bResult.id);
+      expect(aResult.order.id).toBe(bResult.order.id);
 
       const paymentCount = await db.payment.count({ where: { providerRef: intentId } });
       expect(paymentCount).toBe(1);
@@ -994,7 +994,7 @@ describe("createOrderFromPayment — delivery-cost snapshot stays frozen after a
       await cartService.addItem(consumer.id, product.id, 1);
       const cartView = await cartService.getCartForCheckout(consumer.id);
 
-      const created = await prisma.$transaction((tx) =>
+      const { order: created } = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment(
           "pi_o6_delivery_cost_snapshot",
           cartView,
@@ -1015,6 +1015,144 @@ describe("createOrderFromPayment — delivery-cost snapshot stays frozen after a
       const afterUpdate = await db.subOrder.findUniqueOrThrow({ where: { id: subOrderId } });
       expect(afterUpdate.shippingCostSnapshot.toFixed(2)).toBe("4.00");
       expect(afterUpdate.shippingCostSnapshot.toFixed(2)).not.toBe("9.99");
+    },
+    20000,
+  );
+});
+
+// ===========================================================================
+// [N-EMIT] Cycle 5 notifications — Phase 4 emission wiring at the
+// createOrderFromPayment seam (design "Emission wiring", spec §"Event-to-
+// Recipient Emission Mapping"). Real DB — the only way to prove the
+// producer/consumer recipient emails resolved in-tx are correct, and that
+// the step-0 idempotency pre-check emits no duplicate notification.
+// ===========================================================================
+
+describe("createOrderFromPayment — notification emission (Cycle 5 notifications) [N-EMIT]", () => {
+  it(
+    "[N-EMIT-FANOUT] a two-producer order fans ORDER_CREATED out to the consumer + BOTH producers (3 recipients), plus one PAYMENT_CONFIRMED for the consumer, with audience-aware copy",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer: producerA, category } = await seedProducer("nemit-a", "B10000111");
+      const { producer: producerB } = await seedProducer("nemit-b", "B10000112");
+      const consumer = await seedConsumer("nemit");
+
+      const dmA = await db.deliveryMode.create({
+        data: { producerId: producerA.id, type: "SHIPPING_FLAT_RATE", cost: 2.0, isActive: true },
+      });
+      const dmB = await db.deliveryMode.create({
+        data: { producerId: producerB.id, type: "SHIPPING_FLAT_RATE", cost: 4.0, isActive: true },
+      });
+      const productA = await db.product.create({
+        data: { producerId: producerA.id, categoryId: category.id, name: "N-EMIT Product A", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+      const productB = await db.product.create({
+        data: { producerId: producerB.id, categoryId: category.id, name: "N-EMIT Product B", description: "d", price: 10.0, stock: 5, isActive: true },
+      });
+
+      await cartService.addItem(consumer.id, productA.id, 1);
+      await cartService.addItem(consumer.id, productB.id, 1);
+      const cartView = await cartService.getCartForCheckout(consumer.id);
+
+      const { order, pendingEmails } = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_nemit_fanout",
+          cartView,
+          [
+            { producerId: producerA.id, deliveryModeId: dmA.id },
+            { producerId: producerB.id, deliveryModeId: dmB.id },
+          ],
+          tx,
+        ),
+      );
+
+      // 1 PAYMENT_CONFIRMED (consumer) + 3 ORDER_CREATED (consumer + 2 producers) = 4.
+      expect(pendingEmails).toHaveLength(4);
+
+      const consumerRows = await db.notification.findMany({
+        where: { userId: consumer.id },
+        orderBy: { createdAt: "asc" },
+      });
+      expect(consumerRows.map((r) => r.type)).toEqual(["PAYMENT_CONFIRMED", "ORDER_CREATED"]);
+      expect(consumerRows[1]!.title).toBe("Pedido creado"); // base/consumer copy, unchanged
+
+      const producerAUser = await db.user.findUniqueOrThrow({ where: { id: producerA.userId } });
+      const producerBUser = await db.user.findUniqueOrThrow({ where: { id: producerB.userId } });
+      const producerARows = await db.notification.findMany({ where: { userId: producerAUser.id } });
+      const producerBRows = await db.notification.findMany({ where: { userId: producerBUser.id } });
+      expect(producerARows).toHaveLength(1);
+      expect(producerBRows).toHaveLength(1);
+      expect(producerARows[0]!.type).toBe("ORDER_CREATED");
+      // Producer-audience override copy (maintainer decision), distinct from the consumer's base copy.
+      expect(producerARows[0]!.title).toBe("Nuevo pedido recibido");
+      expect(producerARows[0]!.body).toBe("Has recibido un nuevo pedido para tus productos.");
+
+      // Fan-out to exactly 3 distinct ORDER_CREATED recipients: consumer + producerA + producerB.
+      const orderCreatedRecipients = new Set([
+        ...consumerRows.filter((r) => r.type === "ORDER_CREATED").map((r) => r.userId),
+        ...producerARows.map((r) => r.userId),
+        ...producerBRows.map((r) => r.userId),
+      ]);
+      expect(orderCreatedRecipients.size).toBe(3);
+
+      // pendingEmails carry the resolved recipient addresses.
+      const pendingTo = pendingEmails.map((p) => p.to).sort();
+      expect(pendingTo).toEqual(
+        [consumer.email, consumer.email, producerAUser.email, producerBUser.email].sort(),
+      );
+
+      expect(order.subOrders).toHaveLength(2); // sanity — unrelated to notifications
+    },
+    20000,
+  );
+
+  it(
+    "[N-EMIT-REPLAY-NO-DUP] a replayed call for the SAME providerRef (step-0 idempotency) creates no NEW notification and returns an empty pendingEmails",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("nemit-replay", "B10000113");
+      const consumer = await seedConsumer("nemit-replay");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const product = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "N-EMIT Replay Product", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+
+      await cartService.addItem(consumer.id, product.id, 1);
+      const cartView = await cartService.getCartForCheckout(consumer.id);
+      const intentId = "pi_nemit_replay";
+      const selections = [{ producerId: producer.id, deliveryModeId: dm.id }];
+
+      await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(intentId, cartView, selections, tx),
+      );
+
+      const countAfterFirst = await db.notification.count({
+        where: { userId: { in: [consumer.id, producer.userId] } },
+      });
+      expect(countAfterFirst).toBe(3); // PAYMENT_CONFIRMED + ORDER_CREATED(consumer) + ORDER_CREATED(producer)
+
+      // Replay: cartView is now stale (cart already cleared by the first
+      // call), but the step-0 idempotency pre-check must short-circuit
+      // BEFORE any notification write is even attempted.
+      const { pendingEmails: replayPendingEmails } = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(intentId, cartView, selections, tx),
+      );
+
+      expect(replayPendingEmails).toEqual([]);
+      const countAfterReplay = await db.notification.count({
+        where: { userId: { in: [consumer.id, producer.userId] } },
+      });
+      expect(countAfterReplay).toBe(3); // unchanged — no duplicate emission
     },
     20000,
   );
@@ -1066,7 +1204,7 @@ describe("GET /api/v1/pedidos and /api/v1/pedidos/:id — real Postgres + Supert
       await cartService.addItem(owner.id, productA.id, 1);
       await cartService.addItem(owner.id, productB.id, 1);
       const ownerCartView = await cartService.getCartForCheckout(owner.id);
-      const createdOrder = await prisma.$transaction((tx) =>
+      const { order: createdOrder } = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment(
           "pi_oh1_owner_order",
           ownerCartView,
@@ -1081,7 +1219,7 @@ describe("GET /api/v1/pedidos and /api/v1/pedidos/:id — real Postgres + Supert
       // Stranger: their OWN separate order — must never leak into owner's list/detail.
       await cartService.addItem(stranger.id, productA.id, 1);
       const strangerCartView = await cartService.getCartForCheckout(stranger.id);
-      const strangerOrder = await prisma.$transaction((tx) =>
+      const { order: strangerOrder } = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment(
           "pi_oh1_stranger_order",
           strangerCartView,
@@ -1201,7 +1339,7 @@ describe("GET /api/v1/pedidos/:id — exact spec fixture: 2 SubOrders, 3 OrderLi
       const cartView = await cartService.getCartForCheckout(owner.id);
       expect(cartView.items).toHaveLength(3);
 
-      const created = await prisma.$transaction((tx) =>
+      const { order: created } = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment(
           "pi_oh3x_three_line_detail",
           cartView,
@@ -1271,7 +1409,7 @@ describe("GET /api/v1/pedidos/:id — trackingNumber and deliveryMode.type expos
       await cartService.addItem(owner.id, productShip.id, 1);
       await cartService.addItem(owner.id, productPickup.id, 1);
       const cartView = await cartService.getCartForCheckout(owner.id);
-      const created = await prisma.$transaction((tx) =>
+      const { order: created } = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment(
           "pi_ohtrack_tracking_exposure",
           cartView,
@@ -1347,7 +1485,7 @@ describe("PATCH /api/v1/pedidos/:id/cancelar — success, restores stock exactly
 
       await cartService.addItem(consumer.id, product.id, 2);
       const cartView = await cartService.getCartForCheckout(consumer.id);
-      const created = await prisma.$transaction((tx) =>
+      const { order: created } = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment("pi_cxh1_cancel_success", cartView, [
           { producerId: producer.id, deliveryModeId: dm.id },
         ], tx),
@@ -1399,7 +1537,7 @@ describe("PATCH /api/v1/pedidos/:id/cancelar — non-owner returns 404 no-leak [
 
       await cartService.addItem(owner.id, product.id, 1);
       const cartView = await cartService.getCartForCheckout(owner.id);
-      const created = await prisma.$transaction((tx) =>
+      const { order: created } = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment("pi_cxh2_non_owner", cartView, [
           { producerId: producer.id, deliveryModeId: dm.id },
         ], tx),
@@ -1442,7 +1580,7 @@ describe("PATCH /api/v1/pedidos/:id/cancelar — non-PENDING order returns 409 [
 
       await cartService.addItem(consumer.id, product.id, 3);
       const cartView = await cartService.getCartForCheckout(consumer.id);
-      const created = await prisma.$transaction((tx) =>
+      const { order: created } = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment("pi_cxh3_non_pending", cartView, [
           { producerId: producer.id, deliveryModeId: dm.id },
         ], tx),
@@ -1492,7 +1630,7 @@ describe("cancelOrder — producer-wins count-guard: concurrent transition rejec
 
       await cartService.addItem(consumer.id, product.id, 2);
       const cartView = await cartService.getCartForCheckout(consumer.id);
-      const created = await prisma.$transaction((tx) =>
+      const { order: created } = await prisma.$transaction((tx) =>
         ordersService.createOrderFromPayment("pi_cxrace_producer_wins", cartView, [
           { producerId: producer.id, deliveryModeId: dm.id },
         ], tx),

@@ -45,6 +45,11 @@
  *     gate runs BEFORE the no-op early-return (update MUST NOT be called)
  *   - valid shipping sub-order entering "sent" persists trackingNumber in the update payload
  *
+ * transition — notification emission (Cycle 5 notifications, Phase 5):
+ *   - a valid transition emits SUBORDER_STATUS_CHANGED to order.userId
+ *   - entering "sent" with a trackingNumber ALSO emits TRACKING_ASSIGNED (both, in order)
+ *   - the idempotent no-op (Phase 5's "no-op-no-dup") creates NO notification
+ *
  * Spec references:
  *   order-fulfillment §"State machine"
  *   order-fulfillment scenario "Valid transition succeeds"
@@ -58,6 +63,8 @@
  *   order-fulfillment scenario "Already-set trackingNumber cannot be overwritten"
  *   order-fulfillment scenario "trackingNumber rejected on a non-sent transition"
  *   order-fulfillment scenario "Same-status no-op cannot set trackingNumber"
+ *   sdd/notifications/spec §"Sub-order status change and tracking notify the consumer"
+ *   sdd/notifications/spec §"Replayed event does not duplicate" (no-op path)
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -77,9 +84,23 @@ vi.mock("@/shared/utils/prisma", () => {
   };
 });
 
+// ---------------------------------------------------------------------------
+// Mock notifications service (Cycle 5 notifications Phase 5) — the fake `tx`
+// built by `mockTransaction()` below has no `tx.notification` delegate, so
+// the REAL `createNotification` (which calls `tx.notification.create`)
+// would crash against it. This file proves the state-machine + emission
+// CALL-SITE logic (which type, to which userId, in what order); the actual
+// write is proven separately by `notifications.service.ts`'s own suite and
+// the end-to-end HTTP path in `tests/integration/sub-orders.transitions.test.ts`.
+// ---------------------------------------------------------------------------
+vi.mock("@/modules/notifications/services/notifications.service", () => ({
+  createNotification: vi.fn(),
+}));
+
 import type { SubOrderStatus } from "@prisma/client";
 import { Decimal } from "@prisma/client/runtime/library";
 import { prisma } from "@/shared/utils/prisma";
+import * as notificationsService from "@/modules/notifications/services/notifications.service";
 import {
   InvalidOrderTransitionError,
   NotFoundError,
@@ -91,10 +112,15 @@ import * as subOrdersService from "@/modules/sub-orders/services/sub-orders.serv
 // Typed mock accessors
 // ---------------------------------------------------------------------------
 const mockedPrisma = vi.mocked(prisma);
+const mockedCreateNotification = vi.mocked(notificationsService.createNotification);
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
+
+/** Owning Consumer's userId, shared across fixtures below (Cycle 5 notifications recipient). */
+const OWNER_USER_ID = "user_001";
+const OWNER_EMAIL = "owner@example.com";
 
 function makeSubOrder(overrides: Record<string, unknown> = {}) {
   return {
@@ -106,6 +132,11 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
     shippingCostSnapshot: new Decimal("5.00"),
     trackingNumber: null,
     deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+    // Cycle 5 notifications (design "Emission wiring", Phase 5): the step-1
+    // findFirst now includes `order: { select: { userId: true } } }` — the
+    // emission recipient. `Order.userId` is a bare column (no Prisma `user`
+    // relation), so this fixture mirrors ONLY the field the service reads.
+    order: { userId: OWNER_USER_ID },
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
@@ -114,7 +145,8 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
 
 /**
  * Wire prisma.$transaction for a transition: findFirst returns `current`,
- * update returns `updated` (or current if not provided).
+ * update returns `updated` (or current if not provided). `tx.user.findUnique`
+ * resolves the Cycle 5 notifications recipient email.
  * Returns the mockUpdate spy so callers can assert it was or wasn't called.
  */
 function mockTransaction(
@@ -129,6 +161,9 @@ function mockTransaction(
           findFirst: vi.fn().mockResolvedValue(current),
           update: mockUpdate,
         },
+        user: {
+          findUnique: vi.fn().mockResolvedValue({ email: OWNER_EMAIL }),
+        },
       };
       return fn(fakeTx as unknown as typeof prisma);
     },
@@ -138,6 +173,13 @@ function mockTransaction(
 
 beforeEach(() => {
   vi.resetAllMocks();
+  // Cycle 5 notifications: re-establish the default resolved value lost by
+  // resetAllMocks() above (module-factory mocks are reset to a bare vi.fn()).
+  mockedCreateNotification.mockResolvedValue({
+    to: OWNER_EMAIL,
+    subject: "mock subject",
+    body: "mock body",
+  });
 });
 
 // ===========================================================================
@@ -153,7 +195,7 @@ describe("subOrdersService.transition — valid transitions", () => {
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "preparing" });
 
-    expect(result.status).toBe("preparing");
+    expect(result.subOrder.status).toBe("preparing");
     expect(mockUpdate).toHaveBeenCalledOnce();
     expect(mockUpdate).toHaveBeenCalledWith({
       where: { id: "so_001" },
@@ -175,7 +217,7 @@ describe("subOrdersService.transition — valid transitions", () => {
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "sent" });
 
-    expect(result.status).toBe("sent");
+    expect(result.subOrder.status).toBe("sent");
   });
 
   it("transitions PERSONAL_DELIVERY preparing → sent without trackingNumber", async () => {
@@ -204,7 +246,7 @@ describe("subOrdersService.transition — valid transitions", () => {
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "delivered" });
 
-    expect(result.status).toBe("delivered");
+    expect(result.subOrder.status).toBe("delivered");
   });
 
   it("transitions pending → cancelled", async () => {
@@ -214,7 +256,7 @@ describe("subOrdersService.transition — valid transitions", () => {
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "cancelled" });
 
-    expect(result.status).toBe("cancelled");
+    expect(result.subOrder.status).toBe("cancelled");
   });
 
   it("transitions preparing → cancelled", async () => {
@@ -224,7 +266,7 @@ describe("subOrdersService.transition — valid transitions", () => {
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "cancelled" });
 
-    expect(result.status).toBe("cancelled");
+    expect(result.subOrder.status).toBe("cancelled");
   });
 });
 
@@ -245,10 +287,25 @@ describe("subOrdersService.transition — idempotent no-op", () => {
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "preparing" });
 
     // Returns the current row unchanged
-    expect(result.status).toBe("preparing");
-    expect(result.updatedAt).toEqual(t0);
+    expect(result.subOrder.status).toBe("preparing");
+    expect(result.subOrder.updatedAt).toEqual(t0);
     // SQL no-update assertion: update MUST NOT have been called
     expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("[N-EMIT-NOOP-NO-DUP] creates NO notification and returns empty pendingEmails on a no-op transition", async () => {
+    // Cycle 5 notifications (design "Emission wiring", Phase 5) — a same-status
+    // PATCH must not duplicate a notification. Placement AFTER the step-3
+    // early-return guarantees this: the no-op path returns before step 5a
+    // (emission) is ever reached.
+    // Spec: sdd/notifications/spec §"Replayed event does not duplicate"
+    const current = makeSubOrder({ status: "preparing" as SubOrderStatus });
+    mockTransaction(current);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", { status: "preparing" });
+
+    expect(mockedCreateNotification).not.toHaveBeenCalled();
+    expect(result.pendingEmails).toEqual([]);
   });
 });
 
@@ -437,12 +494,95 @@ describe("subOrdersService.transition — trackingNumber gate", () => {
       trackingNumber: "TN1",
     });
 
-    expect(result.status).toBe("sent");
-    expect(result.trackingNumber).toBe("TN1");
+    expect(result.subOrder.status).toBe("sent");
+    expect(result.subOrder.trackingNumber).toBe("TN1");
     expect(mockUpdate).toHaveBeenCalledOnce();
     expect(mockUpdate).toHaveBeenCalledWith({
       where: { id: "so_001" },
       data: { status: "sent", trackingNumber: "TN1" },
     });
+  });
+});
+
+// ===========================================================================
+// transition — notification emission (Cycle 5 notifications, Phase 5)
+// ===========================================================================
+
+describe("subOrdersService.transition — notification emission", () => {
+  it("[N-EMIT-SUBORDER-STATUS] emits SUBORDER_STATUS_CHANGED to order.userId on a valid transition", async () => {
+    // Spec: sdd/notifications/spec §"Sub-order status change and tracking notify the consumer"
+    const current = makeSubOrder({ status: "pending" as SubOrderStatus });
+    const updated = makeSubOrder({ status: "preparing" as SubOrderStatus });
+    mockTransaction(current, updated);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", { status: "preparing" });
+
+    expect(mockedCreateNotification).toHaveBeenCalledOnce();
+    expect(mockedCreateNotification).toHaveBeenCalledWith(expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "SUBORDER_STATUS_CHANGED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(result.pendingEmails).toHaveLength(1);
+  });
+
+  it("[N-EMIT-TRACKING-ASSIGNED] emits SUBORDER_STATUS_CHANGED THEN TRACKING_ASSIGNED when entering 'sent' with a trackingNumber", async () => {
+    // Spec: sdd/notifications/spec §"Sub-order status change and tracking notify the consumer"
+    // Triangulation vs. the previous test: a SECOND notification is emitted
+    // only when trackingNumber is actually set — proves the conditional
+    // branch runs real logic, not a hardcoded single-call Fake It.
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: null,
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: "TN1",
+    });
+    mockTransaction(current, updated);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", {
+      status: "sent",
+      trackingNumber: "TN1",
+    });
+
+    expect(mockedCreateNotification).toHaveBeenCalledTimes(2);
+    expect(mockedCreateNotification).toHaveBeenNthCalledWith(1, expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "SUBORDER_STATUS_CHANGED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(mockedCreateNotification).toHaveBeenNthCalledWith(2, expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "TRACKING_ASSIGNED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(result.pendingEmails).toHaveLength(2);
+  });
+
+  it("does NOT emit TRACKING_ASSIGNED when entering 'sent' without a trackingNumber (PICKUP)", async () => {
+    // Triangulation: proves TRACKING_ASSIGNED is conditional on
+    // input.trackingNumber, not on isEnteringSent alone.
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
+    mockTransaction(current, updated);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", { status: "sent" });
+
+    expect(mockedCreateNotification).toHaveBeenCalledOnce();
+    expect(mockedCreateNotification).toHaveBeenCalledWith(expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "SUBORDER_STATUS_CHANGED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(result.pendingEmails).toHaveLength(1);
   });
 });

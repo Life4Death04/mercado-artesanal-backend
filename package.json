@@ -22,12 +22,14 @@
     "db:seed": "tsx prisma/seed.ts",
     "db:studio": "prisma studio",
     "create-admin": "tsx scripts/create-admin.ts",
+    "validate-ses": "tsx scripts/validate-ses.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1084.0",
+    "@aws-sdk/client-ses": "^3.1106.0",
     "@aws-sdk/s3-request-presigner": "^3.1084.0",
     "@prisma/client": "^5.22.0",
     "compression": "^1.7.4",

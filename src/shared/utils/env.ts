@@ -18,6 +18,13 @@ const EnvSchema = z
     // payments.service.ts's `verifyWebhookSignature` to verify the raw request
     // body signature on POST /pagos/webhook (design Decision 2, spec R6).
     STRIPE_WEBHOOK_SECRET: z.string().min(1),
+    // Cycle 5 — notifications Phase 2 (email-provider boundary). Selects the
+    // EmailProvider implementation once at module-load time in
+    // src/shared/email/email-provider.ts. "console" (default) logs and makes
+    // no external call — zero AWS risk. "ses" sends via @aws-sdk/client-ses
+    // (src/shared/email/ses-email-provider.ts). An unrecognized value fails
+    // boot here (fail-fast), before any provider is constructed.
+    EMAIL_PROVIDER: z.enum(["console", "ses"]).default("console"),
   })
   .superRefine((v, ctx) => {
     // Positive check: fail-closed when NODE_ENV === "production" and URL is not HTTPS.

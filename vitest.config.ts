@@ -33,6 +33,11 @@ export default defineConfig({
       // always mocked in tests (see tests/integration/payments.test.ts) — this
       // value only satisfies env.ts fail-fast validation at singleton import time.
       STRIPE_WEBHOOK_SECRET: "whsec_dummy_for_vitest",
+      // Required after Cycle 5 notifications Phase 2. Explicitly pinned to
+      // "console" (same as the schema default) so the test-env singleton
+      // never selects the SES provider — @aws-sdk/client-ses is globally
+      // mocked in tests/setup.ts regardless, but this keeps intent explicit.
+      EMAIL_PROVIDER: "console",
     },
     coverage: {
       provider: "v8",

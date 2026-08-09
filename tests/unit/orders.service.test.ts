@@ -79,6 +79,24 @@ vi.mock("@/modules/inventory/services/inventory.service", () => ({
   restockProduct: vi.fn(),
 }));
 
+// ---------------------------------------------------------------------------
+// Mock notifications service (Cycle 5 notifications Phase 4) — the fake
+// `tx` from `makeMockTx()` below has no `tx.notification` delegate, so the
+// REAL `createNotification` (which calls `tx.notification.create`) would
+// crash against it. `createOrderFromPayment`'s notification EMISSION
+// wiring is proven separately (real DB) in
+// `tests/integration/orders.test.ts` [N-EMIT-*]; this file only proves the
+// checkout-write-contract logic that predates Cycle 5, so the emission
+// call is swapped for an observable no-op spy instead.
+// ---------------------------------------------------------------------------
+vi.mock("@/modules/notifications/services/notifications.service", () => ({
+  createNotification: vi.fn().mockResolvedValue({
+    to: "mock-recipient@test.local",
+    subject: "mock subject",
+    body: "mock body",
+  }),
+}));
+
 import { decrementStock, restockProduct } from "@/modules/inventory/services/inventory.service";
 import {
   CartItemNotAvailableError,
@@ -177,6 +195,13 @@ function makeMockTx(overrides: Record<string, any> = {}) {
         providerRef: data.providerRef,
       })),
     },
+    // Cycle 5 notifications: `order.userId` is a BARE column (no Prisma
+    // relation — see orders.service.ts "Emission wiring" comment), so
+    // createOrderFromPayment resolves the recipient email via a separate
+    // `tx.user.findUnique` — mocked below.
+    user: {
+      findUnique: vi.fn().mockResolvedValue({ email: "consumer@test.local" }),
+    },
     order: {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       create: vi.fn().mockImplementation(async ({ data }: any) => ({
@@ -196,6 +221,13 @@ function makeMockTx(overrides: Record<string, any> = {}) {
         deliveryModeId: data.deliveryModeId,
         shippingCostSnapshot: data.shippingCostSnapshot,
         status: "pending",
+        // Cycle 5 notifications: `include: { producer: { select: { userId,
+        // user } } }` resolves each producer's recipient email in-tx for
+        // the ORDER_CREATED fan-out.
+        producer: {
+          userId: `producerUser_${data.producerId}`,
+          user: { email: `${data.producerId}@test.local` },
+        },
       })),
     },
     orderLine: {
@@ -298,7 +330,7 @@ describe("ordersService.createOrderFromPayment — idempotency pre-check [CO-IDE
     });
 
     const cartView = makeCartView([makeCartItemForCheckout()]);
-    const result = await ordersService.createOrderFromPayment(
+    const { order: result } = await ordersService.createOrderFromPayment(
       "pi_123",
       cartView,
       [{ producerId: "producer_A", deliveryModeId: "dm_A" }],
@@ -685,7 +717,7 @@ describe("ordersService.createOrderFromPayment — Decimal totals [CO-DECIMAL]",
     });
 
     const cartView = makeCartView([producerAItem1, producerAItem2, producerBItem]);
-    const result = await ordersService.createOrderFromPayment(
+    const { order: result } = await ordersService.createOrderFromPayment(
       "pi_123",
       cartView,
       [
@@ -769,7 +801,7 @@ describe("ordersService.createOrderFromPayment — maps for shipping/deliveryMod
     });
 
     const cartView = makeCartView([producerAItem, producerBItem]);
-    const result = await ordersService.createOrderFromPayment(
+    const { order: result } = await ordersService.createOrderFromPayment(
       "pi_123",
       cartView,
       [
@@ -995,7 +1027,7 @@ describe("ordersService.createOrderFromPayment — snapshot line mapping [CO-SNA
       makeCartItemForCheckout({ unitPriceSnapshot: "5.00", quantity: 2 }),
     ]);
 
-    const result = await ordersService.createOrderFromPayment(
+    const { order: result } = await ordersService.createOrderFromPayment(
       "pi_123",
       cartView,
       [{ producerId: "producer_A", deliveryModeId: "dm_A" }],

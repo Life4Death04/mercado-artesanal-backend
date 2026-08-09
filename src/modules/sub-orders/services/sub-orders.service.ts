@@ -59,6 +59,8 @@
 import type { SubOrder } from "@prisma/client";
 
 import { requiresTrackingNumber } from "@/modules/delivery-modes/delivery-mode.policy";
+import * as notificationsService from "@/modules/notifications/services/notifications.service";
+import type { PendingEmail } from "@/modules/notifications/services/notifications.service";
 import {
   InvalidOrderTransitionError,
   NotFoundError,
@@ -71,6 +73,21 @@ import type {
   PatchSubOrderBody,
   SubOrderStatusValue,
 } from "../dto/sub-orders.dto";
+
+/**
+ * `transition()`'s return contract (Cycle 5 notifications design "Emission
+ * wiring", Phase 5). `subOrder` is the SAME frozen `SubOrder` row this
+ * function always returned; `pendingEmails` is the fire-after-commit
+ * dispatch intent for every Notification written during THIS call (empty on
+ * the step-3 idempotent no-op path — a same-status PATCH emits nothing, so
+ * it has nothing to dispatch). The CALLER (`sub-orders.controller.ts`) is
+ * responsible for invoking `dispatchEmails` from `@/shared/email/email-provider`
+ * AFTER this transaction commits (fire-after-commit, best-effort).
+ */
+export interface TransitionSubOrderResult {
+  subOrder: SubOrder;
+  pendingEmails: PendingEmail[];
+}
 
 // ---------------------------------------------------------------------------
 // State machine definition
@@ -214,17 +231,37 @@ export async function findById(
  * Design Architecture Decision #1 — tracking rules enforced in the service.
  * Design Architecture Decision #3 — idempotent PATCH: early return before update;
  *   extended so the tracking gate runs before that early return too.
+ *
+ * Cycle 5 notifications (design "Emission wiring", Phase 5) — emitted AFTER
+ * the step-5 update only, never on the step-3 no-op early-return (free-rides
+ * that existing guard, zero new idempotency logic, mirrors the payments/orders
+ * seam): SUBORDER_STATUS_CHANGED always, plus TRACKING_ASSIGNED when this
+ * PATCH also set a trackingNumber (`input.trackingNumber !== undefined`,
+ * which the step-2 gate already guarantees only ever happens on the PATCH
+ * entering `sent`). Both go to the order's owning Consumer (`order.userId`)
+ * with base copy — no audience override, this seam has a single recipient
+ * role (maintainer decision sdd/notifications/copy-audience-decision).
+ * Returns `{ subOrder, pendingEmails }`; the CALLER dispatches
+ * `pendingEmails` via the shared `dispatchEmails` AFTER this transaction
+ * commits.
+ *
+ * Spec: notifications §"Sub-order status change and tracking notify the consumer"
+ * Spec: notifications §"Replayed event does not duplicate" (no-op path)
  */
 export async function transition(
   producerId: string,
   id: string,
   input: PatchSubOrderBody,
-): Promise<SubOrder> {
+): Promise<TransitionSubOrderResult> {
   return prisma.$transaction(async (tx) => {
-    // Step 1: ownership guard — 404-no-leak; include deliveryMode.type for the gate.
+    // Step 1: ownership guard — 404-no-leak; include deliveryMode.type for the
+    // gate and order.userId (Cycle 5 notifications) for the emission recipient.
     const current = await tx.subOrder.findFirst({
       where: { id, producerId },
-      include: { deliveryMode: { select: { type: true } } },
+      include: {
+        deliveryMode: { select: { type: true } },
+        order: { select: { userId: true } },
+      },
     });
 
     if (!current) {
@@ -291,10 +328,12 @@ export async function transition(
     }
 
     // Step 3: idempotent no-op — if already in target state, return current row unchanged.
-    // Decision #3: no UPDATE is issued; updatedAt is untouched.
+    // Decision #3: no UPDATE is issued; updatedAt is untouched. (Cycle 5 notifications:
+    // a no-op emits NO notification — pendingEmails stays empty, free-riding this
+    // existing early-return exactly like the payments/orders seam's step-0 replay guard.)
     // Spec: "The service MUST NOT issue any UPDATE to the row; updatedAt MUST remain unchanged."
     if (current.status === target) {
-      return current;
+      return { subOrder: current, pendingEmails: [] };
     }
 
     // Step 4: validate transition
@@ -307,12 +346,50 @@ export async function transition(
 
     // Step 5: valid transition — update the row.
     // trackingNumber is only ever defined here when isEnteringSent was true (gate guarantees it).
-    return tx.subOrder.update({
+    const updated = await tx.subOrder.update({
       where: { id },
       data: {
         status: target,
         ...(input.trackingNumber !== undefined && { trackingNumber: input.trackingNumber }),
       },
     });
+
+    // Step 5a (Cycle 5 notifications, design "Emission wiring"): emit AFTER
+    // the write above — a throw in any EARLIER step never reaches here, so
+    // no notification is ever created for a transition that didn't happen.
+    // `Order.userId` is intentionally a BARE column with no Prisma relation
+    // to `User` (money-webhook exception, prisma pitfall #1 — same
+    // deviation documented for the payments/orders seam), so the recipient
+    // email cannot be nested-included on the step-1 `order` select; one
+    // extra in-tx `user.findUnique` resolves it instead.
+    const owner = await tx.user.findUnique({
+      where: { id: current.order.userId },
+      select: { email: true },
+    });
+    // `order.userId` is FK-guaranteed, so this is a "cannot happen" guard — but
+    // resolve it as a controlled NotFoundError rather than a raw non-null
+    // assertion, so a missing row never becomes an uncaught TypeError mid-tx.
+    if (!owner) {
+      throw new NotFoundError("Order owner not found");
+    }
+    const pendingEmails: PendingEmail[] = [];
+    pendingEmails.push(
+      await notificationsService.createNotification(tx, {
+        userId: current.order.userId,
+        type: "SUBORDER_STATUS_CHANGED",
+        toEmail: owner.email,
+      }),
+    );
+    if (input.trackingNumber !== undefined) {
+      pendingEmails.push(
+        await notificationsService.createNotification(tx, {
+          userId: current.order.userId,
+          type: "TRACKING_ASSIGNED",
+          toEmail: owner.email,
+        }),
+      );
+    }
+
+    return { subOrder: updated, pendingEmails };
   });
 }
