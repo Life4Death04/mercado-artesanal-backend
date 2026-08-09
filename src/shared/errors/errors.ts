@@ -324,3 +324,17 @@ export class InvalidModerationTransitionError extends AppError {
   readonly status = 409;
   readonly title = "Invalid moderation transition";
 }
+
+// ---------------------------------------------------------------------------
+// 409 — POST /admin/categories (or a PATCH that would derive a new slug)
+//       collides with an existing Category.slug. Mapped from a Prisma P2002
+//       unique-constraint violation on the `slug` column (per
+//       NifAlreadyRegisteredError's P2002-to-409 pattern). No category is
+//       created/updated when this is thrown.
+// ---------------------------------------------------------------------------
+
+export class CategorySlugConflictError extends AppError {
+  readonly code = "CATEGORY_SLUG_CONFLICT" as const;
+  readonly status = 409;
+  readonly title = "Category slug conflict";
+}
