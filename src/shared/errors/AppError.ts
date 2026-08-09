@@ -47,7 +47,9 @@ export type ErrorCode =
   | "CART_ITEM_NOT_AVAILABLE"
   // Cycle 5 additions — payments slice (consumer-purchase-flow 3/3)
   | "PAYMENT_INTENT_CREATION_FAILED"
-  | "WEBHOOK_SIGNATURE_INVALID";
+  | "WEBHOOK_SIGNATURE_INVALID"
+  // Cycle 6 additions — admin-catalog-control (admin cycle 1/3)
+  | "INVALID_MODERATION_TRANSITION";
 
 export interface ProblemDetails {
   type: string;

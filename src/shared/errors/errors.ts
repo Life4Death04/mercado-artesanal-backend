@@ -307,3 +307,20 @@ export class WebhookSignatureError extends AppError {
   readonly status = 400;
   readonly title = "Webhook signature invalid";
 }
+
+// ===========================================================================
+// Cycle 6 additions — admin-catalog-control (admin cycle 1/3)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 409 — PATCH /admin/products/:id/moderation action does not match the
+//       product's current moderationStatus (action-table rejection or a
+//       raced conditional write that returned zero updated rows).
+//       Status and audit fields are left unchanged.
+// ---------------------------------------------------------------------------
+
+export class InvalidModerationTransitionError extends AppError {
+  readonly code = "INVALID_MODERATION_TRANSITION" as const;
+  readonly status = 409;
+  readonly title = "Invalid moderation transition";
+}
