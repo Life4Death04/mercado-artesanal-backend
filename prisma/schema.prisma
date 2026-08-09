@@ -238,6 +238,11 @@ model Product {
   reportedAt        DateTime?        @map("reported_at")
   moderationStatus  ModerationStatus @default(OK) @map("moderation_status")
   reportReason      String?          @map("report_reason")
+  // admin-catalog WU1 — latest-action moderation audit (nullable, no backfill).
+  // Distinct from reportReason (reporter's complaint) — design Decision.
+  moderatedBy       String?          @map("moderated_by")
+  moderatedAt       DateTime?        @map("moderated_at")
+  moderationReason  String?          @map("moderation_reason")
   deletedAt         DateTime?        @map("deleted_at")
   createdAt         DateTime         @default(now()) @map("created_at")
   updatedAt         DateTime         @updatedAt @map("updated_at")
@@ -251,6 +256,8 @@ model Product {
   @@index([producerId, isActive])
   @@index([categoryId, isActive])
   @@index([producerId, stock])
+  // admin-catalog WU1 — moderation queue read filters by moderationStatus.
+  @@index([moderationStatus])
   @@map("products")
 }
 
