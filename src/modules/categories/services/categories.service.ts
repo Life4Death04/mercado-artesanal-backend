@@ -151,7 +151,7 @@ export async function create(input: CreateCategoryInput): Promise<Category> {
       },
     });
   } catch (err) {
-    remapSlugP2002(err);
+    return remapSlugP2002(err);
   }
 }
 
