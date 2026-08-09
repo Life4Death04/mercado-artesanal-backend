@@ -37,9 +37,10 @@ model User {
   updatedAt     DateTime  @updatedAt @map("updated_at")
   deletedAt     DateTime? @map("deleted_at")
 
-  producer  Producer?
-  addresses Address[]
-  cart      Cart?
+  producer      Producer?
+  addresses     Address[]
+  cart          Cart?
+  notifications Notification[]
 
   @@index([auth0Sub])
   @@map("users")
@@ -485,4 +486,43 @@ model CartItem {
   @@unique([cartId, productId], name: "cart_product_unique")
   @@index([cartId])
   @@map("cart_items")
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 5 — Notifications (notifications, Phase 1: schema foundation)
+// ---------------------------------------------------------------------------
+
+/// In-app notification event types. INCIDENT_REPORTED and INCIDENT_RESOLVED
+/// are contract-only in Cycle 5 — valid enum values with no emitting code
+/// path yet (incident emission is out of scope, per product-scope decision C).
+enum NotificationType {
+  PAYMENT_CONFIRMED
+  ORDER_CREATED
+  SUBORDER_STATUS_CHANGED
+  TRACKING_ASSIGNED
+  INCIDENT_REPORTED
+  INCIDENT_RESOLVED
+}
+
+/// Per-user in-app notification. Written IN-transaction at the existing
+/// payments/orders and sub-orders tx seams (Cycle 5 design) — the row is
+/// atomic with the business write it announces. `data` is read-only
+/// informational payload, never joined. Owner-scoped reads only; the
+/// service layer MUST filter by `userId` on every list/count/mark-read.
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String           @map("user_id")
+  type      NotificationType
+  title     String
+  body      String
+  data      Json?
+  read      Boolean          @default(false)
+  readAt    DateTime?        @map("read_at")
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+  @@map("notifications")
 }

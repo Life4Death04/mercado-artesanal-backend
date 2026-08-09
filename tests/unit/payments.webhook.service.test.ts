@@ -79,8 +79,22 @@ vi.mock("@/shared/utils/prisma", () => ({
 import type { CartForCheckout } from "@/modules/cart/services/cart.service";
 import { getCartForCheckout } from "@/modules/cart/services/cart.service";
 import * as ordersService from "@/modules/orders/services/orders.service";
-import type { OrderDetailView } from "@/modules/orders/services/orders.service";
+import type {
+  CreateOrderFromPaymentResult,
+  OrderDetailView,
+} from "@/modules/orders/services/orders.service";
 import { prisma } from "@/shared/utils/prisma";
+
+/** Cycle 5 notifications: `createOrderFromPayment` now returns
+ * `{ order, pendingEmails }`. `pendingEmails: []` MUST be a real runtime
+ * array (not just a type cast) — `handleSucceededEvent` calls
+ * `dispatchEmails(result.pendingEmails)` after `attempt()` resolves, and
+ * `dispatchEmails` iterates the array; an `undefined` value would throw. */
+function fakeCreateOrderResult(
+  order: Partial<OrderDetailView> = {},
+): CreateOrderFromPaymentResult {
+  return { order: order as OrderDetailView, pendingEmails: [] };
+}
 
 import { serializeDeliverySelectionsForMetadata } from "@/modules/payments/dto/payments.dto";
 import * as paymentsService from "@/modules/payments/services/payments.service";
@@ -254,7 +268,7 @@ describe("payments.service — payment_intent.succeeded dispatch [WHU-SUCCESS]",
     mockedTransaction.mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) => fn(fakeTx));
     mockedCreateOrderFromPayment.mockImplementationOnce(async () => {
       callOrder.push("createOrderFromPayment");
-      return {} as OrderDetailView;
+      return fakeCreateOrderResult();
     });
     mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView());
 
@@ -276,7 +290,7 @@ describe("payments.service — payment_intent.succeeded dispatch [WHU-SUCCESS]",
   it("[WHU-SUCCESS-METADATA] re-derives cartView via getCartForCheckout(metadata.userId) and parses deliverySelections from metadata", async () => {
     const fakeTx = { payment: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }), updateMany: vi.fn() } };
     mockedTransaction.mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) => fn(fakeTx));
-    mockedCreateOrderFromPayment.mockResolvedValueOnce({} as OrderDetailView);
+    mockedCreateOrderFromPayment.mockResolvedValueOnce(fakeCreateOrderResult());
     // `cartId: "cart_xyz"` matches the event metadata below — the Bug 2
     // reconciliation guard (WU3 rework) compares cartView.cartId against
     // metadata.cartId, so the two must agree for this test to exercise the
@@ -320,7 +334,7 @@ describe("payments.service — payment_intent.succeeded dispatch [WHU-SUCCESS]",
       }
       return fn({ payment: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }), updateMany: vi.fn() } });
     });
-    mockedCreateOrderFromPayment.mockResolvedValue({} as OrderDetailView);
+    mockedCreateOrderFromPayment.mockResolvedValue(fakeCreateOrderResult());
     mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView());
 
     const event = makeSucceededEvent({ id: "pi_p2002_retry" });

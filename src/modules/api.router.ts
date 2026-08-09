@@ -29,6 +29,8 @@
  *   paymentsRouter       — Cycle 5: POST /pagos/intent (payments WU1 — authenticated
  *                          Stripe PaymentIntent creation) + POST /pagos/webhook
  *                          (payments WU2 — unauth, raw-body, signature-verified).
+ *   notificationsRouter  — Cycle 5: owner-scoped in-app notifications under
+ *                          /notifications[/unread-count|/:id/read] (notifications WU3).
  *
  * Mount order: public routers (categoriesRouter, producersRouter GET /:id,
  * publicProductsRouter) are registered BEFORE auth-gated routers so they are
@@ -49,6 +51,7 @@ import { cartRouter } from "./cart/routes/cart.routes";
 import { categoriesRouter } from "./categories/routes/categories.routes";
 import { deliveryModesRouter } from "./delivery-modes/routes/delivery-modes.routes";
 import { imagesRouter } from "./images/routes/images.routes";
+import { notificationsRouter } from "./notifications/routes/notifications.routes";
 import { onboardingRouter } from "./onboarding/routes/onboarding.routes";
 import { ordersRouter } from "./orders/routes/orders.routes";
 import { paymentsRouter } from "./payments/routes/payments.routes";
@@ -82,3 +85,4 @@ apiRouter.use(statisticsRouter);
 apiRouter.use(cartRouter);
 apiRouter.use(ordersRouter);
 apiRouter.use(paymentsRouter);
+apiRouter.use(notificationsRouter);

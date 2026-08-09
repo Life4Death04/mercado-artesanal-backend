@@ -20,6 +20,9 @@
  *   [SO-T6] PATCH /producers/me/sub-orders/:id — 200 shipping sub-order persists trackingNumber on →sent
  *   [SO-T7] PATCH /producers/me/sub-orders/:id — 422 VALIDATION_FAILED, shipping sub-order missing trackingNumber on →sent
  *   [SO-T-unauth] PATCH /producers/me/sub-orders/:id — 401 unauthenticated
+ *   [N-EMIT-SUBORDER-STATUS] PATCH ... — 200 dispatches a SUBORDER_STATUS_CHANGED email after commit
+ *   [N-EMIT-TRACKING-ASSIGNED] PATCH ... →sent w/ trackingNumber — 200 dispatches BOTH emails after commit
+ *   [N-EMIT-NOOP-NO-DUP] PATCH ... idempotent no-op — 200, createNotification is NEVER called
  *
  * NOTE — [SO-T4] formally supersedes the Cycle 2 "Attempt to set trackingNumber rejected"
  * scenario (order-fulfillment §"Tracking number deferred", now REMOVED). This delta
@@ -35,6 +38,8 @@
  *   order-fulfillment scenario "PICKUP sub-order rejects trackingNumber"
  *   order-fulfillment scenario "Shipping sub-order transitions to sent with a valid trackingNumber"
  *   order-fulfillment scenario "Shipping sub-order to sent without trackingNumber rejected"
+ *   sdd/notifications/spec §"Sub-order status change and tracking notify the consumer"
+ *   sdd/notifications/spec §"Replayed event does not duplicate" (no-op path)
  */
 import supertest from "supertest";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -88,9 +93,25 @@ vi.mock("@/shared/utils/prisma", () => {
   };
 });
 
+// ---------------------------------------------------------------------------
+// Mock: notifications service (Cycle 5 notifications Phase 5)
+// The fake `tx` built by `mockTransition()` below has no `tx.notification`
+// delegate, so the REAL `createNotification` (which calls
+// `tx.notification.create`) would crash against it. `dispatchEmails` /
+// `emailProvider` are DELIBERATELY left un-mocked below — the
+// [N-EMIT-*] tests spy on the real `emailProvider.send` to prove the
+// controller's post-commit dispatch wiring end-to-end (mirrors
+// `tests/integration/payments.test.ts` [N-EMIT-NONBLOCKING]).
+// ---------------------------------------------------------------------------
+vi.mock("@/modules/notifications/services/notifications.service", () => ({
+  createNotification: vi.fn(),
+}));
+
 import type { SubOrderStatus } from "@prisma/client";
 import { Decimal } from "@prisma/client/runtime/library";
 import { prisma } from "@/shared/utils/prisma";
+import * as notificationsService from "@/modules/notifications/services/notifications.service";
+import { emailProvider } from "@/shared/email/email-provider";
 import { createApp } from "@/app";
 
 // ---------------------------------------------------------------------------
@@ -99,6 +120,7 @@ import { createApp } from "@/app";
 const mockedPrisma = vi.mocked(prisma);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedUser = mockedPrisma.user as any;
+const mockedCreateNotification = vi.mocked(notificationsService.createNotification);
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -118,6 +140,10 @@ function makeProducerUser(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** Owning Consumer's userId/email, shared across fixtures (Cycle 5 notifications recipient). */
+const OWNER_USER_ID = "cuid_consumer_001";
+const OWNER_EMAIL = "consumer@example.com";
+
 function makeSubOrder(overrides: Record<string, unknown> = {}) {
   return {
     id: "so_001",
@@ -128,6 +154,9 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
     shippingCostSnapshot: new Decimal("5.00"),
     trackingNumber: null,
     deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+    // Cycle 5 notifications (design "Emission wiring", Phase 5): the step-1
+    // findFirst now includes `order: { select: { userId: true } } }`.
+    order: { userId: OWNER_USER_ID },
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
@@ -154,6 +183,7 @@ function mockLoadUser(user: ReturnType<typeof makeProducerUser> | null): void {
 /**
  * Wire up prisma.$transaction for transition scenarios.
  * The callback is called with a fake tx that has findFirst and update methods.
+ * `tx.user.findUnique` resolves the Cycle 5 notifications recipient email.
  */
 function mockTransition(
   current: ReturnType<typeof makeSubOrder> | null,
@@ -165,6 +195,9 @@ function mockTransition(
         subOrder: {
           findFirst: vi.fn().mockResolvedValue(current),
           update: vi.fn().mockResolvedValue(updated ?? current),
+        },
+        user: {
+          findUnique: vi.fn().mockResolvedValue({ email: OWNER_EMAIL }),
         },
       };
       return fn(fakeTx as unknown as typeof prisma);
@@ -185,6 +218,13 @@ afterAll(async () => {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  // Cycle 5 notifications: re-establish the default resolved value lost by
+  // resetAllMocks() above (module-factory mocks are reset to a bare vi.fn()).
+  mockedCreateNotification.mockResolvedValue({
+    to: OWNER_EMAIL,
+    subject: "mock subject",
+    body: "mock body",
+  });
 });
 
 // ===========================================================================
@@ -277,6 +317,9 @@ describe("PATCH /api/v1/producers/me/sub-orders/:id — state machine transition
     expect(res.body.status).toBe("preparing");
     // updatedAt should remain T0 — serialized as ISO string in JSON
     expect(new Date(res.body.updatedAt as string).getTime()).toBe(t0.getTime());
+    // [N-EMIT-NOOP-NO-DUP] (Cycle 5 notifications): a no-op transition must
+    // not emit any notification.
+    expect(mockedCreateNotification).not.toHaveBeenCalled();
   });
 
   it("[SO-T4] returns 422 VALIDATION_FAILED when a PICKUP sub-order carries a trackingNumber", async () => {
@@ -426,5 +469,88 @@ describe("PATCH /api/v1/producers/me/sub-orders/:id — state machine transition
       .patch("/api/v1/producers/me/sub-orders/so_001")
       .send({ status: "preparing" });
     expect(res.status).toBe(401);
+  });
+});
+
+// ===========================================================================
+// PATCH /api/v1/producers/me/sub-orders/:id — notification emission
+// (Cycle 5 notifications, Phase 5)
+// ===========================================================================
+
+describe("PATCH /api/v1/producers/me/sub-orders/:id — notification emission (Cycle 5 notifications)", () => {
+  it("[N-EMIT-SUBORDER-STATUS] dispatches a SUBORDER_STATUS_CHANGED email to the owning Consumer after commit", async () => {
+    // Spec: sdd/notifications/spec §"Sub-order status change and tracking notify the consumer"
+    // Proves the FULL wire path: HTTP -> controller -> transition() (in-tx
+    // createNotification) -> controller's post-commit dispatchEmails() ->
+    // the REAL emailProvider singleton (spied, not mocked — Console in test
+    // env, zero AWS/network I/O either way).
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+    const current = makeSubOrder({ status: "pending" as SubOrderStatus });
+    const updated = makeSubOrder({ status: "preparing" as SubOrderStatus });
+
+    mockLoadUser(user);
+    mockTransition(current, updated);
+    const sendSpy = vi.spyOn(emailProvider, "send").mockResolvedValue(undefined);
+
+    const res = await request
+      .patch("/api/v1/producers/me/sub-orders/so_001")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({ status: "preparing" });
+
+    expect(res.status).toBe(200);
+    expect(mockedCreateNotification).toHaveBeenCalledOnce();
+    expect(mockedCreateNotification).toHaveBeenCalledWith(expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "SUBORDER_STATUS_CHANGED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(sendSpy).toHaveBeenCalledOnce();
+    expect(sendSpy).toHaveBeenCalledWith({ to: OWNER_EMAIL, subject: "mock subject", body: "mock body" });
+
+    sendSpy.mockRestore();
+  });
+
+  it("[N-EMIT-TRACKING-ASSIGNED] dispatches BOTH emails when a shipping sub-order enters 'sent' with a trackingNumber", async () => {
+    // Spec: sdd/notifications/spec §"Sub-order status change and tracking notify the consumer"
+    // Triangulation vs. the previous test: proves the SECOND notification
+    // (TRACKING_ASSIGNED) is conditional on trackingNumber, not hardcoded.
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: null,
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: "TN1",
+    });
+
+    mockLoadUser(user);
+    mockTransition(current, updated);
+    const sendSpy = vi.spyOn(emailProvider, "send").mockResolvedValue(undefined);
+
+    const res = await request
+      .patch("/api/v1/producers/me/sub-orders/so_001")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({ status: "sent", trackingNumber: "TN1" });
+
+    expect(res.status).toBe(200);
+    expect(mockedCreateNotification).toHaveBeenCalledTimes(2);
+    expect(mockedCreateNotification).toHaveBeenNthCalledWith(1, expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "SUBORDER_STATUS_CHANGED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(mockedCreateNotification).toHaveBeenNthCalledWith(2, expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "TRACKING_ASSIGNED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(sendSpy).toHaveBeenCalledTimes(2);
+
+    sendSpy.mockRestore();
   });
 });

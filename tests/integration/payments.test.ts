@@ -113,6 +113,8 @@ import * as cartService from "@/modules/cart/services/cart.service";
 // eslint-disable-next-line import/first
 import { serializeDeliverySelectionsForMetadata } from "@/modules/payments/dto/payments.dto";
 // eslint-disable-next-line import/first
+import { emailProvider } from "@/shared/email/email-provider";
+// eslint-disable-next-line import/first
 import { stripeClient } from "@/modules/payments/services/stripe.client";
 // eslint-disable-next-line import/first
 import type { StripeEvent } from "@/modules/payments/services/stripe.client";
@@ -765,6 +767,71 @@ describe("POST /api/v1/pagos/webhook — replayed succeeded event is a no-op [WU
       expect(orderCount).toBe(1);
       const paymentCount = await db.payment.count({ where: { providerRef: intentId } });
       expect(paymentCount).toBe(1);
+    },
+    20000,
+  );
+});
+
+describe("POST /api/v1/pagos/webhook — email dispatch failure is best-effort, never blocks the committed order (Cycle 5 notifications) [N-EMIT-NONBLOCKING]", () => {
+  it(
+    "[N-EMIT-NONBLOCKING] a rejected email send never surfaces as a webhook error and never rolls back the committed order/payment/notification writes",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+      vi.clearAllMocks();
+
+      const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
+        namePrefix: "nemitfail",
+        nif: "B20000199",
+      });
+      const intentId = "pi_nemit_nonblocking";
+      cleanup.providerRefs.push(intentId);
+
+      // Fire-after-commit dispatch happens AFTER the webhook's own
+      // transaction commits (design "Emission wiring") — spying on the
+      // real `emailProvider` singleton (Console, per test env) proves the
+      // failure is caught+logged per-message, never thrown to the caller.
+      const sendSpy = vi
+        .spyOn(emailProvider, "send")
+        .mockRejectedValue(new Error("SMTP down — simulated provider failure"));
+
+      mockedConstructEvent.mockReturnValueOnce(
+        makeSucceededEvent({
+          intentId,
+          amountCents: 700,
+          userId: consumer.id,
+          cartId,
+          deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+        }),
+      );
+
+      const res = await request
+        .post("/api/v1/pagos/webhook")
+        .set("stripe-signature", "t=1,v1=valid")
+        .send({ id: `evt_${intentId}`, type: "payment_intent.succeeded" });
+
+      // The webhook itself never surfaces the dispatch failure — 200, the
+      // SAME response as a healthy dispatch (best-effort, non-blocking).
+      expect(res.status).toBe(200);
+
+      const payment = await db.payment.findUnique({ where: { providerRef: intentId } });
+      expect(payment?.status).toBe("SUCCEEDED");
+
+      const orderCount = await db.order.count({ where: { payment: { providerRef: intentId } } });
+      expect(orderCount).toBe(1);
+
+      // The Notification rows were WRITTEN in-tx, BEFORE the post-commit
+      // dispatch ever attempted to send them — the failed SEND never rolls
+      // back the already-committed business write.
+      const notificationCount = await db.notification.count({ where: { userId: consumer.id } });
+      expect(notificationCount).toBe(2); // PAYMENT_CONFIRMED + ORDER_CREATED
+
+      // The failure path actually ran (not a vacuous pass).
+      expect(sendSpy).toHaveBeenCalled();
+
+      sendSpy.mockRestore();
     },
     20000,
   );
@@ -1510,16 +1577,26 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R4 pure polling", ()
     const consumer = await seedConsumer(db, cleanup, "be2-pure-read");
     const providerRef = "pi_be2_pure_read";
     await seedProcessingCheckout(consumer.id, providerRef);
-    const before = { payments: await db.payment.count(), orders: await db.order.count(), carts: await db.cart.count() };
+    // Scope row-count assertions to THIS test's own consumer. Vitest runs
+    // integration files in parallel, so an unscoped full-table count() races
+    // against rows other files create between the snapshot and the assertion.
+    // Filtering by userId proves the polled owner's rows are untouched without
+    // depending on global table state.
+    const ownScope = { where: { userId: consumer.id } };
+    const before = {
+      payments: await db.payment.count(ownScope),
+      orders: await db.order.count(ownScope),
+      carts: await db.cart.count(ownScope),
+    };
     vi.clearAllMocks();
 
     const first = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-pure-read"));
     const second = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-pure-read"));
     expect(first.body).toEqual({ state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" });
     expect(second.body).toEqual(first.body);
-    expect(await db.payment.count()).toBe(before.payments);
-    expect(await db.order.count()).toBe(before.orders);
-    expect(await db.cart.count()).toBe(before.carts);
+    expect(await db.payment.count(ownScope)).toBe(before.payments);
+    expect(await db.order.count(ownScope)).toBe(before.orders);
+    expect(await db.cart.count(ownScope)).toBe(before.carts);
     expect(mockedConstructEvent).not.toHaveBeenCalled();
   });
 

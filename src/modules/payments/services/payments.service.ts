@@ -53,7 +53,11 @@ import { Prisma as PrismaValue } from "@prisma/client";
 import { getCartForCheckout } from "@/modules/cart/services/cart.service";
 import { requiresDestinationAddress } from "@/modules/delivery-modes/delivery-mode.policy";
 import { createOrderFromPayment } from "@/modules/orders/services/orders.service";
-import type { DeliverySelection, OrderDetailView } from "@/modules/orders/services/orders.service";
+import type {
+  CreateOrderFromPaymentResult,
+  DeliverySelection,
+} from "@/modules/orders/services/orders.service";
+import { dispatchEmails } from "@/shared/email/email-provider";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
@@ -745,20 +749,27 @@ async function handleSucceededEvent(event: StripeEvent): Promise<void> {
     }
   }
 
-  const attempt = (): Promise<OrderDetailView> =>
+  const attempt = (): Promise<CreateOrderFromPaymentResult> =>
     prisma.$transaction(async (tx) => {
       await tx.payment.deleteMany({ where: { providerRef: intent.id, status: "FAILED" } });
-      const order = await createOrderFromPayment(intent.id, cartView, deliverySelections, tx);
+      const result = await createOrderFromPayment(intent.id, cartView, deliverySelections, tx);
       await tx.payment.updateMany({ where: { providerRef: intent.id }, data: { userId } });
-      return order;
+      return result;
     });
 
+  // Cycle 5 notifications (design "Emission wiring"): dispatch the
+  // transaction's `pendingEmails` AFTER it commits — fire-after-commit,
+  // best-effort (`dispatchEmails` never throws; a provider failure is
+  // caught+logged per-message and never rolls back the already-committed
+  // order/notification writes above).
   try {
-    await attempt();
+    const result = await attempt();
+    await dispatchEmails(result.pendingEmails);
   } catch (err: unknown) {
     if (!isUniqueConstraintViolation(err)) {
       throw err;
     }
-    await attempt();
+    const result = await attempt();
+    await dispatchEmails(result.pendingEmails);
   }
 }

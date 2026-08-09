@@ -6,18 +6,20 @@
  *
  * Responsibilities:
  *   1. Mock AWS SDK modules globally — every test file is protected from
- *      accidental real S3 calls (design §Testing Strategy "S3 mock leakage").
+ *      accidental real S3 calls (design §Testing Strategy "S3 mock leakage")
+ *      and, since Cycle 5 notifications Phase 2, real SES calls.
  *   2. Install the global Zod error map so `unrecognized_keys` messages
  *      are stable across every test that validates Zod schemas.
  *
  * Spec reference:
  *   product-images §"Test hygiene — mock the SDK"
  *   error-handling §"Zod .strict() policy for unknown keys"
+ *   sdd/notifications/spec — "No Real Email In Tests" (SES SDK globally mocked)
  */
 import { vi } from "vitest";
 
 // ---------------------------------------------------------------------------
-// 1. Global AWS SDK mocks — prevent real S3 calls from any test file.
+// 1. Global AWS SDK mocks — prevent real S3/SES calls from any test file.
 //    The actual implementations are provided per-test via mockResolvedValue.
 // ---------------------------------------------------------------------------
 vi.mock("@aws-sdk/client-s3", () => {
@@ -33,6 +35,17 @@ vi.mock("@aws-sdk/client-s3", () => {
 vi.mock("@aws-sdk/s3-request-presigner", () => {
   return {
     getSignedUrl: vi.fn(),
+  };
+});
+
+// Mirrors the S3 mock above (design "SES test isolation") — protects every
+// test file from an accidental real SES call via src/shared/email/ses-email-provider.ts.
+vi.mock("@aws-sdk/client-ses", () => {
+  return {
+    SESClient: vi.fn().mockImplementation(() => ({
+      send: vi.fn(),
+    })),
+    SendEmailCommand: vi.fn(),
   };
 });
 
