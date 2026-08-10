@@ -49,7 +49,8 @@ export type ErrorCode =
   | "PAYMENT_INTENT_CREATION_FAILED"
   | "WEBHOOK_SIGNATURE_INVALID"
   // Cycle 6 additions — admin-catalog-control (admin cycle 1/3)
-  | "INVALID_MODERATION_TRANSITION";
+  | "INVALID_MODERATION_TRANSITION"
+  | "CATEGORY_SLUG_CONFLICT";
 
 export interface ProblemDetails {
   type: string;

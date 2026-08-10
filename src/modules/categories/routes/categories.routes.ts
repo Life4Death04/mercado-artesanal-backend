@@ -1,21 +1,29 @@
 /**
- * Categories routes — public read-only endpoints for product taxonomy.
- * Mounted at /api/v1 in src/modules/api.router.ts.
+ * Categories routes — PUBLIC, anonymous, read-only endpoints for product
+ * taxonomy. Mounted at /api/v1 in src/modules/api.router.ts.
  *
  * Effective paths:
  *   GET /api/v1/categories         — list all active categories
  *   GET /api/v1/categories/:slug   — get a single active category by slug
  *
- * Auth chain: NONE — both endpoints are fully public (no authentication required).
+ * Auth chain: NONE — both endpoints are fully public (no authentication
+ * required) and remain unauthenticated after admin-catalog-control
+ * (product-taxonomy §"Public category read endpoints", amended: "Both
+ * endpoints MUST remain unauthenticated. Authenticated administrators MAY
+ * manage categories only through the admin catalog surface.").
  *
- * WRITE SURFACE: ABSENT by design. Any POST/PATCH/DELETE on /categories
- * constitutes scope creep per spec product-taxonomy §"Invariants" and MUST be
- * rejected in review. Admin write endpoints belong to a future admin-environment cycle.
+ * WRITE SURFACE: ABSENT here BY DESIGN, and it stays absent — this router is
+ * PUBLIC-ONLY. Any POST/PATCH/DELETE added to THIS FILE constitutes scope
+ * creep and MUST be rejected in review. Category create/update/deactivate
+ * ship in `src/modules/admin/` (admin-catalog-control WU3), which composes
+ * `categoriesService.{create,update,deactivate,findAllAdmin}` behind the
+ * `/admin/*` ADMIN guard — never behind this public router. This router's
+ * `findAll`/`findBySlug` delegation is intentionally unchanged by that work.
  *
  * Spec references:
  *   product-taxonomy §"Public category read endpoints" — public, no auth
- *   product-taxonomy §"Invariants" — read-only in Cycle 2
- *   design — API surface table
+ *   admin-catalog    §"Category administration" — admin writes live in /admin/*
+ *   design — API surface table; Decision "Mutable vs stable category slug"
  */
 import { Router } from "express";
 
