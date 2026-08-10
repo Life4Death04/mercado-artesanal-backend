@@ -31,6 +31,12 @@
  *                          (payments WU2 — unauth, raw-body, signature-verified).
  *   notificationsRouter  — Cycle 5: owner-scoped in-app notifications under
  *                          /notifications[/unread-count|/:id/read] (notifications WU3).
+ *   adminRouter          — Cycle 6: ADMIN-only catalog moderation and category
+ *                          management under /admin/* (admin-catalog-control WU3).
+ *                          Guard: authenticate → loadUser → onboardingGate →
+ *                          requireRole("ADMIN"), applied per-route inside the
+ *                          module router (same per-route convention as every
+ *                          other auth-gated router here).
  *
  * Mount order: public routers (categoriesRouter, producersRouter GET /:id,
  * publicProductsRouter) are registered BEFORE auth-gated routers so they are
@@ -46,6 +52,7 @@
 import { Router } from "express";
 
 import { addressesRouter } from "./addresses/routes/addresses.routes";
+import { adminRouter } from "./admin/routes/admin.routes";
 import { authRouter } from "./auth/routes/auth.routes";
 import { cartRouter } from "./cart/routes/cart.routes";
 import { categoriesRouter } from "./categories/routes/categories.routes";
@@ -86,3 +93,4 @@ apiRouter.use(cartRouter);
 apiRouter.use(ordersRouter);
 apiRouter.use(paymentsRouter);
 apiRouter.use(notificationsRouter);
+apiRouter.use(adminRouter);
