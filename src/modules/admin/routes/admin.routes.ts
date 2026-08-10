@@ -11,7 +11,7 @@
  *   DELETE /api/v1/admin/categories/:id                      — deactivate (soft-delete) (ADMIN)
  *
  * Auth chain (per design — Data Flow):
- *   authenticate → loadUser → onboardingGate → requireRole('ADMIN')
+ *   authenticate → loadUser → requireRole('ADMIN') → onboardingGate
  *
  * The guard is applied via `router.use("/admin", ...adminGuard)` so it runs
  * before every matching admin operation registered on this router.
@@ -32,7 +32,7 @@ import * as adminController from "../controllers/admin.controller";
 export const adminRouter: Router = Router();
 
 // Admin-scoped guard — applied to every /admin/* route on this router.
-const adminGuard = [authenticate, loadUser, onboardingGate, requireRole("ADMIN")];
+const adminGuard = [authenticate, loadUser, requireRole("ADMIN"), onboardingGate];
 
 adminRouter.use("/admin", ...adminGuard);
 

@@ -33,8 +33,8 @@
  *                          /notifications[/unread-count|/:id/read] (notifications WU3).
  *   adminRouter          — Cycle 6: ADMIN-only catalog moderation and category
  *                          management under /admin/* (admin-catalog-control WU3).
- *                          Guard: authenticate → loadUser → onboardingGate →
- *                          requireRole("ADMIN"), applied per-route inside the
+ *                          Guard: authenticate → loadUser → requireRole("ADMIN") →
+ *                          onboardingGate, applied per-route inside the
  *                          module router (same per-route convention as every
  *                          other auth-gated router here).
  *

@@ -14,7 +14,7 @@
  * Spec references:
  *   admin-catalog §"Admin-only catalog surface", §"Moderation queue and
  *   detail", §"Reversible audited moderation", §"Category administration"
- *   design — Data Flow (authenticate → loadUser → onboardingGate → requireRole("ADMIN"))
+ *   design — Data Flow (authenticate → loadUser → requireRole("ADMIN") → onboardingGate)
  */
 import supertest from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -159,12 +159,7 @@ describe("Admin catalog RBAC — /api/v1/admin/*", () => {
     expect(res.body.code).toBe("FORBIDDEN");
   });
 
-  it("[AC-5] PENDING_ROLE on /admin/products returns 403", async () => {
-    // A DB row with role=PENDING_ROLE (post auth/sync, pre onboarding) hits
-    // onboardingGate before requireRole ever runs; /admin/products is NOT in
-    // the onboarding allow-list, so onboardingGate rejects with 403
-    // ONBOARDING_REQUIRED — a distinct, earlier non-ADMIN rejection than
-    // requireRole's FORBIDDEN, but the same observable 403 contract.
+  it("[AC-5] PENDING_ROLE on /admin/products returns 403 FORBIDDEN", async () => {
     const sub = "auth0|pending001";
     mockLoadUser("PENDING_ROLE");
 
@@ -173,6 +168,7 @@ describe("Admin catalog RBAC — /api/v1/admin/*", () => {
       .set("X-Test-Auth", authHeader({ sub }));
 
     expect(res.status).toBe(403);
+    expect(res.body.code).toBe("FORBIDDEN");
   });
 
   it("[AC-6] anonymous GET /categories remains 200 (public route unaffected)", async () => {
