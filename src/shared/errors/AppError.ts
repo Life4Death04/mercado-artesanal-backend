@@ -50,7 +50,9 @@ export type ErrorCode =
   | "WEBHOOK_SIGNATURE_INVALID"
   // Cycle 6 additions — admin-catalog-control (admin cycle 1/3)
   | "INVALID_MODERATION_TRANSITION"
-  | "CATEGORY_SLUG_CONFLICT";
+  | "CATEGORY_SLUG_CONFLICT"
+  // admin-incidents WU1 additions
+  | "INCIDENT_ALREADY_RESOLVED";
 
 export interface ProblemDetails {
   type: string;

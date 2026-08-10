@@ -338,3 +338,24 @@ export class CategorySlugConflictError extends AppError {
   readonly status = 409;
   readonly title = "Category slug conflict";
 }
+
+// ===========================================================================
+// admin-incidents WU1 additions
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 409 — PATCH /admin/incidents/:id/resolve targets an incident that is not
+//       OPEN or already carries a resolution audit (existence check passed,
+//       conditional `updateMany` on status=OPEN + null audit fields returned
+//       count 0). A losing race maps here too. detail MUST NOT include the
+//       original report/resolution reason, reporter email, or any protected
+//       identifier — only a stable, non-mutating conflict signal.
+//       Status and audit fields (resolver, reason, timestamp) are left
+//       unchanged for both the raced loser and the repeated caller.
+// ---------------------------------------------------------------------------
+
+export class IncidentAlreadyResolvedError extends AppError {
+  readonly code = "INCIDENT_ALREADY_RESOLVED" as const;
+  readonly status = 409;
+  readonly title = "Incident already resolved";
+}

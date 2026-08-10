@@ -37,10 +37,15 @@ model User {
   updatedAt     DateTime  @updatedAt @map("updated_at")
   deletedAt     DateTime? @map("deleted_at")
 
-  producer      Producer?
-  addresses     Address[]
-  cart          Cart?
-  notifications Notification[]
+  producer          Producer?
+  addresses         Address[]
+  cart              Cart?
+  notifications     Notification[]
+  // admin-incidents WU1 — named back-relations for the two distinct User
+  // roles an Incident references: the consumer who filed it and the ADMIN
+  // who resolved it (see model Incident below for the named @relation pair).
+  incidentsReported Incident[]     @relation("IncidentReporter")
+  incidentsResolved Incident[]     @relation("IncidentResolver")
 
   @@index([auth0Sub])
   @@map("users")
@@ -68,6 +73,8 @@ model Producer {
   products      Product[]
   deliveryModes DeliveryMode[]
   subOrders     SubOrder[]
+  // admin-incidents WU1 — back-relation for incidents targeting this producer.
+  incidents     Incident[]
 
   @@index([userId])
   @@map("producers")
@@ -434,6 +441,8 @@ model SubOrder {
   producer     Producer     @relation(fields: [producerId], references: [id], onDelete: Restrict)
   deliveryMode DeliveryMode @relation(fields: [deliveryModeId], references: [id], onDelete: Restrict)
   orderLines   OrderLine[]
+  // admin-incidents WU1 — back-relation for incidents targeting this sub-order.
+  incidents    Incident[]
 
   @@index([producerId, status])
   @@index([orderId])
@@ -532,4 +541,59 @@ model Notification {
 
   @@index([userId, read])
   @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 3 — Incidents (admin-incidents, Phase 1: schema and core contract)
+// ---------------------------------------------------------------------------
+
+/// Lifecycle status of an Incident. OPEN is the initial state on create;
+/// RESOLVED is terminal — reopening is forbidden (design §"Final conditional
+/// resolution").
+enum IncidentStatus {
+  OPEN
+  RESOLVED
+}
+
+/// Consumer-reported audit of a paid, non-cancelled sub-order (RF-16,
+/// TS-036). An Incident is an immutable audit trail: report and resolution
+/// data are never overwritten, only the OPEN -> RESOLVED transition is
+/// permitted (conditionally, via `updateMany` constrained by status = OPEN
+/// and null audit fields — design Decision "Conditional write vs
+/// read/update").
+///
+/// All four FKs use `onDelete: Restrict`: incidents are audits and MUST NOT
+/// disappear or lose actors/targets when a parent row is removed. Every
+/// referenced parent (User, SubOrder, Producer) already uses soft deletion
+/// or is otherwise protected, so Restrict never blocks a legitimate delete
+/// path in this codebase (design §"Data Model and Migration").
+///
+/// No uniqueness on subOrderId — multiple reports against the same
+/// sub-order are not prohibited (design §"Data Model and Migration").
+model Incident {
+  id               String         @id @default(cuid())
+  reporterId       String         @map("reporter_id")
+  subOrderId       String         @map("sub_order_id")
+  producerId       String         @map("producer_id")
+  reportReason     String         @map("report_reason") @db.VarChar(2000)
+  status           IncidentStatus @default(OPEN)
+  resolvedById     String?        @map("resolved_by_id")
+  resolutionReason String?        @map("resolution_reason") @db.VarChar(2000)
+  resolvedAt       DateTime?      @map("resolved_at")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  reporter   User     @relation("IncidentReporter", fields: [reporterId], references: [id], onDelete: Restrict)
+  subOrder   SubOrder @relation(fields: [subOrderId], references: [id], onDelete: Restrict)
+  producer   Producer @relation(fields: [producerId], references: [id], onDelete: Restrict)
+  resolvedBy User?    @relation("IncidentResolver", fields: [resolvedById], references: [id], onDelete: Restrict)
+
+  // Consumer owner-scoped list/detail, DESC order with id tie-break.
+  @@index([reporterId, createdAt(sort: Desc), id(sort: Desc)])
+  // ADMIN all-status inbox, DESC order with id tie-break.
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  @@index([subOrderId])
+  @@index([producerId])
+  @@index([resolvedById])
+  @@map("incidents")
 }
