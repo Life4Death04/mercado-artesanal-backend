@@ -9,15 +9,22 @@
  *   POST   /api/v1/admin/categories                         — create (auto-slug) (ADMIN)
  *   PATCH  /api/v1/admin/categories/:id                      — update name/description/isActive (ADMIN)
  *   DELETE /api/v1/admin/categories/:id                      — deactivate (soft-delete) (ADMIN)
+ *   GET    /api/v1/admin/incidents?page=&limit=              — all-status inbox, paginated, no filters (ADMIN)
+ *   GET    /api/v1/admin/incidents/:id                       — safe detail, reporter name/email allowlisted (ADMIN)
+ *   PATCH  /api/v1/admin/incidents/:id/resolve                — final OPEN -> RESOLVED transition (ADMIN)
  *
  * Auth chain (per design — Data Flow):
  *   authenticate → loadUser → requireRole('ADMIN') → onboardingGate
  *
  * The guard is applied via `router.use("/admin", ...adminGuard)` so it runs
- * before every matching admin operation registered on this router.
+ * before every matching admin operation registered on this router — the
+ * admin-incidents WU3 routes below reuse this SAME centralized guard, no
+ * second/competing admin guard is created.
  *
  * Spec references:
  *   admin-catalog §"Admin-only catalog surface"
+ *   incident-management §"ADMIN inbox pagination", §"Safe ADMIN detail",
+ *     §"Final conditional resolution"
  *   design — Data Flow, API surface table
  */
 import { Router } from "express";
@@ -27,6 +34,7 @@ import { loadUser } from "@/shared/middleware/loadUser";
 import { onboardingGate } from "@/shared/middleware/onboardingGate";
 import { requireRole } from "@/shared/middleware/requireRole";
 
+import * as adminIncidentsController from "../../incidents/controllers/admin-incidents.controller";
 import * as adminController from "../controllers/admin.controller";
 
 export const adminRouter: Router = Router();
@@ -57,3 +65,13 @@ adminRouter.post("/admin/categories", adminController.createCategory);
 adminRouter.patch("/admin/categories/:id", adminController.updateCategory);
 
 adminRouter.delete("/admin/categories/:id", adminController.deactivateCategory);
+
+// ---------------------------------------------------------------------------
+// Incident triage/resolution routes (admin-incidents WU3)
+// ---------------------------------------------------------------------------
+
+adminRouter.get("/admin/incidents", adminIncidentsController.listIncidents);
+
+adminRouter.get("/admin/incidents/:id", adminIncidentsController.getIncidentDetail);
+
+adminRouter.patch("/admin/incidents/:id/resolve", adminIncidentsController.resolveIncident);
