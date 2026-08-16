@@ -28,6 +28,8 @@
  *          and no `data`; a deleted ADMIN receives none.
  *   [IC11] A forced notification-write failure rolls back the WHOLE creation
  *          transaction — no Incident row, no notification rows persist.
+ *   [IC12] A producer acting as a buyer can create and read their own incident;
+ *          the seller cannot create from, list, or inspect that buyer's report.
  *
  * SKIP POLICY: When the database is unreachable, each test calls `ctx.skip()`
  * so Vitest reports it as SKIPPED (not passed). This prevents silent
@@ -162,7 +164,7 @@ async function seedProducer(namePrefix: string, nif: string) {
   });
   cleanupProducerIds.push(producer.id);
 
-  return { category, producer };
+  return { category, producer, producerUser };
 }
 
 async function seedConsumer(namePrefix: string) {
@@ -207,7 +209,7 @@ async function seedSubOrder(
     subOrderStatus?: "pending" | "cancelled";
   },
 ) {
-  const { producer, category } = await seedProducer(namePrefix, nextNif());
+  const { producer, category, producerUser } = await seedProducer(namePrefix, nextNif());
   const consumer = options?.consumer ?? (await seedConsumer(namePrefix));
 
   const deliveryMode = await db.deliveryMode.create({
@@ -244,7 +246,18 @@ async function seedSubOrder(
     data: { subOrderId: subOrder.id, productId: product.id, quantity: 1, unitPriceSnapshot: 12.5 },
   });
 
-  return { producer, category, consumer, deliveryMode, product, payment, order, subOrder, orderLine };
+  return {
+    producer,
+    producerUser,
+    category,
+    consumer,
+    deliveryMode,
+    product,
+    payment,
+    order,
+    subOrder,
+    orderLine,
+  };
 }
 
 /** FK-safe deletion of every Incident row created against our test fixtures. */
@@ -615,6 +628,78 @@ describe("GET /api/v1/incidencias[/:id] — owner-scoped views [IC7-IC9]", () =>
       expect(res.status).toBe(404);
       expect(res.body.code).toBe("NOT_FOUND");
       expect(JSON.stringify(res.body)).not.toContain("Owner-only report");
+    },
+    20000,
+  );
+});
+
+// ===========================================================================
+// [IC12] Producer acting as buyer inherits the consumer incident surface
+// ===========================================================================
+
+describe("/api/v1/incidencias — producer acting as buyer [IC12]", () => {
+  it(
+    "[IC12] creates and reads an owned incident while keeping it opaque to the seller",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producerUser: buyer } = await seedProducer("ic12buyer", nextNif());
+      const { producerUser: seller, subOrder } = await seedSubOrder("ic12sale", {
+        consumer: buyer,
+      });
+
+      const createRes = await request
+        .post("/api/v1/incidencias")
+        .set("X-Test-Auth", authHeader({ sub: buyer.auth0Sub }))
+        .send({ subOrderId: subOrder.id, reason: "The purchased order arrived damaged" });
+
+      expect(createRes.status).toBe(201);
+      expect(createRes.body.target.subOrderId).toBe(subOrder.id);
+
+      const persisted = await db.incident.findUniqueOrThrow({ where: { id: createRes.body.id } });
+      expect(persisted.reporterId).toBe(buyer.id);
+
+      const buyerListRes = await request
+        .get("/api/v1/incidencias")
+        .set("X-Test-Auth", authHeader({ sub: buyer.auth0Sub }));
+
+      expect(buyerListRes.status).toBe(200);
+      expect(buyerListRes.body.map((incident: { id: string }) => incident.id)).toContain(
+        createRes.body.id,
+      );
+
+      const buyerDetailRes = await request
+        .get(`/api/v1/incidencias/${createRes.body.id}`)
+        .set("X-Test-Auth", authHeader({ sub: buyer.auth0Sub }));
+
+      expect(buyerDetailRes.status).toBe(200);
+      expect(buyerDetailRes.body.id).toBe(createRes.body.id);
+      expect(buyerDetailRes.body.reportReason).toBe("The purchased order arrived damaged");
+
+      const sellerCreateRes = await request
+        .post("/api/v1/incidencias")
+        .set("X-Test-Auth", authHeader({ sub: seller.auth0Sub }))
+        .send({ subOrderId: subOrder.id, reason: "Seller does not own this purchase" });
+      expect(sellerCreateRes.status).toBe(404);
+      expect(sellerCreateRes.body.code).toBe("NOT_FOUND");
+
+      const sellerListRes = await request
+        .get("/api/v1/incidencias")
+        .set("X-Test-Auth", authHeader({ sub: seller.auth0Sub }));
+      expect(sellerListRes.status).toBe(200);
+      expect(sellerListRes.body).toEqual([]);
+
+      const sellerDetailRes = await request
+        .get(`/api/v1/incidencias/${createRes.body.id}`)
+        .set("X-Test-Auth", authHeader({ sub: seller.auth0Sub }));
+      expect(sellerDetailRes.status).toBe(404);
+      expect(sellerDetailRes.body.code).toBe("NOT_FOUND");
+      expect(JSON.stringify(sellerDetailRes.body)).not.toContain(
+        "The purchased order arrived damaged",
+      );
     },
     20000,
   );

@@ -1,5 +1,5 @@
 /**
- * Incidents controller — thin HTTP layer for the consumer reporting/read
+ * Incidents controller — thin HTTP layer for the buyer reporting/read
  * surface (admin-incidents WU2).
  *
  * Response codes:
@@ -9,7 +9,8 @@
  *   GET  /incidencias/:id  -> 200 IncidentDetailView, 404 unknown/unowned (no-leak)
  *
  * Auth chain (design §"API Contracts"):
- *   authenticate -> loadUser -> onboardingGate -> requireRole("CONSUMER") -> controller
+ *   authenticate -> loadUser -> onboardingGate ->
+ *   requireRole("CONSUMER", "PRODUCER") -> controller
  *
  * `createIncident` dispatches `pendingEmails` via the shared `dispatchEmails`
  * AFTER `incidentsService.createIncident` resolves — i.e. AFTER its

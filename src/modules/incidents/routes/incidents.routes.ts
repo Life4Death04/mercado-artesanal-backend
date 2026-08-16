@@ -7,9 +7,9 @@
  *   GET  /api/v1/incidencias
  *   GET  /api/v1/incidencias/:id
  *
- * Auth chain (design §"API Contracts" — consumer guard, CONSUMER only,
- * distinct from the multi-role guards used by cart/orders):
- *   authenticate -> loadUser -> onboardingGate -> requireRole("CONSUMER") -> controller
+ * Auth chain (design §"API Contracts" — buyer guard):
+ *   authenticate -> loadUser -> onboardingGate ->
+ *   requireRole("CONSUMER", "PRODUCER") -> controller
  *
  * Reporter is `req.user.id`. PENDING_ROLE users are blocked by
  * onboardingGate (403 ONBOARDING_REQUIRED) — /incidencias is NOT in the
@@ -33,8 +33,13 @@ import * as incidentsController from "../controllers/incidents.controller";
 
 export const incidentsRouter: Router = Router();
 
-// Guard chain — CONSUMER only, per design §"API Contracts" "Consumer guard".
-const incidentsGuard = [authenticate, loadUser, onboardingGate, requireRole("CONSUMER")];
+// Guard chain for consumer-area access by users acting as buyers.
+const incidentsGuard = [
+  authenticate,
+  loadUser,
+  onboardingGate,
+  requireRole("CONSUMER", "PRODUCER"),
+];
 
 // ---------------------------------------------------------------------------
 // Incidents routes
