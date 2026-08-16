@@ -155,7 +155,7 @@ export async function create(producerId: string, input: CreateProductInput): Pro
         presentation: input.presentation ?? null,
         // Publish-on-create invariants
         isActive: true,
-        moderationStatus: "OK" as ModerationStatus,
+        moderationStatus: "OK",
       },
     });
   });
@@ -335,7 +335,7 @@ export async function report(
 ): Promise<Product> {
   return prisma.$transaction(async (tx) => {
     const product = await tx.product.findFirst({
-      where: { id: productId, moderationStatus: { not: "REMOVED" as ModerationStatus }, deletedAt: null },
+      where: { id: productId, moderationStatus: { not: "REMOVED" }, deletedAt: null },
     });
 
     if (!product) {
@@ -351,7 +351,7 @@ export async function report(
     return tx.product.update({
       where: { id: productId },
       data: {
-        moderationStatus: "REPORTED" as ModerationStatus,
+        moderationStatus: "REPORTED",
         reportedAt: new Date(),
         reportReason: reason,
       },

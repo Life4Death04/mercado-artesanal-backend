@@ -48,9 +48,10 @@ import { randomUUID } from "crypto";
 
 import type { ProductImage } from "@prisma/client";
 
-import { getPresignedUrl, headObject } from "@/shared/s3/s3-client";
 import { ImageUploadInvalidError, ProductNotFoundError } from "@/shared/errors/errors";
+import { getPresignedUrl, headObject } from "@/shared/s3/s3-client";
 import { prisma } from "@/shared/utils/prisma";
+
 import { ALLOWED_MIME_TYPES, MAX_CONTENT_LENGTH } from "../dto/images.dto";
 
 // ---------------------------------------------------------------------------
