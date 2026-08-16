@@ -16,6 +16,15 @@
  *   [AU7]       Producer detail: activity counts unambiguous
  *               (2 producer orders, 3 published products), includes producerId.
  *   [AU8]       Unknown/non-actionable id -> 404 NOT_FOUND.
+ *   [AU9]       Repeated deactivate is idempotent (no double state change).
+ *   [AU10]      Activation from DEACTIVATED commits exactly one
+ *               ACCOUNT_ACTIVATED notification atomically.
+ *   [AU11]      Activating a DELETED (tombstoned) account -> 409 ACCOUNT_DELETED.
+ *   [AU12]      Active orders block deletion -> 409 USER_HAS_ACTIVE_ORDERS,
+ *               no profile or lifecycle data changes.
+ *   [AU13]      Successful deletion redacts profile + address, retains id
+ *               and producer commercial data; returns 204.
+ *
  * SKIP POLICY: When the database is unreachable, each test calls `ctx.skip()`
  * so Vitest reports it as SKIPPED (not passed).
  *
@@ -23,10 +32,15 @@
  *   admin-user-management §"Deterministic user discovery"
  *   admin-user-management §"User detail and activity definitions"
  *   admin-user-management §"Guarded lifecycle actions"
+ *   account-lifecycle §"Approved tombstone redaction"
+ *   notifications §"Event-to-Recipient Emission Mapping" — Activation
+ *   error-handling §"Account lifecycle error contract"
  */
 import { PrismaClient } from "@prisma/client";
 import supertest from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+
+import { emailProvider } from "@/shared/email/email-provider";
 
 vi.mock("express-oauth2-jwt-bearer", () => ({
   auth: () =>
@@ -409,5 +423,253 @@ describe("GET /api/v1/admin/users/:id — detail and activity", () => {
       .get(`/api/v1/admin/users/${otherAdmin.id}`)
       .set("X-Test-Auth", adminAuth(admin));
     expect(resAdminTarget.status).toBe(404);
+  });
+});
+
+// ===========================================================================
+// Guarded lifecycle actions — admin-user-management §"Guarded lifecycle
+// actions"
+// ===========================================================================
+
+describe("PATCH /api/v1/admin/users/:id/deactivate — idempotent", () => {
+  it("[AU9] repeated deactivate succeeds without creating another state change", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const admin = await seedAdmin("au9");
+    const consumer = await seedConsumer("au9-target");
+
+    const first = await request
+      .patch(`/api/v1/admin/users/${consumer.id}/deactivate`)
+      .set("X-Test-Auth", adminAuth(admin));
+    expect(first.status).toBe(200);
+    expect(first.body.status).toBe("DEACTIVATED");
+
+    const firstRow = await db.user.findUniqueOrThrow({ where: { id: consumer.id } });
+
+    const second = await request
+      .patch(`/api/v1/admin/users/${consumer.id}/deactivate`)
+      .set("X-Test-Auth", adminAuth(admin));
+    expect(second.status).toBe(200);
+    expect(second.body.status).toBe("DEACTIVATED");
+
+    const secondRow = await db.user.findUniqueOrThrow({ where: { id: consumer.id } });
+    expect(secondRow.deactivatedAt?.getTime()).toBe(firstRow.deactivatedAt?.getTime());
+  });
+});
+
+describe("PATCH /api/v1/admin/users/:id/activate — atomic notification", () => {
+  it("[AU10] activation from DEACTIVATED commits exactly one ACCOUNT_ACTIVATED notification", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const admin = await seedAdmin("au10");
+    const consumer = await seedConsumer("au10-target");
+    await db.user.update({ where: { id: consumer.id }, data: { deactivatedAt: new Date() } });
+
+    const res = await request
+      .patch(`/api/v1/admin/users/${consumer.id}/activate`)
+      .set("X-Test-Auth", adminAuth(admin));
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("ACTIVE");
+
+    const notifications = await db.notification.findMany({
+      where: { userId: consumer.id, type: "ACCOUNT_ACTIVATED" },
+    });
+    expect(notifications).toHaveLength(1);
+
+    // Spec: notifications §"Replayed event does not duplicate" — an
+    // already-ACTIVE target's activation is an idempotent no-op and MUST
+    // NOT create a second notification.
+    const replay = await request
+      .patch(`/api/v1/admin/users/${consumer.id}/activate`)
+      .set("X-Test-Auth", adminAuth(admin));
+    expect(replay.status).toBe(200);
+    const notificationsAfterReplay = await db.notification.findMany({
+      where: { userId: consumer.id, type: "ACCOUNT_ACTIVATED" },
+    });
+    expect(notificationsAfterReplay).toHaveLength(1);
+  });
+
+  // Spec: email-provider §"Activation dispatches after commit", §"Email
+  // failure does not undo activation" — spies on the real singleton
+  // (Console provider, per test env), same pattern as payments.test.ts
+  // [N-EMIT-NONBLOCKING].
+  it("[AU10b] a rejected activation email never undoes the committed activation/notification", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const admin = await seedAdmin("au10b");
+    const consumer = await seedConsumer("au10b-target");
+    await db.user.update({ where: { id: consumer.id }, data: { deactivatedAt: new Date() } });
+    const sendSpy = vi.spyOn(emailProvider, "send").mockRejectedValueOnce(new Error("SMTP down"));
+
+    const res = await request
+      .patch(`/api/v1/admin/users/${consumer.id}/activate`)
+      .set("X-Test-Auth", adminAuth(admin));
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("ACTIVE");
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    const notifications = await db.notification.findMany({
+      where: { userId: consumer.id, type: "ACCOUNT_ACTIVATED" },
+    });
+    expect(notifications).toHaveLength(1);
+    sendSpy.mockRestore();
+  });
+
+  it("[AU11] activating a DELETED account returns 409 ACCOUNT_DELETED", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const admin = await seedAdmin("au11");
+    const consumer = await seedConsumer("au11-target");
+    await db.user.update({ where: { id: consumer.id }, data: { deletedAt: new Date() } });
+    const sendSpy = vi.spyOn(emailProvider, "send");
+
+    const res = await request
+      .patch(`/api/v1/admin/users/${consumer.id}/activate`)
+      .set("X-Test-Auth", adminAuth(admin));
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("ACCOUNT_DELETED");
+    expect(res.body.type).toBe("/errors/account-deleted");
+    // Spec: email-provider §"Rolled-back activation sends no email".
+    expect(sendSpy).not.toHaveBeenCalled();
+    sendSpy.mockRestore();
+
+    // Spec: notifications §"Activation is atomic and unique" — "activation
+    // failure or rollback MUST leave neither outcome": a rejected
+    // activation attempt commits no ACCOUNT_ACTIVATED notification.
+    const notifications = await db.notification.findMany({
+      where: { userId: consumer.id, type: "ACCOUNT_ACTIVATED" },
+    });
+    expect(notifications).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// Tombstone deletion — admin-user-management §"Guarded lifecycle actions",
+// account-lifecycle §"Approved tombstone redaction"
+// ===========================================================================
+
+describe("DELETE /api/v1/admin/users/:id — irreversible tombstone deletion", () => {
+  it("[AU12] active orders block deletion with no profile or lifecycle change", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const admin = await seedAdmin("au12");
+    const consumer = await seedConsumer("au12-target");
+    const { producer, category } = await seedProducer("au12-owner");
+    const product = await seedProduct(producer.id, category.id);
+    void product;
+    await seedSubOrderForProducer(producer.id, consumer.id, "sent");
+
+    const before = await db.user.findUniqueOrThrow({ where: { id: consumer.id } });
+
+    const res = await request
+      .delete(`/api/v1/admin/users/${consumer.id}`)
+      .set("X-Test-Auth", adminAuth(admin));
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("USER_HAS_ACTIVE_ORDERS");
+    expect(res.body.type).toBe("/errors/user-has-active-orders");
+
+    const after = await db.user.findUniqueOrThrow({ where: { id: consumer.id } });
+    expect(after.email).toBe(before.email);
+    expect(after.deletedAt).toBeNull();
+  });
+
+  it("[AU13] successful deletion redacts profile + address, retains id, returns 204", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const admin = await seedAdmin("au13");
+    const consumer = await seedConsumer("au13-target", {
+      name: "Nombre Visible",
+      avatar: "https://example.com/avatar.png",
+      emailVerified: true,
+    });
+    await db.address.create({
+      data: {
+        userId: consumer.id,
+        line1: "Calle Real 1",
+        city: "Alicante",
+        postalCode: "03001",
+        province: "Alicante",
+        isDefault: true,
+      },
+    });
+    // account-lifecycle §"Approved tombstone redaction" — every PendingCheckout
+    // row for the user MUST receive the same address tombstones.
+    await db.pendingCheckout.create({
+      data: {
+        fingerprint: `au13-fp-${consumer.id}`,
+        userId: consumer.id,
+        addressLine1: "Calle Real 1",
+        addressCity: "Alicante",
+        addressPostalCode: "03001",
+        addressProvince: "Alicante",
+      },
+    });
+
+    const res = await request
+      .delete(`/api/v1/admin/users/${consumer.id}`)
+      .set("X-Test-Auth", adminAuth(admin));
+
+    expect(res.status).toBe(204);
+
+    const row = await db.user.findUniqueOrThrow({ where: { id: consumer.id } });
+    expect(row.deletedAt).not.toBeNull();
+    expect(row.email).toBe(`deleted+${consumer.id}@tombstone.invalid`);
+    expect(row.name).toBeNull();
+    expect(row.avatar).toBeNull();
+    expect(row.emailVerified).toBe(false);
+    // Retained identifiers.
+    expect(row.id).toBe(consumer.id);
+    expect(row.auth0Sub).toBeTruthy();
+
+    const addresses = await db.address.findMany({ where: { userId: consumer.id } });
+    expect(addresses).toHaveLength(1);
+    expect(addresses[0]!.isDefault).toBe(false);
+    expect(addresses[0]!.deletedAt).not.toBeNull();
+    expect(addresses[0]!.line1).toBe("REDACTED");
+    expect(addresses[0]!.postalCode).toBe("00000");
+
+    const pendingCheckouts = await db.pendingCheckout.findMany({ where: { userId: consumer.id } });
+    expect(pendingCheckouts[0]!.addressLine1).toBe("REDACTED");
+    expect(pendingCheckouts[0]!.addressPostalCode).toBe("00000");
+  });
+
+  // Spec: account-lifecycle §"Redaction failure is atomic". Forces the
+  // Address redaction write (postalCode -> "00000") to fail with a real
+  // Postgres CHECK constraint, so the SAME transaction's already-applied
+  // User tombstone write MUST also roll back — proving deletion is
+  // all-or-nothing, not "unless not real database" faith.
+  it("[AU13b] a failed redaction write rolls back the whole deletion, including the User tombstone", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const admin = await seedAdmin("au13b");
+    const consumer = await seedConsumer("au13b-target");
+    await db.address.create({
+      data: {
+        userId: consumer.id,
+        line1: "Calle Real 2",
+        city: "Alicante",
+        postalCode: "03002",
+        province: "Alicante",
+        isDefault: true,
+      },
+    });
+
+    // NOT VALID: only newly written/updated rows are checked — pre-existing
+    // "00000" rows left by other redaction tests must not block this ALTER.
+    await db.$executeRawUnsafe(
+      `ALTER TABLE "addresses" ADD CONSTRAINT au13b_block_redaction CHECK (postal_code <> '00000') NOT VALID`,
+    );
+    try {
+      const res = await request
+        .delete(`/api/v1/admin/users/${consumer.id}`)
+        .set("X-Test-Auth", adminAuth(admin));
+      expect(res.status).toBe(500);
+
+      const row = await db.user.findUniqueOrThrow({ where: { id: consumer.id } });
+      expect(row.deletedAt).toBeNull();
+      expect(row.email).toBe(consumer.email);
+
+      const addresses = await db.address.findMany({ where: { userId: consumer.id } });
+      expect(addresses[0]!.postalCode).toBe("03002");
+      expect(addresses[0]!.deletedAt).toBeNull();
+    } finally {
+      await db.$executeRawUnsafe(`ALTER TABLE "addresses" DROP CONSTRAINT au13b_block_redaction`);
+    }
   });
 });
