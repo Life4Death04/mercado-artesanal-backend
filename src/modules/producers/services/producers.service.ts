@@ -41,6 +41,7 @@
  */
 import type { Producer, SubOrderStatus } from "@prisma/client";
 
+import { ACTIVE_USER_WHERE } from "@/shared/account-lifecycle";
 import {
   NotFoundError,
   ProducerHasActiveOrdersError,
@@ -272,10 +273,13 @@ export async function softDelete(producerId: string): Promise<void> {
  *
  * Spec scenario: "Public projection redacts PII"
  * Spec scenario: "Soft-deleted producer returns 404"
+ * Spec: product-catalog §"Owning account controls catalog availability" —
+ *   a producer profile is only publicly visible while its owning User is
+ *   ACTIVE (admin-user-management delta).
  */
 export async function findPublicById(id: string): Promise<PublicProducerProjection> {
   const producer = await prisma.producer.findFirst({
-    where: { id, deletedAt: null },
+    where: { id, deletedAt: null, user: ACTIVE_USER_WHERE },
     select: {
       id: true,
       businessName: true,

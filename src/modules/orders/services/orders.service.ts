@@ -59,6 +59,7 @@ import { requiresDestinationAddress } from "@/modules/delivery-modes/delivery-mo
 import { decrementStock, restockProduct } from "@/modules/inventory/services/inventory.service";
 import * as notificationsService from "@/modules/notifications/services/notifications.service";
 import type { PendingEmail } from "@/modules/notifications/services/notifications.service";
+import { lockAndAssertOwnersActive } from "@/shared/account-lifecycle";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
@@ -339,6 +340,52 @@ export async function createOrderFromPayment(
   // Step 1: empty cart rejection.
   if (cartView.items.length === 0) {
     throw new EmptyCartCheckoutError("Cannot checkout an empty cart");
+  }
+
+  // Step 1b (account-lifecycle §"Commerce lifecycle consistency" —
+  // "Checkout MUST re-evaluate consumer and all producer-owner lifecycle
+  // states before committing"; design "createOrderFromPayment locks the
+  // same set before availability/order writes"): lock the consumer + every
+  // distinct producer-owner User row, then assert all ACTIVE. Either this
+  // order-creation transaction wins the lock first and proceeds, or a
+  // concurrent admin deactivate/delete (which takes the SAME row lock to
+  // write `deactivatedAt`/`deletedAt`) wins and this call observes the
+  // now-inactive state and fails closed — checkout never commits after
+  // observing a deactivated/deleted owner.
+  const cartProducerIdsForLock = [...new Set(cartView.items.map((item) => item.producerId))];
+  await lockAndAssertOwnersActive(tx, cartView.userId, cartProducerIdsForLock);
+
+  // Step 1c — re-check idempotency AFTER the lock (orders §"Duplicate
+  // webhook must not double-create an order"). Step 0's plain SELECT ran
+  // BEFORE any lock was held, so two genuinely concurrent duplicate calls
+  // can both miss it (neither committed yet) and both then queue on the
+  // SAME Step 1b lock. The loser only unblocks after the winner has fully
+  // committed — including deleting the checked-out cart items (step 9) —
+  // so without this re-check the loser would wrongly observe "cart items
+  // gone" (CartItemNotAvailableError) instead of idempotently returning the
+  // now-committed order. This mirrors Step 0 exactly; it is intentionally
+  // NOT extracted into a shared helper to keep both call sites' step
+  // numbering and intent independently readable.
+  const existingPaymentAfterLock = await tx.payment.findUnique({
+    where: { providerRef: stripeIntentId },
+    include: {
+      order: {
+        include: {
+          subOrders: {
+            include: { orderLines: true, deliveryMode: { select: { type: true } } },
+          },
+        },
+      },
+    },
+  });
+  if (existingPaymentAfterLock?.order) {
+    return {
+      order: mapExistingOrderDetailView(
+        existingPaymentAfterLock.order,
+        existingPaymentAfterLock.status,
+      ),
+      pendingEmails: [],
+    };
   }
 
   // Derived once, reused by the live re-check (step 2) and the cart clear (step 9).

@@ -33,6 +33,7 @@
  */
 import type { ModerationStatus, Prisma, Product, SubOrderStatus } from "@prisma/client";
 
+import { ACTIVE_USER_WHERE } from "@/shared/account-lifecycle";
 import {
   CategoryNotFoundError,
   InvalidModerationTransitionError,
@@ -417,7 +418,11 @@ const PUBLIC_PRODUCT_WHERE = {
   deletedAt: null,
   isActive: true,
   moderationStatus: "OK" as ModerationStatus,
-  producer: { deletedAt: null },
+  // admin-user-management delta (product-catalog §"Owning account controls
+  // catalog availability"): a product is only publicly visible while its
+  // producer's owning User is ACTIVE, on top of the existing producer
+  // soft-delete gate.
+  producer: { deletedAt: null, user: ACTIVE_USER_WHERE },
 };
 
 /**

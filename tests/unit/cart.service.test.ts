@@ -121,6 +121,9 @@ function makeProducer(overrides: Record<string, unknown> = {}) {
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     deletedAt: null,
+    // admin-user-management — owning User lifecycle, nested per the
+    // producer: { include: { user: { select: ... } } } query shape.
+    user: { deletedAt: null, deactivatedAt: null },
     ...overrides,
   };
 }
@@ -284,7 +287,7 @@ describe("cartService.getCartView — single-query seam [G3]", () => {
             include: {
               product: {
                 include: {
-                  producer: true,
+                  producer: { include: { user: { select: { deletedAt: true, deactivatedAt: true } } } },
                   images: {
                     orderBy: [{ position: "asc" }, { createdAt: "asc" }],
                     select: { id: true, position: true, s3Key: true },
@@ -590,7 +593,7 @@ describe("cartService.updateItemQuantity — update within stock [P1]", () => {
         include: {
           product: {
             include: {
-              producer: true,
+              producer: { include: { user: { select: { deletedAt: true, deactivatedAt: true } } } },
               images: {
                 orderBy: [{ position: "asc" }, { createdAt: "asc" }],
                 select: { id: true, position: true, s3Key: true },

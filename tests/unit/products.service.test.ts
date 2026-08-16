@@ -697,7 +697,7 @@ describe("productsService.findAllPublic", () => {
         deletedAt: null,
         isActive: true,
         moderationStatus: "OK",
-        producer: { deletedAt: null },
+        producer: { deletedAt: null, user: { deletedAt: null, deactivatedAt: null } },
       }),
     );
   });
@@ -856,7 +856,7 @@ describe("productsService.findPublicById", () => {
         deletedAt: null,
         isActive: true,
         moderationStatus: "OK",
-        producer: { deletedAt: null },
+        producer: { deletedAt: null, user: { deletedAt: null, deactivatedAt: null } },
       }),
     );
   });

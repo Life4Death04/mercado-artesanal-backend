@@ -67,7 +67,9 @@ vi.mock("@/modules/cart/services/cart.service", () => ({
 }));
 
 // ---------------------------------------------------------------------------
-// Mock prisma singleton — WU1 only touches deliveryMode.findMany directly.
+// Mock prisma singleton — WU1 only touches deliveryMode.findMany directly;
+// admin-user-management adds the locked-preflight $transaction wrapping
+// `pendingCheckout.upsert` (Step 6c) / `updateMany` (Step 7b bind).
 // ---------------------------------------------------------------------------
 vi.mock("@/shared/utils/prisma", () => ({
   prisma: {
@@ -76,13 +78,27 @@ vi.mock("@/shared/utils/prisma", () => ({
     },
     pendingCheckout: {
       updateMany: vi.fn(),
-      create: vi.fn(),
+      upsert: vi.fn(),
     },
     // checkout-contracts WU4 (BE-3) — addressId ownership resolution.
     address: {
       findFirst: vi.fn(),
     },
+    $transaction: vi.fn(),
   },
+}));
+
+// ---------------------------------------------------------------------------
+// Mock the account-lifecycle locked-owner guard — admin-user-management adds
+// this call inside the Step 6c/7b transactions. WU1's original scope (this
+// file) exercises intent-creation business rules only; the guard's own
+// lock/deny behavior has dedicated coverage elsewhere (account-lifecycle
+// unit tests + the real-Postgres concurrency integration suite) — mocked
+// here as an always-passes no-op so this file stays scoped to WU1 (per its
+// own header comment: "WU1 only touches deliveryMode.findMany directly").
+// ---------------------------------------------------------------------------
+vi.mock("@/shared/account-lifecycle", () => ({
+  lockAndAssertOwnersActive: vi.fn().mockResolvedValue(undefined),
 }));
 
 // ---------------------------------------------------------------------------
@@ -126,6 +142,7 @@ import { stripeClient } from "@/modules/payments/services/stripe.client";
 import * as paymentsService from "@/modules/payments/services/payments.service";
 
 const mockedGetCartForCheckout = vi.mocked(getCartForCheckout);
+const mockedPrisma = vi.mocked(prisma);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedDeliveryMode = vi.mocked(prisma).deliveryMode as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -186,6 +203,14 @@ function makeSelection(overrides: Partial<DeliverySelection> = {}): DeliverySele
 beforeEach(() => {
   vi.clearAllMocks();
   mockedPendingCheckout.updateMany.mockResolvedValue({ count: 1 });
+  mockedPendingCheckout.upsert.mockResolvedValue({});
+  // The locked-preflight (Step 6c) and bind (Step 7b) both run inside
+  // prisma.$transaction — default implementation just invokes the callback
+  // against the SAME mocked prisma delegates (mirrors the project-wide
+  // `mockedPrisma.$transaction.mockImplementationOnce((fn) => fn(mockedPrisma))`
+  // convention used across other integration test files).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  mockedPrisma.$transaction.mockImplementation((fn: any) => fn(mockedPrisma));
 });
 
 // ---------------------------------------------------------------------------
@@ -564,7 +589,6 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
       makeDeliveryModeRow({ type: "PERSONAL_DELIVERY" }),
     ]);
     mockedAddress.findFirst.mockResolvedValueOnce(makeAddressRow());
-    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
     mockedCreatePaymentIntent.mockResolvedValueOnce({
       id: "pi_personal",
       client_secret: "secret_personal",
@@ -575,15 +599,16 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
     expect(mockedAddress.findFirst).toHaveBeenCalledWith({
       where: { id: "addr_A", userId: "user_001", deletedAt: null },
     });
-    expect(mockedPendingCheckout.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({ addressLine1: "Calle Envio 1" }),
-    });
+    expect(mockedPendingCheckout.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ addressLine1: "Calle Envio 1" }),
+      }),
+    );
   });
 
   it("[CPI-ADDR-PICKUP-IGNORED] pickup-only selection with a supplied addressId -> ignored, no address lookup, no snapshot content written", async () => {
     mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView([makeCartItem()]));
     mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryModeRow({ type: "PICKUP" })]);
-    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
     mockedCreatePaymentIntent.mockResolvedValueOnce({
       id: "pi_pickup",
       client_secret: "secret_pickup",
@@ -597,17 +622,19 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
 
     expect(result).toEqual({ clientSecret: "secret_pickup" });
     expect(mockedAddress.findFirst).not.toHaveBeenCalled();
-    expect(mockedPendingCheckout.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        addressLine1: "",
-        addressLine2: null,
-        addressCity: "",
-        addressPostalCode: "",
-        addressProvince: "",
+    expect(mockedPendingCheckout.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          addressLine1: "",
+          addressLine2: null,
+          addressCity: "",
+          addressPostalCode: "",
+          addressProvince: "",
+        }),
       }),
-    });
-    const createCallData = mockedPendingCheckout.create.mock.calls[0]?.[0]?.data;
-    expect(createCallData).not.toHaveProperty("addressCountry");
+    );
+    const upsertCallData = mockedPendingCheckout.upsert.mock.calls[0]?.[0]?.create;
+    expect(upsertCallData).not.toHaveProperty("addressCountry");
   });
 
   it("[CPI-ADDR-OWNERSHIP] addressId resolves to null (unknown or not owned) -> ValidationFailedError, no Stripe call", async () => {
@@ -643,7 +670,6 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
         country: "ES",
       }),
     );
-    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
     mockedCreatePaymentIntent.mockResolvedValueOnce({
       id: "pi_shipping",
       client_secret: "secret_shipping",
@@ -656,16 +682,18 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
     );
 
     expect(result).toEqual({ clientSecret: "secret_shipping" });
-    expect(mockedPendingCheckout.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        addressLine1: "Avenida Real 42",
-        addressLine2: "Piso 3",
-        addressCity: "Alicante",
-        addressPostalCode: "03001",
-        addressProvince: "Alicante",
-        addressCountry: "ES",
+    expect(mockedPendingCheckout.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          addressLine1: "Avenida Real 42",
+          addressLine2: "Piso 3",
+          addressCity: "Alicante",
+          addressPostalCode: "03001",
+          addressProvince: "Alicante",
+          addressCountry: "ES",
+        }),
       }),
-    });
+    );
   });
 
   // R1-001/R3-001 correction (review-bf06f52e2bf5b337): the idempotency
@@ -682,7 +710,6 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
       makeDeliveryModeRow({ type: "SHIPPING_FLAT_RATE" }),
     ]);
     mockedAddress.findFirst.mockResolvedValueOnce(makeAddressRow({ id: "addr_A" }));
-    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
     mockedCreatePaymentIntent.mockResolvedValueOnce({
       id: "pi_addr_A",
       client_secret: "secret_addr_A",
@@ -693,7 +720,6 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
     mockedAddress.findFirst.mockResolvedValueOnce(
       makeAddressRow({ id: "addr_B", line1: "Otra Calle 9", city: "Sevilla" }),
     );
-    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
     mockedCreatePaymentIntent.mockResolvedValueOnce({
       id: "pi_addr_B",
       client_secret: "secret_addr_B",
