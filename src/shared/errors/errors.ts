@@ -359,3 +359,54 @@ export class IncidentAlreadyResolvedError extends AppError {
   readonly status = 409;
   readonly title = "Incident already resolved";
 }
+
+// ===========================================================================
+// admin-user-management additions — account lifecycle error contract
+// Spec: error-handling §"Account lifecycle error contract"
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 403 — Deactivated or deleted identity denied on a protected operation.
+//       detail MUST NOT expose email, subject, or profile data (PII safety).
+// ---------------------------------------------------------------------------
+
+export class AccountInactiveError extends AppError {
+  readonly code = "ACCOUNT_INACTIVE" as const;
+  readonly status = 403;
+  readonly title = "Account inactive";
+
+  constructor(detail = "Account is deactivated or deleted", cause?: unknown) {
+    super(detail, cause);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 409 — An action attempts to restore a deletion tombstone (e.g. ADMIN
+//       activation targeting an already-deleted account). Irreversible by
+//       design — deletion MUST NEVER be undone.
+// ---------------------------------------------------------------------------
+
+export class AccountDeletedError extends AppError {
+  readonly code = "ACCOUNT_DELETED" as const;
+  readonly status = 409;
+  readonly title = "Account deleted";
+
+  constructor(detail = "Account has been permanently deleted", cause?: unknown) {
+    super(detail, cause);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 409 — Account deletion requested while the consumer or producer owns any
+//       active (non-terminal) order.
+// ---------------------------------------------------------------------------
+
+export class UserHasActiveOrdersError extends AppError {
+  readonly code = "USER_HAS_ACTIVE_ORDERS" as const;
+  readonly status = 409;
+  readonly title = "User has active orders";
+
+  constructor(detail = "Cannot delete a user with active orders", cause?: unknown) {
+    super(detail, cause);
+  }
+}

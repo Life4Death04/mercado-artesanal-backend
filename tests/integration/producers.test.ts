@@ -172,6 +172,8 @@ function mockLoadUser(user: AnyTestUser | null): void {
     id: user.id,
     role: user.role,
     email: user.email,
+    deletedAt: null,
+    deactivatedAt: null,
     producer: user.producerId ? { id: user.producerId } : null,
   });
 }

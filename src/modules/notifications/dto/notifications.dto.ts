@@ -97,6 +97,14 @@ export const NOTIFICATION_COPY: Record<NotificationType, NotificationCopy> = {
     title: "Incidencia resuelta",
     body: "La incidencia de tu pedido ha sido resuelta.",
   },
+  // admin-user-management WU3 — emitted atomically with a DEACTIVATED ->
+  // ACTIVE admin transition (notifications spec "Activation is atomic and
+  // unique"); email-provider spec "Activation email follows committed
+  // notification".
+  ACCOUNT_ACTIVATED: {
+    title: "Cuenta reactivada",
+    body: "Tu cuenta ha sido reactivada. Ya puedes volver a usar todos los servicios.",
+  },
 };
 
 // ---------------------------------------------------------------------------

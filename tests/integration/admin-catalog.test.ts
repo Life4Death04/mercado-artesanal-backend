@@ -78,6 +78,8 @@ function mockLoadUser(role: string): void {
     id: "cuid_user_001",
     role,
     email: "user@example.com",
+    deletedAt: null,
+    deactivatedAt: null,
     producer: null,
   });
 }

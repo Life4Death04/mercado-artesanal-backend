@@ -129,6 +129,7 @@ function makeUser(overrides: Partial<User> = {}): User {
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     deletedAt: null,
+    deactivatedAt: null,
     ...overrides,
   };
 }
@@ -142,7 +143,15 @@ const mockedPrisma = vi.mocked(prisma);
  * { id, role, email } projection from the DB. Pass null to simulate "no user yet".
  */
 function mockLoadUser(user: User | null): void {
-  const projection = user ? { id: user.id, role: user.role, email: user.email } : null;
+  const projection = user
+    ? {
+        id: user.id,
+        role: user.role,
+        email: user.email,
+        deletedAt: user.deletedAt ?? null,
+        deactivatedAt: user.deactivatedAt ?? null,
+      }
+    : null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (mockedPrisma.user as any).findUnique.mockResolvedValueOnce(projection);
 }
@@ -175,8 +184,8 @@ describe("POST /api/v1/auth/sync — first sync creates PENDING user", () => {
 
     // loadUser: no DB record yet (null projection)
     mockLoadUser(null);
-    // auth.service: findByAuth0Sub → null (first sync)
-    mockedUserRepo.findByAuth0Sub.mockResolvedValueOnce(null);
+    // auth.service: findByAuth0SubAny → null (first sync, no lifecycle match)
+    mockedUserRepo.findByAuth0SubAny.mockResolvedValueOnce(null);
     // auth.service: create() → new user
     mockedUserRepo.create.mockResolvedValueOnce(createdUser);
 
@@ -192,7 +201,7 @@ describe("POST /api/v1/auth/sync — first sync creates PENDING user", () => {
       emailVerified: true,
     });
 
-    expect(mockedUserRepo.findByAuth0Sub).toHaveBeenCalledWith(sub);
+    expect(mockedUserRepo.findByAuth0SubAny).toHaveBeenCalledWith(sub);
     expect(mockedUserRepo.create).toHaveBeenCalledWith({
       auth0Sub: sub,
       email,
@@ -206,7 +215,7 @@ describe("POST /api/v1/auth/sync — first sync creates PENDING user", () => {
     const createdUser = makeUser({ auth0Sub: sub, email, emailVerified: true });
 
     mockLoadUser(null);
-    mockedUserRepo.findByAuth0Sub.mockResolvedValueOnce(null);
+    mockedUserRepo.findByAuth0SubAny.mockResolvedValueOnce(null);
     mockedUserRepo.create.mockResolvedValueOnce(createdUser);
 
     const res = await request.post("/api/v1/auth/sync").set(
@@ -237,8 +246,8 @@ describe("POST /api/v1/auth/sync — first sync creates PENDING user", () => {
 
     // loadUser: no DB record yet
     mockLoadUser(null);
-    // auth.service: no existing user → first sync path
-    mockedUserRepo.findByAuth0Sub.mockResolvedValueOnce(null);
+    // auth.service: no existing user of any lifecycle state → first sync path
+    mockedUserRepo.findByAuth0SubAny.mockResolvedValueOnce(null);
 
     const res = await request
       .post("/api/v1/auth/sync")
@@ -265,8 +274,8 @@ describe("POST /api/v1/auth/sync — re-sync updates only emailVerified", () => 
 
     // loadUser: user exists in DB
     mockLoadUser(existingUser);
-    // auth.service: findByAuth0Sub → existing user (re-sync path)
-    mockedUserRepo.findByAuth0Sub.mockResolvedValueOnce(existingUser);
+    // auth.service: findByAuth0SubAny → existing ACTIVE user (re-sync path)
+    mockedUserRepo.findByAuth0SubAny.mockResolvedValueOnce(existingUser);
     mockedUserRepo.updateEmailVerified.mockResolvedValueOnce(updatedUser);
 
     const res = await request
@@ -281,6 +290,58 @@ describe("POST /api/v1/auth/sync — re-sync updates only emailVerified", () => 
     expect(mockedUserRepo.create).not.toHaveBeenCalled();
     // updateEmailVerified called with correct args
     expect(mockedUserRepo.updateEmailVerified).toHaveBeenCalledWith(existingUser.id, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// [S2b] admin-user-management delta — tombstoned subject cannot be recreated
+// Spec: user-profile §"Tombstoned subject cannot be recreated"
+// ---------------------------------------------------------------------------
+
+describe("POST /api/v1/auth/sync — tombstoned subject (admin-user-management)", () => {
+  it("returns the stable lifecycle denial (403 ACCOUNT_INACTIVE) and creates no user", async () => {
+    const sub = "auth0|deleted001";
+    const deletedUser = makeUser({
+      auth0Sub: sub,
+      deletedAt: new Date("2026-01-01T00:00:00Z"),
+    });
+
+    // loadUser: real middleware treats a deleted match as absent (req.user = null),
+    // so the request still reaches auth.service — which MUST detect the
+    // tombstone itself via findByAuth0SubAny (user-profile spec delta).
+    mockLoadUser(null);
+    mockedUserRepo.findByAuth0SubAny.mockResolvedValueOnce(deletedUser);
+
+    const res = await request
+      .post("/api/v1/auth/sync")
+      .set("X-Test-Auth", authHeader({ sub, email: "new@example.com", email_verified: true }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("ACCOUNT_INACTIVE");
+    // error-handling §"Account lifecycle error contract" — stable RFC 7807 type.
+    expect(res.body.type).toBe("/errors/account-inactive");
+    expect(mockedUserRepo.create).not.toHaveBeenCalled();
+    expect(mockedUserRepo.updateEmailVerified).not.toHaveBeenCalled();
+  });
+
+  // Spec: user-profile §"Deactivated subject cannot sync"; account-lifecycle
+  // §"Backend-wide lifecycle denial" — loadUser itself halts the chain, so
+  // the sync handler (and findByAuth0SubAny) is never reached.
+  it("deactivated (not deleted) subject also receives the lifecycle denial and remains deactivated", async () => {
+    const sub = "auth0|deactivated001";
+    const deactivatedUser = makeUser({ auth0Sub: sub, deactivatedAt: new Date("2026-01-01T00:00:00Z") });
+
+    mockLoadUser(deactivatedUser);
+
+    const res = await request
+      .post("/api/v1/auth/sync")
+      .set("X-Test-Auth", authHeader({ sub, email: "new@example.com", email_verified: true }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("ACCOUNT_INACTIVE");
+    expect(res.body.type).toBe("/errors/account-inactive");
+    expect(mockedUserRepo.create).not.toHaveBeenCalled();
+    expect(mockedUserRepo.findByAuth0SubAny).not.toHaveBeenCalled();
   });
 });
 

@@ -31,11 +31,10 @@
  *                          (payments WU2 — unauth, raw-body, signature-verified).
  *   notificationsRouter  — Cycle 5: owner-scoped in-app notifications under
  *                          /notifications[/unread-count|/:id/read] (notifications WU3).
- *   incidentsRouter      — Consumer purchase-support incident reporting under
+ *   incidentsRouter      — Buyer purchase-support incident reporting under
  *                          /incidencias (admin-incidents WU2). Guard:
  *                          authenticate -> loadUser -> onboardingGate ->
- *                          requireRole("CONSUMER") — CONSUMER only, distinct
- *                          from the multi-role guards above.
+ *                          requireRole("CONSUMER", "PRODUCER").
  *   adminRouter          — Cycle 6: ADMIN-only catalog moderation and category
  *                          management under /admin/* (admin-catalog-control WU3).
  *                          Guard: authenticate → loadUser → requireRole("ADMIN") →

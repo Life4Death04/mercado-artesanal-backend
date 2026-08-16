@@ -36,6 +36,11 @@ model User {
   createdAt     DateTime  @default(now()) @map("created_at")
   updatedAt     DateTime  @updatedAt @map("updated_at")
   deletedAt     DateTime? @map("deleted_at")
+  // admin-user-management WU1 — reversible deactivation timestamp. Null means
+  // active. Lifecycle precedence (design "Boolean vs timestamps" Decision):
+  // deletedAt wins over deactivatedAt — see src/shared/account-lifecycle.ts
+  // deriveAccountState, the single authority for this precedence.
+  deactivatedAt DateTime? @map("deactivated_at")
 
   producer          Producer?
   addresses         Address[]
@@ -48,6 +53,10 @@ model User {
   incidentsResolved Incident[]     @relation("IncidentResolver")
 
   @@index([auth0Sub])
+  // admin-user-management WU2 — ADMIN discovery listing, page size 8,
+  // ordered createdAt DESC, id DESC, filtered to actionable roles
+  // (CONSUMER, PRODUCER) via the leading `role` column.
+  @@index([role, createdAt(sort: Desc), id(sort: Desc)])
   @@map("users")
 }
 
@@ -402,6 +411,10 @@ model Order {
   payment   Payment    @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   subOrders SubOrder[]
 
+  // admin-user-management WU1 — consumer activity-count reads
+  // (distinct aggregate Orders owned by a user) and the account-lifecycle
+  // checkout/deletion race guard both filter by userId.
+  @@index([userId])
   @@map("orders")
 }
 
@@ -518,6 +531,10 @@ enum NotificationType {
   TRACKING_ASSIGNED
   INCIDENT_REPORTED
   INCIDENT_RESOLVED
+  // admin-user-management WU3 — emitted atomically with a DEACTIVATED ->
+  // ACTIVE admin transition (notifications spec "Activation is atomic and
+  // unique").
+  ACCOUNT_ACTIVATED
 }
 
 /// Per-user in-app notification. Written IN-transaction at the existing

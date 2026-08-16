@@ -46,7 +46,7 @@ function findNotificationMigrationSql(): string {
 // [S1] NotificationType enum — exact value set, in schema order
 // ---------------------------------------------------------------------------
 describe("NotificationType enum (DMMF)", () => {
-  it("declares exactly the six designed values, in order", () => {
+  it("declares exactly the seven designed values, in order (admin-user-management adds ACCOUNT_ACTIVATED)", () => {
     const enumDef = Prisma.dmmf.datamodel.enums.find(
       (e) => e.name === "NotificationType",
     );
@@ -59,6 +59,7 @@ describe("NotificationType enum (DMMF)", () => {
       "TRACKING_ASSIGNED",
       "INCIDENT_REPORTED",
       "INCIDENT_RESOLVED",
+      "ACCOUNT_ACTIVATED",
     ]);
   });
 });
