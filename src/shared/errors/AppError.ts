@@ -52,7 +52,11 @@ export type ErrorCode =
   | "INVALID_MODERATION_TRANSITION"
   | "CATEGORY_SLUG_CONFLICT"
   // admin-incidents WU1 additions
-  | "INCIDENT_ALREADY_RESOLVED";
+  | "INCIDENT_ALREADY_RESOLVED"
+  // admin-user-management additions — account lifecycle error contract
+  | "ACCOUNT_INACTIVE"
+  | "ACCOUNT_DELETED"
+  | "USER_HAS_ACTIVE_ORDERS";
 
 export interface ProblemDetails {
   type: string;
