@@ -48,10 +48,10 @@ import {
   UnknownCategoryError,
 } from "@/shared/errors/errors";
 import { prisma } from "@/shared/utils/prisma";
-import { isTerminalStatus } from "../../sub-orders/services/sub-orders.service";
 
-import type { PatchProducerBody } from "../dto/producers.dto";
 import type { SubOrderStatusValue } from "../../sub-orders/dto/sub-orders.dto";
+import { isTerminalStatus } from "../../sub-orders/services/sub-orders.service";
+import type { PatchProducerBody } from "../dto/producers.dto";
 
 // ---------------------------------------------------------------------------
 // Terminal SubOrder statuses for the soft-delete guard
@@ -68,9 +68,8 @@ const ALL_SUBORDER_STATUSES: SubOrderStatusValue[] = [
   "delivered",
   "cancelled",
 ];
-const TERMINAL_SUBORDER_STATUSES: SubOrderStatus[] = ALL_SUBORDER_STATUSES.filter(
-  isTerminalStatus,
-) as SubOrderStatus[];
+const TERMINAL_SUBORDER_STATUSES: SubOrderStatus[] =
+  ALL_SUBORDER_STATUSES.filter(isTerminalStatus);
 
 // ---------------------------------------------------------------------------
 // Public projection type

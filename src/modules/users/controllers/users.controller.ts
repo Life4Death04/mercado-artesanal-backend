@@ -16,7 +16,9 @@
 import type { NextFunction, Request, Response } from "express";
 
 import { NotFoundError, UnauthorizedError } from "@/shared/errors/errors";
+import { validateBody } from "@/shared/validation/zod";
 
+import { UpdateMeSchema } from "../dto/users.dto";
 import * as usersService from "../services/users.service";
 
 /**
@@ -36,6 +38,29 @@ export async function getMe(req: Request, res: Response, next: NextFunction): Pr
     }
 
     const meView = await usersService.getMe(req.user.id);
+
+    if (!meView) {
+      throw new NotFoundError("User not found");
+    }
+
+    res.status(200).json(meView);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateMe(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    if (req.user === undefined) {
+      throw new UnauthorizedError("Authentication required");
+    }
+
+    if (req.user === null) {
+      throw new NotFoundError("User not found");
+    }
+
+    const body = validateBody(UpdateMeSchema, req.body);
+    const meView = await usersService.updateMe(req.user.id, body);
 
     if (!meView) {
       throw new NotFoundError("User not found");
