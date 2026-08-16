@@ -28,6 +28,19 @@ import { prisma } from "@/shared/utils/prisma";
 // Minimal type accepted wherever a Prisma transaction client is expected.
 type PrismaTx = Prisma.TransactionClient;
 
+const profileInclude = {
+  producer: {
+    where: { deletedAt: null },
+    include: {
+      categories: {
+        include: { category: true },
+      },
+    },
+  },
+} satisfies Prisma.UserInclude;
+
+type UserWithProducer = Prisma.UserGetPayload<{ include: typeof profileInclude }>;
+
 // ---------------------------------------------------------------------------
 // Read
 // ---------------------------------------------------------------------------
@@ -157,6 +170,34 @@ export async function updateEmailVerified(
   return client.user.update({
     where: { id },
     data: { emailVerified },
+  });
+}
+
+/** Update only the editable personal profile fields of an ACTIVE user. */
+export async function updateProfile(
+  id: string,
+  data: { firstName?: string; lastName?: string },
+  tx?: PrismaTx,
+): Promise<UserWithProducer | null> {
+  if (tx) return updateProfileInTransaction(tx, id, data);
+  return prisma.$transaction((transaction) => updateProfileInTransaction(transaction, id, data));
+}
+
+async function updateProfileInTransaction(
+  tx: PrismaTx,
+  id: string,
+  data: { firstName?: string; lastName?: string },
+): Promise<UserWithProducer | null> {
+  const { count } = await tx.user.updateMany({
+    where: { id, ...ACTIVE_USER_WHERE },
+    data,
+  });
+
+  if (count === 0) return null;
+
+  return tx.user.findFirst({
+    where: { id, ...ACTIVE_USER_WHERE },
+    include: profileInclude,
   });
 }
 

@@ -24,6 +24,8 @@ import type { Prisma } from "@prisma/client";
 
 import * as userRepo from "@/shared/repositories/user.repository";
 
+import type { UpdateMeBody } from "../dto/users.dto";
+
 // Shape of the producer sub-object in the response (user-profile spec §GET /users/me).
 export interface ProducerView {
   id: string;
@@ -113,6 +115,12 @@ function mapToMeView(user: UserWithProducer): MeView {
  */
 export async function getMe(userId: string): Promise<MeView | null> {
   const user = await userRepo.findByIdWithProducer(userId);
+  if (!user) return null;
+  return mapToMeView(user);
+}
+
+export async function updateMe(userId: string, data: UpdateMeBody): Promise<MeView | null> {
+  const user = await userRepo.updateProfile(userId, data);
   if (!user) return null;
   return mapToMeView(user);
 }
