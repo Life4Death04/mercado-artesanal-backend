@@ -25,6 +25,8 @@
  *   admin-catalog §"Admin-only catalog surface"
  *   incident-management §"ADMIN inbox pagination", §"Safe ADMIN detail",
  *     §"Final conditional resolution"
+ *   admin-user-management §"Deterministic user discovery",
+ *     §"User detail and activity definitions"
  *   design — Data Flow, API surface table
  */
 import { Router } from "express";
@@ -35,6 +37,7 @@ import { onboardingGate } from "@/shared/middleware/onboardingGate";
 import { requireRole } from "@/shared/middleware/requireRole";
 
 import * as adminIncidentsController from "../../incidents/controllers/admin-incidents.controller";
+import * as adminUsersController from "../controllers/admin-users.controller";
 import * as adminController from "../controllers/admin.controller";
 
 export const adminRouter: Router = Router();
@@ -75,3 +78,6 @@ adminRouter.get("/admin/incidents", adminIncidentsController.listIncidents);
 adminRouter.get("/admin/incidents/:id", adminIncidentsController.getIncidentDetail);
 
 adminRouter.patch("/admin/incidents/:id/resolve", adminIncidentsController.resolveIncident);
+adminRouter.get("/admin/users", adminUsersController.listUsers);
+
+adminRouter.get("/admin/users/:id", adminUsersController.getUserDetail);
