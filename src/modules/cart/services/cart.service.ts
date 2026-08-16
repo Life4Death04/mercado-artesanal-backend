@@ -34,9 +34,13 @@
  */
 import type { Prisma } from "@prisma/client";
 
+import { ACTIVE_USER_WHERE, isAccountActive } from "@/shared/account-lifecycle";
 import { NotFoundError, ProductInactiveError, QuantityExceedsStockError } from "@/shared/errors/errors";
 import { toImageUrl } from "@/shared/utils/image-url";
 import { prisma } from "@/shared/utils/prisma";
+
+/** Minimal owning-User lifecycle projection reused by every product/producer include below. */
+const OWNER_LIFECYCLE_SELECT = { deletedAt: true, deactivatedAt: true } as const;
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -105,7 +109,11 @@ export interface CartForCheckout {
 // Internal row shapes (nested Prisma includes) — mapping helpers only
 // ---------------------------------------------------------------------------
 
-type ProducerRow = { id: string; deletedAt: Date | null };
+type ProducerRow = {
+  id: string;
+  deletedAt: Date | null;
+  user: { deletedAt: Date | null; deactivatedAt: Date | null };
+};
 type ProductImageRow = { id: string; position: number; s3Key: string };
 type ProductRow = {
   id: string;
@@ -129,12 +137,19 @@ type CartItemRow = {
 type CartItemViewRow = Omit<CartItemRow, "product"> & { product: ProductWithImagesRow };
 
 /**
- * Computes item availability: product is not soft-deleted, is active, AND
- * its producer is not soft-deleted. See file header note on the
- * producer.isActive derivation.
+ * Computes item availability: product is not soft-deleted, is active, its
+ * producer is not soft-deleted, AND the producer's owning User is ACTIVE
+ * (account-lifecycle §"Commerce lifecycle consistency" — admin-user-management
+ * delta: "Producer deactivation removes commerce availability"). See file
+ * header note on the producer.isActive derivation.
  */
 function computeIsAvailable(product: ProductRow): boolean {
-  return product.deletedAt === null && product.isActive && product.producer.deletedAt === null;
+  return (
+    product.deletedAt === null &&
+    product.isActive &&
+    product.producer.deletedAt === null &&
+    isAccountActive(product.producer.user)
+  );
 }
 
 /** Maps a Prisma CartItem row (with nested product+producer) to the wire shape. */
@@ -221,7 +236,7 @@ export async function getCartView(userId: string): Promise<CartReadView> {
         include: {
           product: {
             include: {
-              producer: true,
+              producer: { include: { user: { select: OWNER_LIFECYCLE_SELECT } } },
               images: {
                 orderBy: [{ position: "asc" }, { createdAt: "asc" }],
                 select: { id: true, position: true, s3Key: true },
@@ -296,9 +311,16 @@ export async function addItem(
   quantity: number,
 ): Promise<CartItemView> {
   const product = await prisma.product.findUnique({
-    where: { id: productId, deletedAt: null, producer: { deletedAt: null } },
+    where: {
+      id: productId,
+      deletedAt: null,
+      // Cart writes reject a non-active producer owner (cart spec "Add from
+      // deactivated owner is rejected") — reuses the SAME not-found path as
+      // a soft-deleted producer, mirroring the existing 404-no-leak convention.
+      producer: { deletedAt: null, user: ACTIVE_USER_WHERE },
+    },
     include: {
-      producer: true,
+      producer: { include: { user: { select: OWNER_LIFECYCLE_SELECT } } },
       images: {
         orderBy: [{ position: "asc" }, { createdAt: "asc" }],
         select: { id: true, position: true, s3Key: true },
@@ -387,7 +409,7 @@ export async function updateItemQuantity(
     include: {
       product: {
         include: {
-          producer: true,
+          producer: { include: { user: { select: OWNER_LIFECYCLE_SELECT } } },
           images: {
             orderBy: [{ position: "asc" }, { createdAt: "asc" }],
             select: { id: true, position: true, s3Key: true },
@@ -410,7 +432,7 @@ export async function updateItemQuantity(
     include: {
       product: {
         include: {
-          producer: true,
+          producer: { include: { user: { select: OWNER_LIFECYCLE_SELECT } } },
           images: {
             orderBy: [{ position: "asc" }, { createdAt: "asc" }],
             select: { id: true, position: true, s3Key: true },
@@ -491,7 +513,9 @@ export async function getCartForCheckout(userId: string): Promise<CartForCheckou
     include: {
       items: {
         include: {
-          product: { include: { producer: true } },
+          product: {
+            include: { producer: { include: { user: { select: OWNER_LIFECYCLE_SELECT } } } },
+          },
         },
       },
     },

@@ -173,7 +173,7 @@ function makeCartForCheckout(producerIds: string[]) {
         stock: 10,
         isActive: true,
         deletedAt: null,
-        producer: { id: producerId, deletedAt: null },
+        producer: { id: producerId, deletedAt: null, user: { deletedAt: null, deactivatedAt: null } },
       },
     })),
   };

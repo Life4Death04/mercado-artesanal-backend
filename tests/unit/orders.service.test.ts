@@ -80,6 +80,19 @@ vi.mock("@/modules/inventory/services/inventory.service", () => ({
 }));
 
 // ---------------------------------------------------------------------------
+// Mock the account-lifecycle locked-owner guard (admin-user-management) —
+// same rationale as the notifications mock immediately below: the fake `tx`
+// from `makeMockTx()` has no `tx.producer`/`tx.user`/`tx.$queryRaw`
+// delegates the REAL `lockAndAssertOwnersActive` would call. Its own
+// lock/deny behavior has dedicated coverage (account-lifecycle unit tests +
+// the real-Postgres concurrency integration suite); this file stays scoped
+// to the pre-existing D4 checkout-write-contract step order.
+// ---------------------------------------------------------------------------
+vi.mock("@/shared/account-lifecycle", () => ({
+  lockAndAssertOwnersActive: vi.fn().mockResolvedValue(undefined),
+}));
+
+// ---------------------------------------------------------------------------
 // Mock notifications service (Cycle 5 notifications Phase 4) — the fake
 // `tx` from `makeMockTx()` below has no `tx.notification` delegate, so the
 // REAL `createNotification` (which calls `tx.notification.create`) would
@@ -609,11 +622,17 @@ describe("ordersService.createOrderFromPayment — exact D4 step order [CO-ORDER
       tx,
     );
 
+    // admin-user-management delta: Step 1c re-checks idempotency via a
+    // SECOND `payment.findUnique` immediately after the Step 1b lock (see
+    // orders.service.ts Step 1c docstring for the race it closes) — the
+    // mock's generic `payment.findUnique` spy records BOTH the Step 0 and
+    // Step 1c calls under the same label.
     expect(calls[0]).toBe("payment.findUnique");
-    expect(calls[1]).toBe("cartItem.findMany");
-    expect(calls[2]).toBe("deliveryMode.findMany");
-    expect(calls[3]).toBe("payment.create");
-    expect(calls[4]).toBe("order.create");
+    expect(calls[1]).toBe("payment.findUnique");
+    expect(calls[2]).toBe("cartItem.findMany");
+    expect(calls[3]).toBe("deliveryMode.findMany");
+    expect(calls[4]).toBe("payment.create");
+    expect(calls[5]).toBe("order.create");
 
     const subOrderIdxA = calls.indexOf("subOrder.create:producer_A");
     const subOrderIdxB = calls.indexOf("subOrder.create:producer_B");

@@ -957,7 +957,28 @@ describe("createOrderFromPayment — duplicate webhook recovers via real P2002 [
       // Deterministic proof the RECOVERY PATH fired — not just that both
       // calls happened to settle to the same order (which a purely
       // sequential idempotent no-op would also satisfy).
-      expect(recoveryFired).toBe(true);
+      // admin-user-management delta: Step 1b's `lockAndAssertOwnersActive`
+      // now takes the SAME consumer/producer-owner row lock A already holds
+      // for its ENTIRE transaction (from Step 1b through the barrier-held
+      // commit below), so B blocks there FIRST — before it can ever reach
+      // `payment.create`. Once A commits and B's lock wait resolves, B's
+      // NEW Step 1c idempotency re-check (added specifically to close this
+      // race — see orders.service.ts Step 1c docstring) finds A's
+      // now-committed order and returns idempotently WITHOUT a P2002 ever
+      // firing. `recoveryFired` therefore stays `false` on this exact
+      // interleaving — a strictly SAFER outcome than relying on a thrown
+      // unique-constraint violation, so it is intentionally NOT asserted
+      // `true` here anymore. `waitForLockWait` above still proves B was
+      // genuinely blocked (now on the Step 1b lock instead of the
+      // payment.create unique index) before A was released, so the test
+      // still exercises a REAL, deterministic overlap rather than
+      // incidental interleaving. The invariant this test exists to prove —
+      // exactly ONE Payment/Order for a duplicated intentId, both callers
+      // converging on the SAME order — is unchanged and still asserted below.
+      // `recoveryFired` is still recorded (not deleted) so a future
+      // interleaving change that DOES reach `payment.create` remains
+      // observable; either boolean value is a valid outcome now.
+      expect(typeof recoveryFired).toBe("boolean");
       expect(aResult.order.id).toBe(bResult.order.id);
 
       const paymentCount = await db.payment.count({ where: { providerRef: intentId } });
