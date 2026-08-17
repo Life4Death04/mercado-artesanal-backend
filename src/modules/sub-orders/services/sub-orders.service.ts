@@ -55,8 +55,9 @@
  *   spec order-fulfillment §"State machine"
  *   spec order-fulfillment §"Idempotent transitions"
  *   spec order-fulfillment §"Tracking number on shipment" (MODIFIED)
+ *   spec order-fulfillment §"Producer public reference responses" (order-public-numbers Phase 4)
  */
-import type { SubOrder } from "@prisma/client";
+import { Prisma as PrismaValue } from "@prisma/client";
 
 import { requiresTrackingNumber } from "@/modules/delivery-modes/delivery-mode.policy";
 import * as notificationsService from "@/modules/notifications/services/notifications.service";
@@ -71,8 +72,12 @@ import { prisma } from "@/shared/utils/prisma";
 import type {
   ListSubOrdersQuery,
   PatchSubOrderBody,
+  SubOrderListItemView,
   SubOrderStatusValue,
+  SubOrderView,
 } from "../dto/sub-orders.dto";
+
+type DecimalValue = InstanceType<typeof PrismaValue.Decimal>;
 
 /**
  * `transition()`'s return contract (Cycle 5 notifications design "Emission
@@ -85,7 +90,7 @@ import type {
  * AFTER this transaction commits (fire-after-commit, best-effort).
  */
 export interface TransitionSubOrderResult {
-  subOrder: SubOrder;
+  subOrder: SubOrderView;
   pendingEmails: PendingEmail[];
 }
 
@@ -127,6 +132,100 @@ export function isTerminalStatus(status: SubOrderStatusValue): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Internal row shapes (nested Prisma includes) — mapping helpers only
+// order-public-numbers Phase 4 (PR 3): explicit response mapping, replacing
+// the previous raw-Prisma-row passthrough. Mirrors the `orders.service.ts`
+// `ExistingSubOrderRow`/`mapSubOrderView` convention.
+// ---------------------------------------------------------------------------
+
+interface SubOrderScalarRow {
+  id: string;
+  orderId: string;
+  producerId: string;
+  deliveryModeId: string;
+  status: string;
+  shippingCostSnapshot: DecimalValue;
+  trackingNumber: string | null;
+  shipToLine1: string | null;
+  shipToLine2: string | null;
+  shipToCity: string | null;
+  shipToPostalCode: string | null;
+  shipToProvince: string | null;
+  shipToCountry: string | null;
+  subOrderNumber: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface SubOrderLineRow {
+  id: string;
+  productId: string;
+  quantity: number;
+  unitPriceSnapshot: DecimalValue;
+}
+
+/**
+ * Maps a scalar SubOrder row + its separately-resolved `orderNumber` to the
+ * frozen `SubOrderView` wire shape. Deliberately takes `orderNumber` as its
+ * own parameter (not a nested `order` relation) so `order.userId` — read
+ * separately by `transition()` for the notification recipient — can NEVER
+ * flow into this mapper's output (design "Interfaces / Contracts": "exactly
+ * order: { orderNumber: number }").
+ *
+ * Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+ */
+function mapSubOrderView(row: SubOrderScalarRow, orderNumber: number): SubOrderView {
+  return {
+    id: row.id,
+    orderId: row.orderId,
+    producerId: row.producerId,
+    deliveryModeId: row.deliveryModeId,
+    status: row.status as SubOrderStatusValue,
+    shippingCostSnapshot: row.shippingCostSnapshot.toFixed(2),
+    trackingNumber: row.trackingNumber,
+    shipToLine1: row.shipToLine1,
+    shipToLine2: row.shipToLine2,
+    shipToCity: row.shipToCity,
+    shipToPostalCode: row.shipToPostalCode,
+    shipToProvince: row.shipToProvince,
+    shipToCountry: row.shipToCountry,
+    subOrderNumber: row.subOrderNumber,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+    order: { orderNumber },
+  };
+}
+
+function mapSubOrderLineView(line: SubOrderLineRow): {
+  id: string;
+  productId: string;
+  quantity: number;
+  unitPriceSnapshot: string;
+} {
+  return {
+    id: line.id,
+    productId: line.productId,
+    quantity: line.quantity,
+    unitPriceSnapshot: line.unitPriceSnapshot.toFixed(2),
+  };
+}
+
+/** `findAll`/`findById` list/detail mapping — adds `deliveryMode.type` and `orderLines`. */
+function mapSubOrderListItemView(
+  row: SubOrderScalarRow & {
+    deliveryMode: { type: string };
+    orderLines: SubOrderLineRow[];
+    order: { orderNumber: number };
+  },
+): SubOrderListItemView {
+  return {
+    ...mapSubOrderView(row, row.order.orderNumber),
+    deliveryMode: row.deliveryMode,
+    orderLines: row.orderLines.map(mapSubOrderLineView),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // findAll
 // ---------------------------------------------------------------------------
 
@@ -148,12 +247,12 @@ export function isTerminalStatus(status: SubOrderStatusValue): boolean {
 export async function findAll(
   producerId: string,
   query?: Partial<Pick<ListSubOrdersQuery, "status" | "page" | "limit">>,
-): Promise<SubOrder[]> {
+): Promise<SubOrderListItemView[]> {
   const page = query?.page ?? 1;
   const limit = Math.min(query?.limit ?? 20, 100);
   const skip = (page - 1) * limit;
 
-  return prisma.subOrder.findMany({
+  const subOrders = await prisma.subOrder.findMany({
     where: {
       producerId,
       ...(query?.status !== undefined && { status: query.status }),
@@ -161,11 +260,14 @@ export async function findAll(
     include: {
       orderLines: true,
       deliveryMode: { select: { type: true } },
+      order: { select: { orderNumber: true } },
     },
     orderBy: { createdAt: "desc" },
     skip,
     take: limit,
   });
+
+  return subOrders.map(mapSubOrderListItemView);
 }
 
 // ---------------------------------------------------------------------------
@@ -185,20 +287,21 @@ export async function findAll(
  *   - Cross-producer reads MUST return 404
  * Spec scenario: "Cross-producer read returns 404"
  */
-export async function findById(
-  producerId: string,
-  id: string,
-): Promise<SubOrder & { orderLines: unknown[] }> {
+export async function findById(producerId: string, id: string): Promise<SubOrderListItemView> {
   const subOrder = await prisma.subOrder.findFirst({
     where: { id, producerId },
-    include: { orderLines: true, deliveryMode: { select: { type: true } } },
+    include: {
+      orderLines: true,
+      deliveryMode: { select: { type: true } },
+      order: { select: { orderNumber: true } },
+    },
   });
 
   if (!subOrder) {
     throw new NotFoundError("SubOrder not found");
   }
 
-  return subOrder;
+  return mapSubOrderListItemView(subOrder);
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +350,11 @@ export async function findById(
  *
  * Spec: notifications §"Sub-order status change and tracking notify the consumer"
  * Spec: notifications §"Replayed event does not duplicate" (no-op path)
+ * Spec: order-fulfillment §"Producer public reference responses" (order-public-numbers
+ *   Phase 4) — scenario "Transition returns the same contract": both the
+ *   idempotent no-op and the successful-update path return the SAME explicit
+ *   `SubOrderView` (`subOrderNumber` + `order.orderNumber`), and `order.userId`
+ *   (read below ONLY for the notification recipient) never reaches the response.
  */
 export async function transition(
   producerId: string,
@@ -255,12 +363,14 @@ export async function transition(
 ): Promise<TransitionSubOrderResult> {
   return prisma.$transaction(async (tx) => {
     // Step 1: ownership guard — 404-no-leak; include deliveryMode.type for the
-    // gate and order.userId (Cycle 5 notifications) for the emission recipient.
+    // gate, order.userId (Cycle 5 notifications) for the emission recipient,
+    // and order.orderNumber (order-public-numbers Phase 4) for the response
+    // view — order.userId is read here but MUST NOT reach mapSubOrderView.
     const current = await tx.subOrder.findFirst({
       where: { id, producerId },
       include: {
         deliveryMode: { select: { type: true } },
-        order: { select: { userId: true } },
+        order: { select: { userId: true, orderNumber: true } },
       },
     });
 
@@ -333,7 +443,10 @@ export async function transition(
     // existing early-return exactly like the payments/orders seam's step-0 replay guard.)
     // Spec: "The service MUST NOT issue any UPDATE to the row; updatedAt MUST remain unchanged."
     if (current.status === target) {
-      return { subOrder: current, pendingEmails: [] };
+      return {
+        subOrder: mapSubOrderView(current, current.order.orderNumber),
+        pendingEmails: [],
+      };
     }
 
     // Step 4: validate transition
@@ -390,6 +503,9 @@ export async function transition(
       );
     }
 
-    return { subOrder: updated, pendingEmails };
+    return {
+      subOrder: mapSubOrderView(updated, current.order.orderNumber),
+      pendingEmails,
+    };
   });
 }

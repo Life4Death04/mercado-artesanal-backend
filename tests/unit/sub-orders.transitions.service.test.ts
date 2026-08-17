@@ -131,12 +131,23 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
     status: "pending" as SubOrderStatus,
     shippingCostSnapshot: new Decimal("5.00"),
     trackingNumber: null,
+    shipToLine1: null,
+    shipToLine2: null,
+    shipToCity: null,
+    shipToPostalCode: null,
+    shipToProvince: null,
+    shipToCountry: null,
+    // order-public-numbers Phase 4 (PR 3) — subOrderNumber is a raw column.
+    subOrderNumber: 4,
     deliveryMode: { type: "SHIPPING_FLAT_RATE" },
     // Cycle 5 notifications (design "Emission wiring", Phase 5): the step-1
-    // findFirst now includes `order: { select: { userId: true } } }` — the
-    // emission recipient. `Order.userId` is a bare column (no Prisma `user`
-    // relation), so this fixture mirrors ONLY the field the service reads.
-    order: { userId: OWNER_USER_ID },
+    // findFirst now includes `order: { select: { userId: true, orderNumber:
+    // true } } }` — `userId` is the emission recipient (never propagated to
+    // the response), `orderNumber` (order-public-numbers Phase 4) is
+    // propagated to `subOrder.order.orderNumber`. `Order.userId` is a bare
+    // column (no Prisma `user` relation), so this fixture mirrors ONLY the
+    // fields the service reads.
+    order: { userId: OWNER_USER_ID, orderNumber: 9 },
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
@@ -201,6 +212,29 @@ describe("subOrdersService.transition — valid transitions", () => {
       where: { id: "so_001" },
       data: { status: "preparing" },
     });
+  });
+
+  it("[SO-VIEW-5] maps the successful-update path to subOrderNumber + order.orderNumber, no order.userId", async () => {
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // scenario "Transition returns the same contract" — P1 owns S1(#4) under
+    // an order.orderNumber that MUST survive a valid transition.
+    const current = makeSubOrder({
+      status: "pending" as SubOrderStatus,
+      subOrderNumber: 4,
+      order: { userId: OWNER_USER_ID, orderNumber: 9 },
+    });
+    const updated = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      subOrderNumber: 4,
+    });
+    mockTransaction(current, updated);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", { status: "preparing" });
+
+    expect(result.subOrder.subOrderNumber).toBe(4);
+    expect(result.subOrder.order).toEqual({ orderNumber: 9 });
+    expect(result.subOrder).not.toHaveProperty("order.userId");
+    expect(Object.keys(result.subOrder.order)).toEqual(["orderNumber"]);
   });
 
   it("transitions preparing → sent (PICKUP — no trackingNumber required)", async () => {
@@ -288,9 +322,30 @@ describe("subOrdersService.transition — idempotent no-op", () => {
 
     // Returns the current row unchanged
     expect(result.subOrder.status).toBe("preparing");
-    expect(result.subOrder.updatedAt).toEqual(t0);
+    // The mapped view serializes updatedAt as an ISO string (explicit
+    // mapping — order-public-numbers Phase 4), not the raw Prisma Date.
+    expect(result.subOrder.updatedAt).toBe(t0.toISOString());
     // SQL no-update assertion: update MUST NOT have been called
     expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("[SO-VIEW-6] maps the idempotent no-op path to subOrderNumber + order.orderNumber, no order.userId", async () => {
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // scenario "Transition returns the same contract" — the no-op path MUST
+    // return the SAME explicit shape as the successful-update path.
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      subOrderNumber: 4,
+      order: { userId: OWNER_USER_ID, orderNumber: 9 },
+    });
+    mockTransaction(current);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", { status: "preparing" });
+
+    expect(result.subOrder.subOrderNumber).toBe(4);
+    expect(result.subOrder.order).toEqual({ orderNumber: 9 });
+    expect(result.subOrder).not.toHaveProperty("order.userId");
+    expect(Object.keys(result.subOrder.order)).toEqual(["orderNumber"]);
   });
 
   it("[N-EMIT-NOOP-NO-DUP] creates NO notification and returns empty pendingEmails on a no-op transition", async () => {

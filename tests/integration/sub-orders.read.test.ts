@@ -31,7 +31,8 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 // Mock: express-oauth2-jwt-bearer — same pattern as delivery-modes.test.ts
 // ---------------------------------------------------------------------------
 vi.mock("express-oauth2-jwt-bearer", () => ({
-  auth: () =>
+  auth:
+    () =>
     (
       req: import("express").Request,
       _res: import("express").Response,
@@ -116,6 +117,17 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
     status: "pending" as SubOrderStatus,
     shippingCostSnapshot: new Decimal("5.00"),
     trackingNumber: null,
+    shipToLine1: null,
+    shipToLine2: null,
+    shipToCity: null,
+    shipToPostalCode: null,
+    shipToProvince: null,
+    shipToCountry: null,
+    // order-public-numbers Phase 4 (PR 3) — subOrderNumber is a raw column;
+    // order.orderNumber is resolved via the new `order` include.
+    subOrderNumber: 4,
+    deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+    order: { orderNumber: 9 },
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     orderLines: [],
@@ -179,6 +191,10 @@ describe("GET /api/v1/producers/me/sub-orders — list own SubOrders", () => {
     expect(res.body).toHaveLength(1);
     expect(res.body[0].id).toBe(so.id);
     expect(res.body[0].producerId).toBe("prod_001");
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // scenario "Producer reads public references" — subOrderNumber + order.orderNumber.
+    expect(res.body[0].subOrderNumber).toBe(4);
+    expect(res.body[0].order).toEqual({ orderNumber: 9 });
   });
 
   it("[SO-R2] returns 200 with only SubOrders matching status filter", async () => {
@@ -256,6 +272,10 @@ describe("GET /api/v1/producers/me/sub-orders/:id — get own SubOrder with line
     expect(res.body.producerId).toBe("prod_001");
     expect(Array.isArray(res.body.orderLines)).toBe(true);
     expect(res.body.orderLines).toHaveLength(1);
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // scenario "Producer reads public references" — subOrderNumber + order.orderNumber.
+    expect(res.body.subOrderNumber).toBe(4);
+    expect(res.body.order).toEqual({ orderNumber: 9 });
   });
 
   it("[SO-R6] returns 200 with deliveryMode.type so the producer can gate tracking UI", async () => {
@@ -294,5 +314,35 @@ describe("GET /api/v1/producers/me/sub-orders/:id — get own SubOrder with line
     expect(res.status).toBe(404);
     // Must not be 403 — opaque no-leak (spec: "MUST NOT reveal ownership")
     expect(res.body.code).not.toBe("FORBIDDEN");
+  });
+
+  it("[SO-R7] cross-producer access leaks nothing — 404 body carries none of S1's numbers or parent data", async () => {
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // scenario "Cross-producer access leaks nothing" — S1 belongs to P1; P2's
+    // findFirst({ producerId: P2 }) returns null (Prisma's own filter, not a
+    // post-hoc redaction), so no field of S1 — including subOrderNumber or
+    // order.orderNumber — can ever reach the 404 body.
+    const sub = "auth0|producer002";
+    const user = makeProducerUser({
+      id: "cuid_user_002",
+      auth0Sub: sub,
+      producerId: "prod_002",
+    });
+
+    mockLoadUser(user);
+    mockedSubOrder.findFirst.mockResolvedValueOnce(null);
+
+    const res = await request
+      .get("/api/v1/producers/me/sub-orders/so_owned_by_p1")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(404);
+    expect(res.body).not.toHaveProperty("subOrderNumber");
+    expect(res.body).not.toHaveProperty("order");
+    expect(res.body).not.toHaveProperty("producerId");
+    // Only the standard RFC 7807 error envelope — no accidental data leakage.
+    expect(Object.keys(res.body).sort()).toEqual(
+      ["type", "title", "status", "detail", "code", "instance"].sort(),
+    );
   });
 });
