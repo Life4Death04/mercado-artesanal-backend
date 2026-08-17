@@ -110,7 +110,25 @@ vi.mock("@/modules/notifications/services/notifications.service", () => ({
   }),
 }));
 
+// ---------------------------------------------------------------------------
+// Mock the public-number allocator (order-public-numbers WU2) — the fake
+// `tx` from `makeMockTx()` has no `tx.$queryRaw` delegate the REAL
+// allocateOrderNumber/allocateSubOrderNumber would call. Its own raw-SQL
+// INSERT...ON CONFLICT behavior has dedicated real-Postgres coverage in
+// `tests/integration/orders.test.ts` [O7-*]; this file only proves that
+// createOrderFromPayment calls the allocator on the SUPPLIED tx and wires
+// the returned numbers into the creates (design "Data Flow").
+// ---------------------------------------------------------------------------
+vi.mock("@/modules/orders/services/order-number-allocator", () => ({
+  allocateOrderNumber: vi.fn().mockResolvedValue(1),
+  allocateSubOrderNumber: vi.fn().mockResolvedValue(1),
+}));
+
 import { decrementStock, restockProduct } from "@/modules/inventory/services/inventory.service";
+import {
+  allocateOrderNumber,
+  allocateSubOrderNumber,
+} from "@/modules/orders/services/order-number-allocator";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
@@ -125,6 +143,8 @@ import { prisma } from "@/shared/utils/prisma";
 
 const mockedDecrementStock = vi.mocked(decrementStock);
 const mockedRestockProduct = vi.mocked(restockProduct);
+const mockedAllocateOrderNumber = vi.mocked(allocateOrderNumber);
+const mockedAllocateSubOrderNumber = vi.mocked(allocateSubOrderNumber);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedOrder = vi.mocked(prisma).order as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -356,6 +376,9 @@ describe("ordersService.createOrderFromPayment — idempotency pre-check [CO-IDE
     expect(tx.payment.create).not.toHaveBeenCalled();
     expect(tx.order.create).not.toHaveBeenCalled();
     expect(tx.cartItem.findMany).not.toHaveBeenCalled();
+    // order-public-numbers WU2: the idempotent no-op path never allocates —
+    // a replay must not consume a counter value for a write that never happens.
+    expect(mockedAllocateOrderNumber).not.toHaveBeenCalled();
   });
 });
 
@@ -656,6 +679,73 @@ describe("ordersService.createOrderFromPayment — exact D4 step order [CO-ORDER
     expect(calls[calls.length - 1]).toBe("cartItem.deleteMany");
 
     expect(calls.filter((c) => c.startsWith("decrementStock")).length).toBe(2);
+  });
+});
+
+describe("ordersService.createOrderFromPayment — public number allocation [CO-ALLOC]", () => {
+  it("[CO-ALLOC] allocates orderNumber/subOrderNumber on the supplied tx, in sorted producer order, and wires the returned values into the creates", async () => {
+    // Cart items are built in REVERSE producer order deliberately — proves
+    // the allocation/create loop sorts by producerId (design "sorted
+    // order"), not cart insertion order.
+    const producerBItem = makeCartItemForCheckout({
+      cartItemId: "item_B",
+      productId: "product_B",
+      producerId: "producer_B",
+      unitPriceSnapshot: "10.00",
+    });
+    const producerAItem = makeCartItemForCheckout();
+
+    mockedAllocateOrderNumber.mockResolvedValueOnce(7);
+    mockedAllocateSubOrderNumber.mockResolvedValueOnce(3).mockResolvedValueOnce(9);
+
+    const tx = makeMockTx({
+      cartItem: {
+        findMany: vi.fn().mockResolvedValue([
+          makeLiveCartItemRow({
+            id: "item_B",
+            productId: "product_B",
+            product: { id: "product_B", isActive: true, deletedAt: null, producer: { id: "producer_B", deletedAt: null } },
+          }),
+          makeLiveCartItemRow(),
+        ]),
+        deleteMany: vi.fn().mockResolvedValue({ count: 2 }),
+      },
+      deliveryMode: {
+        findMany: vi
+          .fn()
+          .mockResolvedValue([makeDeliveryModeRow(), makeDeliveryModeRow({ id: "dm_B", producerId: "producer_B" })]),
+      },
+    });
+
+    const cartView = makeCartView([producerBItem, producerAItem], { userId: "user_007" });
+    await ordersService.createOrderFromPayment(
+      "pi_alloc",
+      cartView,
+      [
+        { producerId: "producer_A", deliveryModeId: "dm_A" },
+        { producerId: "producer_B", deliveryModeId: "dm_B" },
+      ],
+      tx,
+    );
+
+    expect(mockedAllocateOrderNumber).toHaveBeenCalledTimes(1);
+    expect(mockedAllocateOrderNumber).toHaveBeenCalledWith("user_007", tx);
+    expect(tx.order.create.mock.calls[0]![0].data.orderNumber).toBe(7);
+
+    expect(mockedAllocateSubOrderNumber).toHaveBeenCalledTimes(2);
+    expect(mockedAllocateSubOrderNumber.mock.calls[0]).toEqual(["producer_A", tx]);
+    expect(mockedAllocateSubOrderNumber.mock.calls[1]).toEqual(["producer_B", tx]);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const subOrderCallA = tx.subOrder.create.mock.calls.find(
+      (c: any) => c[0].data.producerId === "producer_A",
+    )![0];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const subOrderCallB = tx.subOrder.create.mock.calls.find(
+      (c: any) => c[0].data.producerId === "producer_B",
+    )![0];
+    expect(subOrderCallA.data.subOrderNumber).toBe(3);
+    expect(subOrderCallB.data.subOrderNumber).toBe(9);
   });
 });
 
@@ -1085,6 +1175,9 @@ describe("ordersService.createOrderFromPayment — P2002 bubbles uncaught [CO-P2
     expect(tx.order.create).not.toHaveBeenCalled();
     expect(tx.subOrder.create).not.toHaveBeenCalled();
     expect(mockedDecrementStock).not.toHaveBeenCalled();
+    // order-public-numbers WU2: payment.create throws BEFORE the
+    // orderNumber allocation that follows it (step 5) ever runs.
+    expect(mockedAllocateOrderNumber).not.toHaveBeenCalled();
   });
 });
 

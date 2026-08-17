@@ -418,6 +418,14 @@ afterAll(async () => {
     await db.subOrder.deleteMany({ where: { id: { in: subOrderIds } } });
     await db.order.deleteMany({ where: { id: { in: orderIds } } });
     await db.payment.deleteMany({ where: { id: { in: paymentIds } } });
+    // order-public-numbers WU2 [O7]: every createOrderFromPayment call in
+    // this file now allocates through the REAL counter tables — clean them
+    // scoped to our own actors so a re-run starts each fresh actor at 1
+    // again (upsert reuses the SAME userId/producerId across runs).
+    await db.orderNumberCounter.deleteMany({ where: { userId: { in: cleanupUserIds } } });
+    await db.subOrderNumberCounter.deleteMany({
+      where: { producerId: { in: cleanupProducerIds } },
+    });
     await db.cartItem.deleteMany({ where: { cart: { userId: { in: cleanupUserIds } } } });
     await db.cart.deleteMany({ where: { userId: { in: cleanupUserIds } } });
     await db.deliveryMode.deleteMany({ where: { producerId: { in: cleanupProducerIds } } });
@@ -1036,6 +1044,136 @@ describe("createOrderFromPayment — delivery-cost snapshot stays frozen after a
       const afterUpdate = await db.subOrder.findUniqueOrThrow({ where: { id: subOrderId } });
       expect(afterUpdate.shippingCostSnapshot.toFixed(2)).toBe("4.00");
       expect(afterUpdate.shippingCostSnapshot.toFixed(2)).not.toBe("9.99");
+    },
+    20000,
+  );
+});
+
+// ===========================================================================
+// [O7] Actor-scoped public number allocation (order-public-numbers WU2,
+// design "Technical Approach" — allocateOrderNumber/allocateSubOrderNumber
+// run in-tx via order-number-allocator.ts; committed/rolled-back WITH the
+// aggregate they number). Real Postgres — proves the runtime behavior the
+// disposable-DB migration suite [order-public-numbers.migration.test.ts]
+// cannot: fresh-actor start, concurrent distinctness, rollback-permits-reuse.
+// ===========================================================================
+
+describe("createOrderFromPayment — actor-scoped public number allocation [O7]", () => {
+  it(
+    "[O7ac] a fresh scope starts at 1, and a rolled-back allocation is available for later reuse — no mandatory gap",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("o7ac", "B10000121");
+      const consumer = await seedConsumer("o7ac");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const productHealthy = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "O7ac Healthy", description: "d", price: 2.0, stock: 10, isActive: true },
+      });
+      const productShort = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "O7ac Short", description: "d", price: 2.0, stock: 1, isActive: true },
+      });
+
+      await cartService.addItem(consumer.id, productHealthy.id, 1);
+      const cart = await db.cart.findUniqueOrThrow({ where: { userId: consumer.id } });
+      // Bypass addItem's own pre-check (mirrors [O2]) — quantity=5 against
+      // stock=1 only trips decrementStock's post-decrement guard, forcing
+      // the ENTIRE tx (order.create + subOrder.create + both allocations)
+      // to roll back AFTER the numbers were already allocated.
+      await db.cartItem.create({
+        data: { cartId: cart.id, productId: productShort.id, quantity: 5, unitPriceSnapshot: 2.0 },
+      });
+      const cartView = await cartService.getCartForCheckout(consumer.id);
+
+      await expect(
+        prisma.$transaction((tx) =>
+          ordersService.createOrderFromPayment(
+            "pi_o7ac_rollback",
+            cartView,
+            [{ producerId: producer.id, deliveryModeId: dm.id }],
+            tx,
+          ),
+        ),
+      ).rejects.toBeInstanceOf(InsufficientStockError);
+
+      // Drop the failing line and retry with only the healthy one — spec
+      // scenario "Rolled-back creation may release number": this is the
+      // FIRST record ever COMMITTED for this fresh scope, so it also proves
+      // "New actors begin independently at one" in the same assertion.
+      await db.cartItem.deleteMany({ where: { cartId: cart.id, productId: productShort.id } });
+      const retryCartView = await cartService.getCartForCheckout(consumer.id);
+      const { order: retried } = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_o7ac_retry",
+          retryCartView,
+          [{ producerId: producer.id, deliveryModeId: dm.id }],
+          tx,
+        ),
+      );
+
+      const order = await db.order.findUniqueOrThrow({ where: { id: retried.id } });
+      const subOrder = await db.subOrder.findFirstOrThrow({ where: { orderId: retried.id } });
+      expect(order.orderNumber).toBe(1);
+      expect(subOrder.subOrderNumber).toBe(1);
+    },
+    20000,
+  );
+
+  it(
+    "[O7b] two consumers ordering from the SAME producer concurrently receive distinct sequential subOrderNumbers",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("o7b", "B10000122");
+      const consumerX = await seedConsumer("o7bx");
+      const consumerY = await seedConsumer("o7by");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const productX = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "O7b Product X", description: "d", price: 2.0, stock: 10, isActive: true },
+      });
+      const productY = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "O7b Product Y", description: "d", price: 2.0, stock: 10, isActive: true },
+      });
+
+      await cartService.addItem(consumerX.id, productX.id, 1);
+      await cartService.addItem(consumerY.id, productY.id, 1);
+      const cartViewX = await cartService.getCartForCheckout(consumerX.id);
+      const cartViewY = await cartService.getCartForCheckout(consumerY.id);
+
+      const [{ order: orderX }, { order: orderY }] = await Promise.all([
+        prisma.$transaction((tx) =>
+          ordersService.createOrderFromPayment(
+            "pi_o7b_x",
+            cartViewX,
+            [{ producerId: producer.id, deliveryModeId: dm.id }],
+            tx,
+          ),
+        ),
+        prisma.$transaction((tx) =>
+          ordersService.createOrderFromPayment(
+            "pi_o7b_y",
+            cartViewY,
+            [{ producerId: producer.id, deliveryModeId: dm.id }],
+            tx,
+          ),
+        ),
+      ]);
+
+      const subOrderX = await db.subOrder.findFirstOrThrow({ where: { orderId: orderX.id } });
+      const subOrderY = await db.subOrder.findFirstOrThrow({ where: { orderId: orderY.id } });
+
+      expect(subOrderX.subOrderNumber).not.toBe(subOrderY.subOrderNumber);
+      expect(new Set([subOrderX.subOrderNumber, subOrderY.subOrderNumber])).toEqual(new Set([1, 2]));
     },
     20000,
   );

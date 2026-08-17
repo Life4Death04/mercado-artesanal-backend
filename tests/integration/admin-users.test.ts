@@ -212,11 +212,26 @@ async function seedSubOrderForProducer(
     data: { producerId, type: "PICKUP", cost: 0, isActive: true, pickupLocation: "x" },
   });
   const payment = await db.payment.create({ data: { status: "SUCCEEDED", amount: 10.0 } });
+  // order-public-numbers WU1/WU2: orderNumber/subOrderNumber are now
+  // DB-required. This fixture writes Order/SubOrder directly (not through
+  // the allocator-wired orders.service.ts) and is called REPEATEDLY for the
+  // SAME producerId/consumerId, so count+1 derives a scope-unique value per
+  // call — narrow type-safety compatibility only, unrelated to this suite's
+  // admin-users behavior under test.
+  const orderNumber = (await db.order.count({ where: { userId: consumerId } })) + 1;
   const order = await db.order.create({
-    data: { userId: consumerId, paymentId: payment.id, totalAmount: 10.0 },
+    data: { userId: consumerId, paymentId: payment.id, totalAmount: 10.0, orderNumber },
   });
+  const subOrderNumber = (await db.subOrder.count({ where: { producerId } })) + 1;
   const subOrder = await db.subOrder.create({
-    data: { orderId: order.id, producerId, deliveryModeId: dm.id, status, shippingCostSnapshot: 0 },
+    data: {
+      orderId: order.id,
+      producerId,
+      deliveryModeId: dm.id,
+      status,
+      shippingCostSnapshot: 0,
+      subOrderNumber,
+    },
   });
   return { dm, payment, order, subOrder };
 }

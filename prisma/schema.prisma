@@ -405,12 +405,19 @@ model Order {
   /// the DB level. (orders design Decision 2 — compute-on-read, sole authority
   /// is the deriveOrderStatus() function applied on every list/detail/cancel read.)
   status      OrderStatus @default(PENDING)
+  // order-public-numbers WU1 — non-fiscal reference, unique per userId,
+  // starting at 1. Allocated in-transaction by the WU2 allocator; this
+  // migration only establishes schema/backfill (see migration.sql for the
+  // nullable -> backfill -> constraints -> NOT NULL staging).
+  orderNumber Int         @map("order_number")
   createdAt   DateTime    @default(now()) @map("created_at")
   updatedAt   DateTime    @updatedAt @map("updated_at")
 
   payment   Payment    @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   subOrders SubOrder[]
 
+  // order-public-numbers WU1 — per-consumer scoped uniqueness invariant backstop.
+  @@unique([userId, orderNumber])
   // admin-user-management WU1 — consumer activity-count reads
   // (distinct aggregate Orders owned by a user) and the account-lifecycle
   // checkout/deletion race guard both filter by userId.
@@ -447,6 +454,9 @@ model SubOrder {
   shipToPostalCode     String?        @map("ship_to_postal_code")
   shipToProvince       String?        @map("ship_to_province")
   shipToCountry        String?        @map("ship_to_country")
+  // order-public-numbers WU1 — non-fiscal reference, unique per producerId,
+  // starting at 1. Mirrors Order.orderNumber exactly (see that field's comment).
+  subOrderNumber       Int            @map("sub_order_number")
   createdAt            DateTime       @default(now()) @map("created_at")
   updatedAt            DateTime       @updatedAt @map("updated_at")
 
@@ -457,9 +467,38 @@ model SubOrder {
   // admin-incidents WU1 — back-relation for incidents targeting this sub-order.
   incidents    Incident[]
 
+  // order-public-numbers WU1 — per-producer scoped uniqueness invariant backstop.
+  @@unique([producerId, subOrderNumber])
   @@index([producerId, status])
   @@index([orderId])
   @@map("sub_orders")
+}
+
+// order-public-numbers WU1 — allocation counters, keyed by actor id (design
+// "Architecture Decisions" — selected over mutable counters on
+// users/producers to avoid coupling order writes to identity records). No
+// FK to User/Producer, same additive pattern as PendingCheckout: pure
+// operational state. last_number starts at 1 and increments atomically via
+// the WU2 allocator's `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`
+// inside the order-creation transaction, so it commits/rolls back with the
+// aggregate it numbers. This migration seeds each existing actor's counter
+// at its backfilled maximum; actors without history get no row (allocate 1).
+
+/// Per-consumer allocation counter for Order.orderNumber.
+model OrderNumberCounter {
+  userId     String @id @map("user_id")
+  lastNumber Int    @map("last_number")
+
+  @@map("order_number_counters")
+}
+
+/// Per-producer allocation counter for SubOrder.subOrderNumber. Mirrors
+/// OrderNumberCounter exactly.
+model SubOrderNumberCounter {
+  producerId String @id @map("producer_id")
+  lastNumber Int    @map("last_number")
+
+  @@map("sub_order_number_counters")
 }
 
 /// Immutable order line — historical price snapshot at the time of purchase.
