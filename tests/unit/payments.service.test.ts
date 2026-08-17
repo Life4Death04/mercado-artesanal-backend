@@ -79,9 +79,15 @@ vi.mock("@/shared/utils/prisma", () => ({
     pendingCheckout: {
       updateMany: vi.fn(),
       upsert: vi.fn(),
+      // order-public-numbers WU3 — getPaymentStatus's PROCESSING branch.
+      findFirst: vi.fn(),
     },
     // checkout-contracts WU4 (BE-3) — addressId ownership resolution.
     address: {
+      findFirst: vi.fn(),
+    },
+    // order-public-numbers WU3 — getPaymentStatus reads Payment + nested Order.
+    payment: {
       findFirst: vi.fn(),
     },
     $transaction: vi.fn(),
@@ -149,6 +155,8 @@ const mockedDeliveryMode = vi.mocked(prisma).deliveryMode as any;
 const mockedPendingCheckout = vi.mocked(prisma).pendingCheckout as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedAddress = vi.mocked(prisma).address as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedPayment = vi.mocked(prisma).payment as any;
 const mockedCreatePaymentIntent = vi.mocked(stripeClient.createPaymentIntent);
 
 // ---------------------------------------------------------------------------
@@ -732,4 +740,100 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
     expect(firstKey).toBeTruthy();
     expect(secondKey).not.toBe(firstKey);
   });
+});
+
+// ---------------------------------------------------------------------------
+// order-public-numbers WU3 (PR 2, Phase 3) — payments.service.getPaymentStatus
+// `orderNumber` propagation (design "Consumer/payment response contracts",
+// spec scenario "Payment status aligns both identifiers": SUCCEEDED-with-order
+// returns (orderId, orderNumber) TOGETHER; every other branch returns
+// (orderId: null, orderNumber: null) — never one without the other.
+// ---------------------------------------------------------------------------
+
+describe("payments.service.getPaymentStatus — orderNumber propagation (order-public-numbers WU3)", () => {
+  it("[GPS-SELECT] requests both id and orderNumber on the nested order include", async () => {
+    mockedPayment.findFirst.mockResolvedValueOnce(null);
+    mockedPendingCheckout.findFirst.mockResolvedValueOnce(null);
+
+    await paymentsService.getPaymentStatus("user_001", "pi_select");
+
+    expect(mockedPayment.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: { order: { select: { id: true, orderNumber: true } } },
+      }),
+    );
+  });
+
+  it("[GPS-NULL] no Payment row and no PendingCheckout -> returns null", async () => {
+    mockedPayment.findFirst.mockResolvedValueOnce(null);
+    mockedPendingCheckout.findFirst.mockResolvedValueOnce(null);
+
+    const result = await paymentsService.getPaymentStatus("user_001", "pi_absent");
+
+    expect(result).toBeNull();
+  });
+
+  it("[GPS-PROCESSING] no Payment row but an owner-bound PendingCheckout -> PROCESSING, orderId/orderNumber both null", async () => {
+    mockedPayment.findFirst.mockResolvedValueOnce(null);
+    mockedPendingCheckout.findFirst.mockResolvedValueOnce({ id: "pc_1" });
+
+    const result = await paymentsService.getPaymentStatus("user_001", "pi_processing");
+
+    expect(result).toEqual({
+      state: "PROCESSING",
+      orderId: null,
+      orderNumber: null,
+      code: "PAYMENT_PROCESSING",
+    });
+  });
+
+  it("[GPS-SUCCEEDED] SUCCEEDED payment WITH an order -> orderId AND orderNumber together", async () => {
+    mockedPayment.findFirst.mockResolvedValueOnce({
+      status: "SUCCEEDED",
+      order: { id: "order_cuid_1", orderNumber: 7 },
+    });
+
+    const result = await paymentsService.getPaymentStatus("user_001", "pi_succeeded");
+
+    expect(result).toEqual({
+      state: "SUCCEEDED",
+      orderId: "order_cuid_1",
+      orderNumber: 7,
+      code: "PAYMENT_SUCCEEDED",
+    });
+  });
+
+  it("[GPS-SUCCEEDED-NO-ORDER] SUCCEEDED payment with no order yet -> PENDING/NEEDS_REVIEW, orderId/orderNumber both null", async () => {
+    mockedPayment.findFirst.mockResolvedValueOnce({ status: "SUCCEEDED", order: null });
+
+    const result = await paymentsService.getPaymentStatus("user_001", "pi_needs_review");
+
+    expect(result).toEqual({
+      state: "PENDING",
+      orderId: null,
+      orderNumber: null,
+      code: "PAYMENT_NEEDS_REVIEW",
+    });
+  });
+
+  it.each([
+    ["FAILED", "FAILED", "PAYMENT_FAILED"],
+    ["CANCELED", "CANCELED", "PAYMENT_CANCELED"],
+    ["PENDING", "PENDING", "PAYMENT_NEEDS_REVIEW"],
+    ["REFUNDED", "PENDING", "PAYMENT_NEEDS_REVIEW"],
+  ] as const)(
+    "[GPS-%s] %s payment -> orderId AND orderNumber are both null",
+    async (paymentStatus, expectedState, expectedCode) => {
+      mockedPayment.findFirst.mockResolvedValueOnce({ status: paymentStatus, order: null });
+
+      const result = await paymentsService.getPaymentStatus("user_001", `pi_${paymentStatus}`);
+
+      expect(result).toEqual({
+        state: expectedState,
+        orderId: null,
+        orderNumber: null,
+        code: expectedCode,
+      });
+    },
+  );
 });

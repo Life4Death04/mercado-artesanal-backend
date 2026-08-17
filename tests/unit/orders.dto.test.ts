@@ -95,6 +95,7 @@ describe("Cycle 4 orders WU1 subclasses — typeSlug derivation invariant", () =
 function makeOrderSummaryRow(overrides: Partial<OrderSummaryRow> = {}): OrderSummaryRow {
   return {
     id: "order_001",
+    orderNumber: 7,
     createdAt: new Date("2026-07-28T10:00:00.000Z"),
     totalAmount: new Prisma.Decimal("24.00"),
     status: "PENDING",
@@ -104,13 +105,14 @@ function makeOrderSummaryRow(overrides: Partial<OrderSummaryRow> = {}): OrderSum
 }
 
 describe("mapOrderSummaryView", () => {
-  it("[DTO-SUM-1] maps ISO createdAt, 2dp Decimal totalAmount, and passes status/producerCount through", () => {
+  it("[DTO-SUM-1] maps ISO createdAt, 2dp Decimal totalAmount, and passes orderNumber/status/producerCount through", () => {
     const row = makeOrderSummaryRow();
 
     const view = mapOrderSummaryView(row);
 
     expect(view).toEqual({
       id: "order_001",
+      orderNumber: 7,
       createdAt: "2026-07-28T10:00:00.000Z",
       totalAmount: "24.00",
       status: "PENDING",
@@ -118,9 +120,10 @@ describe("mapOrderSummaryView", () => {
     });
   });
 
-  it("[DTO-SUM-2] triangulation — a different row (FULFILLED, producerCount 1, different total) maps independently", () => {
+  it("[DTO-SUM-2] triangulation — a different row (FULFILLED, producerCount 1, different total, different orderNumber) maps independently", () => {
     const row = makeOrderSummaryRow({
       id: "order_002",
+      orderNumber: 3,
       createdAt: new Date("2026-01-15T00:00:00.000Z"),
       totalAmount: new Prisma.Decimal("9.5"),
       status: "FULFILLED",
@@ -131,6 +134,7 @@ describe("mapOrderSummaryView", () => {
 
     expect(view).toEqual({
       id: "order_002",
+      orderNumber: 3,
       createdAt: "2026-01-15T00:00:00.000Z",
       totalAmount: "9.50",
       status: "FULFILLED",

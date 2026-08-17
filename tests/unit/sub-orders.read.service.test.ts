@@ -64,8 +64,19 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
     status: "pending" as SubOrderStatus,
     shippingCostSnapshot: new Decimal("5.00"),
     trackingNumber: null,
+    shipToLine1: null,
+    shipToLine2: null,
+    shipToCity: null,
+    shipToPostalCode: null,
+    shipToProvince: null,
+    shipToCountry: null,
+    // order-public-numbers Phase 4 (PR 3) — subOrderNumber is a raw SubOrder
+    // column; order.orderNumber is resolved via the new `order` include.
+    subOrderNumber: 4,
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
+    deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+    order: { orderNumber: 9 },
     orderLines: [],
     ...overrides,
   };
@@ -91,6 +102,54 @@ describe("subOrdersService.findAll", () => {
     expect(result).toHaveLength(2);
     expect(result[0]!.producerId).toBe("prod_001");
     expect(result[1]!.producerId).toBe("prod_001");
+  });
+
+  it("[SO-VIEW-1] maps to the explicit SubOrderListItemView — subOrderNumber and order.orderNumber, no order.userId", async () => {
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // scenario "Producer reads public references" — P1 owns S1(#4) under O1(#9).
+    const so = makeSubOrder({
+      id: "so_001",
+      subOrderNumber: 4,
+      order: { orderNumber: 9 },
+      orderLines: [
+        {
+          id: "ol_001",
+          productId: "prod_item_001",
+          quantity: 2,
+          unitPriceSnapshot: new Decimal("10.00"),
+        },
+      ],
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.subOrder as any).findMany.mockResolvedValueOnce([so]);
+
+    const result = await subOrdersService.findAll("prod_001");
+
+    expect(result[0]).toEqual({
+      id: "so_001",
+      orderId: "order_001",
+      producerId: "prod_001",
+      deliveryModeId: "dm_001",
+      status: "pending",
+      shippingCostSnapshot: "5.00",
+      trackingNumber: null,
+      shipToLine1: null,
+      shipToLine2: null,
+      shipToCity: null,
+      shipToPostalCode: null,
+      shipToProvince: null,
+      shipToCountry: null,
+      subOrderNumber: 4,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      order: { orderNumber: 9 },
+      orderLines: [
+        { id: "ol_001", productId: "prod_item_001", quantity: 2, unitPriceSnapshot: "10.00" },
+      ],
+    });
+    // order.userId must never appear on the wire — the mapper never reads it.
+    expect(result[0]).not.toHaveProperty("order.userId");
   });
 
   it("forwards status filter to prisma when provided — returns only matching SubOrders", async () => {
@@ -141,6 +200,23 @@ describe("subOrdersService.findAll", () => {
       select: { type: true },
     });
   });
+
+  it("[SO-VIEW-2] includes order.orderNumber in the query so the response can expose order.orderNumber", async () => {
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.subOrder as any).findMany.mockResolvedValueOnce([]);
+
+    await subOrdersService.findAll("prod_001");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const callArgs = (mockedPrisma.subOrder as any).findMany.mock.calls[0][0] as Record<
+      string,
+      unknown
+    >;
+    expect((callArgs.include as Record<string, unknown>).order).toEqual({
+      select: { orderNumber: true },
+    });
+  });
 });
 
 // ===========================================================================
@@ -170,24 +246,57 @@ describe("subOrdersService.findById", () => {
     expect(result.orderLines).toHaveLength(1);
   });
 
+  it("[SO-VIEW-3] maps to the explicit SubOrderListItemView — subOrderNumber and order.orderNumber, no order.userId", async () => {
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // scenario "Producer reads public references" — P1 owns S1(#4) under O1(#9).
+    const so = makeSubOrder({ id: "so_001", subOrderNumber: 4, order: { orderNumber: 9 } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.subOrder as any).findFirst.mockResolvedValueOnce(so);
+
+    const result = await subOrdersService.findById("prod_001", "so_001");
+
+    expect(result).toEqual({
+      id: "so_001",
+      orderId: "order_001",
+      producerId: "prod_001",
+      deliveryModeId: "dm_001",
+      status: "pending",
+      shippingCostSnapshot: "5.00",
+      trackingNumber: null,
+      shipToLine1: null,
+      shipToLine2: null,
+      shipToCity: null,
+      shipToPostalCode: null,
+      shipToProvince: null,
+      shipToCountry: null,
+      subOrderNumber: 4,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      order: { orderNumber: 9 },
+      orderLines: [],
+    });
+    expect(result).not.toHaveProperty("order.userId");
+  });
+
   it("throws NotFoundError when SubOrder belongs to another producer (404-no-leak)", async () => {
     // Spec: order-fulfillment scenario "Cross-producer read returns 404"
     // Service uses findFirst({ where: { id, producerId } }) → null for wrong producer
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.subOrder as any).findFirst.mockResolvedValueOnce(null);
 
-    await expect(
-      subOrdersService.findById("prod_attacker", "so_001"),
-    ).rejects.toThrow(NotFoundError);
+    await expect(subOrdersService.findById("prod_attacker", "so_001")).rejects.toThrow(
+      NotFoundError,
+    );
   });
 
   it("throws NotFoundError when SubOrder id does not exist (404-no-leak)", async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.subOrder as any).findFirst.mockResolvedValueOnce(null);
 
-    await expect(
-      subOrdersService.findById("prod_001", "nonexistent_id"),
-    ).rejects.toThrow(NotFoundError);
+    await expect(subOrdersService.findById("prod_001", "nonexistent_id")).rejects.toThrow(
+      NotFoundError,
+    );
   });
 
   it("includes deliveryMode.type in the query so producer reads can gate tracking behavior", async () => {
@@ -207,6 +316,24 @@ describe("subOrdersService.findById", () => {
     >;
     expect((callArgs.include as Record<string, unknown>).deliveryMode).toEqual({
       select: { type: true },
+    });
+  });
+
+  it("[SO-VIEW-4] includes order.orderNumber in the query so the response can expose order.orderNumber", async () => {
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    const so = makeSubOrder();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.subOrder as any).findFirst.mockResolvedValueOnce(so);
+
+    await subOrdersService.findById("prod_001", "so_001");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const callArgs = (mockedPrisma.subOrder as any).findFirst.mock.calls[0][0] as Record<
+      string,
+      unknown
+    >;
+    expect((callArgs.include as Record<string, unknown>).order).toEqual({
+      select: { orderNumber: true },
     });
   });
 });

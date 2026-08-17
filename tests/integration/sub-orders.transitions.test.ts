@@ -153,10 +153,21 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
     status: "pending" as SubOrderStatus,
     shippingCostSnapshot: new Decimal("5.00"),
     trackingNumber: null,
+    shipToLine1: null,
+    shipToLine2: null,
+    shipToCity: null,
+    shipToPostalCode: null,
+    shipToProvince: null,
+    shipToCountry: null,
+    // order-public-numbers Phase 4 (PR 3) — subOrderNumber is a raw column.
+    subOrderNumber: 4,
     deliveryMode: { type: "SHIPPING_FLAT_RATE" },
     // Cycle 5 notifications (design "Emission wiring", Phase 5): the step-1
-    // findFirst now includes `order: { select: { userId: true } } }`.
-    order: { userId: OWNER_USER_ID },
+    // findFirst now includes `order: { select: { userId: true, orderNumber:
+    // true } } }`. `userId` is the notification recipient (never propagated
+    // to the response); `orderNumber` (order-public-numbers Phase 4) is
+    // propagated to `subOrder.order.orderNumber`.
+    order: { userId: OWNER_USER_ID, orderNumber: 9 },
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
@@ -255,6 +266,11 @@ describe("PATCH /api/v1/producers/me/sub-orders/:id — state machine transition
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("preparing");
     expect(res.body.id).toBe("so_001");
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // scenario "Transition returns the same contract" — subOrderNumber +
+    // order.orderNumber survive the transition; order.userId never leaks.
+    expect(res.body.subOrderNumber).toBe(4);
+    expect(res.body.order).toEqual({ orderNumber: 9 });
   });
 
   it("[SO-T2] returns 409 INVALID_ORDER_TRANSITION on invalid transition (pending → delivered)", async () => {
@@ -322,6 +338,12 @@ describe("PATCH /api/v1/producers/me/sub-orders/:id — state machine transition
     // [N-EMIT-NOOP-NO-DUP] (Cycle 5 notifications): a no-op transition must
     // not emit any notification.
     expect(mockedCreateNotification).not.toHaveBeenCalled();
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // scenario "Transition returns the same contract" — the no-op path MUST
+    // return the SAME subOrderNumber/order.orderNumber shape, no order.userId.
+    expect(res.body.subOrderNumber).toBe(4);
+    expect(res.body.order).toEqual({ orderNumber: 9 });
+    expect(res.body).not.toHaveProperty("order.userId");
   });
 
   it("[SO-T4] returns 422 VALIDATION_FAILED when a PICKUP sub-order carries a trackingNumber", async () => {
@@ -466,6 +488,37 @@ describe("PATCH /api/v1/producers/me/sub-orders/:id — state machine transition
     expect(res.body.code).not.toBe("FORBIDDEN");
   });
 
+  it("[SO-T8] cross-producer transition attempt leaks nothing — 404 body carries none of S1's numbers or parent data", async () => {
+    // Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+    // scenario "Cross-producer access leaks nothing" — P2 PATCHing P1's
+    // SubOrder gets the SAME opaque 404 as a read; the tx's own
+    // findFirst({ producerId: P2 }) returns null BEFORE any mapping runs,
+    // so no field of S1 (subOrderNumber, order.orderNumber, order.userId)
+    // can ever reach the response.
+    const sub = "auth0|producer002";
+    const user = makeProducerUser({
+      id: "cuid_user_002",
+      auth0Sub: sub,
+      producerId: "prod_002",
+    });
+
+    mockLoadUser(user);
+    mockTransition(null);
+
+    const res = await request
+      .patch("/api/v1/producers/me/sub-orders/so_owned_by_p1")
+      .set("X-Test-Auth", authHeader({ sub }))
+      .send({ status: "preparing" });
+
+    expect(res.status).toBe(404);
+    expect(res.body).not.toHaveProperty("subOrderNumber");
+    expect(res.body).not.toHaveProperty("order");
+    expect(res.body).not.toHaveProperty("producerId");
+    expect(Object.keys(res.body).sort()).toEqual(
+      ["type", "title", "status", "detail", "code", "instance"].sort(),
+    );
+  });
+
   it("[SO-T-unauth] returns 401 when no auth header", async () => {
     const res = await request
       .patch("/api/v1/producers/me/sub-orders/so_001")
@@ -508,7 +561,11 @@ describe("PATCH /api/v1/producers/me/sub-orders/:id — notification emission (C
       toEmail: OWNER_EMAIL,
     });
     expect(sendSpy).toHaveBeenCalledOnce();
-    expect(sendSpy).toHaveBeenCalledWith({ to: OWNER_EMAIL, subject: "mock subject", body: "mock body" });
+    expect(sendSpy).toHaveBeenCalledWith({
+      to: OWNER_EMAIL,
+      subject: "mock subject",
+      body: "mock body",
+    });
 
     sendSpy.mockRestore();
   });

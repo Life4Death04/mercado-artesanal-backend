@@ -94,3 +94,74 @@ export const PatchSubOrderBodySchema = strictObject({
 });
 
 export type PatchSubOrderBody = z.infer<typeof PatchSubOrderBodySchema>;
+
+// ---------------------------------------------------------------------------
+// Response views — explicit producer-facing SubOrder shape
+// ---------------------------------------------------------------------------
+
+/**
+ * order-public-numbers Phase 4 (PR 3): producer list/detail/transition
+ * responses expose `subOrderNumber` (a raw `SubOrder` column, already wire-
+ * visible) and add `order: { orderNumber }` — EXACTLY `orderNumber`, never
+ * `order.userId` (design "Interfaces / Contracts": "Producer views add
+ * subOrderNumber: number and exactly order: { orderNumber: number };
+ * internal order.userId used for notifications is mapped out.").
+ *
+ * These view interfaces replace the previous raw-Prisma-row passthrough in
+ * `sub-orders.service.ts` with an explicit mapped response, matching the
+ * `orders.dto.ts` / `orders.service.ts` convention (`OrderSummaryView` +
+ * `mapOrderSummaryView`, `SubOrderView` + `mapSubOrderView`).
+ *
+ * Spec: order-fulfillment §"Producer public reference responses" (ADDED)
+ *   scenario "Producer reads public references"
+ *   scenario "Transition returns the same contract"
+ *   scenario "Cross-producer access leaks nothing"
+ */
+export interface SubOrderOrderRefView {
+  orderNumber: number;
+}
+
+export interface SubOrderLineView {
+  id: string;
+  productId: string;
+  quantity: number;
+  unitPriceSnapshot: string;
+}
+
+/**
+ * Scalar producer SubOrder view, shared by all three producer surfaces.
+ * `transition()` returns exactly this shape (it never exposed
+ * `orderLines`/`deliveryMode` before this change either); `findAll`/
+ * `findById` extend it with `deliveryMode`/`orderLines` via
+ * `SubOrderListItemView` below.
+ */
+export interface SubOrderView {
+  id: string;
+  orderId: string;
+  producerId: string;
+  deliveryModeId: string;
+  status: SubOrderStatusValue;
+  shippingCostSnapshot: string;
+  trackingNumber: string | null;
+  shipToLine1: string | null;
+  shipToLine2: string | null;
+  shipToCity: string | null;
+  shipToPostalCode: string | null;
+  shipToProvince: string | null;
+  shipToCountry: string | null;
+  subOrderNumber: number;
+  createdAt: string;
+  updatedAt: string;
+  order: SubOrderOrderRefView;
+}
+
+/**
+ * `findAll`/`findById` list/detail view — adds `deliveryMode.type` (order-
+ * fulfillment "Consumer sub-order read exposes tracking and delivery mode",
+ * ADDED — "Producer sub-order reads MUST also expose deliveryMode.type") and
+ * `orderLines` (unchanged wire fields from before this change).
+ */
+export interface SubOrderListItemView extends SubOrderView {
+  deliveryMode: { type: string };
+  orderLines: SubOrderLineView[];
+}
