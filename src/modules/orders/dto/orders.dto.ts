@@ -21,9 +21,15 @@
  * returns the same view, with no dependency on `orders.service.ts` beyond a
  * type-only import (erased at compile time, zero runtime coupling).
  *
+ * order-public-numbers WU3 (PR 2, Phase 3): `orderNumber` is additive on
+ * `OrderSummaryView`/`OrderSummaryRow` and `mapOrderSummaryView` passes it
+ * through unchanged — same pre-computed-by-caller pattern as `status`/
+ * `producerCount` (see below), never re-derived here.
+ *
  * Spec references:
  *   orders §"Response Shapes" — OrderSummaryView
  *   orders §"GET /pedidos returns owner-scoped summary history"
+ *   order-public-references §"Consumer/payment response contracts"
  *   design Decision 2 (deriveOrderStatus sole authority), Decision 6 (module layout)
  */
 import { Prisma } from "@prisma/client";
@@ -38,6 +44,7 @@ type DecimalValue = InstanceType<typeof Prisma.Decimal>;
 
 export interface OrderSummaryView {
   id: string;
+  orderNumber: number;
   createdAt: string;
   totalAmount: string;
   status: OrderStatusValue;
@@ -55,6 +62,7 @@ export interface OrderSummaryView {
  */
 export interface OrderSummaryRow {
   id: string;
+  orderNumber: number;
   createdAt: Date;
   totalAmount: DecimalValue;
   status: OrderStatusValue;
@@ -72,6 +80,7 @@ export interface OrderSummaryRow {
 export function mapOrderSummaryView(row: OrderSummaryRow): OrderSummaryView {
   return {
     id: row.id,
+    orderNumber: row.orderNumber,
     createdAt: row.createdAt.toISOString(),
     totalAmount: row.totalAmount.toFixed(2),
     status: row.status,

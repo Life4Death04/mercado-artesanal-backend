@@ -115,6 +115,7 @@ export interface SubOrderView {
 
 export interface OrderDetailView {
   id: string;
+  orderNumber: number;
   createdAt: string;
   totalAmount: string;
   status: OrderStatusValue;
@@ -205,6 +206,7 @@ interface ExistingSubOrderRow {
 
 interface ExistingOrderRow {
   id: string;
+  orderNumber: number;
   createdAt: Date;
   totalAmount: DecimalValue;
   subOrders: ExistingSubOrderRow[];
@@ -240,6 +242,7 @@ function mapExistingOrderDetailView(
   const subOrders = order.subOrders.map(mapSubOrderView);
   return {
     id: order.id,
+    orderNumber: order.orderNumber,
     createdAt: order.createdAt.toISOString(),
     totalAmount: order.totalAmount.toFixed(2),
     status: deriveOrderStatus(subOrders.map((s) => s.status)),
@@ -695,6 +698,7 @@ export async function createOrderFromPayment(
   return {
     order: {
       id: order.id,
+      orderNumber: order.orderNumber,
       createdAt: order.createdAt.toISOString(),
       totalAmount: total.toFixed(2),
       status: deriveOrderStatus(subOrders.map((s) => s.status)),
@@ -731,6 +735,7 @@ export async function listOrders(userId: string): Promise<OrderSummaryView[]> {
     orderBy: { createdAt: "desc" },
     select: {
       id: true,
+      orderNumber: true,
       createdAt: true,
       totalAmount: true,
       subOrders: { select: { status: true } },
@@ -741,6 +746,7 @@ export async function listOrders(userId: string): Promise<OrderSummaryView[]> {
     const statuses = order.subOrders.map((s) => s.status);
     return mapOrderSummaryView({
       id: order.id,
+      orderNumber: order.orderNumber,
       createdAt: order.createdAt,
       totalAmount: order.totalAmount,
       status: deriveOrderStatus(statuses),

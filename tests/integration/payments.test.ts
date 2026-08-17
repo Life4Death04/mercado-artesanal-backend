@@ -1393,7 +1393,7 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R1 guards", () => {
     cleanup.providerRefs.push(providerRef);
     await db.payment.create({ data: { providerRef, userId: consumer.id, status: "FAILED", amount: 7 } });
     const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-owner-read"));
-    expect(res.body).toEqual({ state: "FAILED", orderId: null, code: "PAYMENT_FAILED" });
+    expect(res.body).toEqual({ state: "FAILED", orderId: null, orderNumber: null, code: "PAYMENT_FAILED" });
   });
 
   it("[BE2-R1-401] rejects an unauthenticated status poll", async () => {
@@ -1472,7 +1472,7 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R3 five states", () 
       .get(`/api/v1/pagos/status/${providerRef}`)
       .set("x-test-auth", consumerAuthHeaderFor("be2-intent-processing"));
     expect(status.status).toBe(200);
-    expect(status.body).toEqual({ state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" });
+    expect(status.body).toEqual({ state: "PROCESSING", orderId: null, orderNumber: null, code: "PAYMENT_PROCESSING" });
   });
 
   it("[BE2-R3-PROCESSING] returns PROCESSING for an owner-bound PendingCheckout before a Payment row exists", async (ctx) => {
@@ -1485,7 +1485,7 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R3 five states", () 
       .get(`/api/v1/pagos/status/${providerRef}`)
       .set("x-test-auth", consumerAuthHeaderFor("be2-processing"));
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" });
+    expect(res.body).toEqual({ state: "PROCESSING", orderId: null, orderNumber: null, code: "PAYMENT_PROCESSING" });
   });
 
   it("[BE2-R3-SUCCEEDED] returns SUCCEEDED with the linked order id", async (ctx) => {
@@ -1505,7 +1505,15 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R3 five states", () 
     const order = await db.order.findFirst({ where: { payment: { providerRef } } });
     const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-succeeded"));
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ state: "SUCCEEDED", orderId: order?.id, code: "PAYMENT_SUCCEEDED" });
+    // order-public-numbers WU3: SUCCEEDED-with-order returns orderId AND
+    // orderNumber TOGETHER (spec "Payment status aligns both identifiers").
+    expect(res.body).toEqual({
+      state: "SUCCEEDED",
+      orderId: order?.id,
+      orderNumber: order?.orderNumber,
+      code: "PAYMENT_SUCCEEDED",
+    });
+    expect(order?.orderNumber).toEqual(expect.any(Number));
   });
 
   it("[BE2-R3-FAILED] returns FAILED for an owner-bound failed webhook payment", async (ctx) => {
@@ -1519,7 +1527,7 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R3 five states", () 
 
     const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-failed"));
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ state: "FAILED", orderId: null, code: "PAYMENT_FAILED" });
+    expect(res.body).toEqual({ state: "FAILED", orderId: null, orderNumber: null, code: "PAYMENT_FAILED" });
     expect(consumer.id).toBeTruthy();
   });
 
@@ -1539,7 +1547,7 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R3 five states", () 
 
     const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-pending-status"));
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" });
+    expect(res.body).toEqual({ state: "PENDING", orderId: null, orderNumber: null, code: "PAYMENT_NEEDS_REVIEW" });
   });
 
   it("[BE2-R3-CANCELED] returns CANCELED for an owner-bound canceled webhook payment", async (ctx) => {
@@ -1553,7 +1561,7 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R3 five states", () 
 
     const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-canceled-status"));
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ state: "CANCELED", orderId: null, code: "PAYMENT_CANCELED" });
+    expect(res.body).toEqual({ state: "CANCELED", orderId: null, orderNumber: null, code: "PAYMENT_CANCELED" });
   });
 
   it("[BE2-R3-REFUNDED] maps a persisted refund to the documented review state", async (ctx) => {
@@ -1567,7 +1575,7 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R3 five states", () 
       .get(`/api/v1/pagos/status/${providerRef}`)
       .set("x-test-auth", consumerAuthHeaderFor("be2-refunded-status"));
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" });
+    expect(res.body).toEqual({ state: "PENDING", orderId: null, orderNumber: null, code: "PAYMENT_NEEDS_REVIEW" });
   });
 });
 
@@ -1592,7 +1600,7 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R4 pure polling", ()
 
     const first = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-pure-read"));
     const second = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-pure-read"));
-    expect(first.body).toEqual({ state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" });
+    expect(first.body).toEqual({ state: "PROCESSING", orderId: null, orderNumber: null, code: "PAYMENT_PROCESSING" });
     expect(second.body).toEqual(first.body);
     expect(await db.payment.count(ownScope)).toBe(before.payments);
     expect(await db.order.count(ownScope)).toBe(before.orders);
@@ -1606,7 +1614,7 @@ describe("GET /api/v1/pagos/status/:paymentIntentId — BE2-R4 pure polling", ()
     const providerRef = "pi_be2_redirect";
     await seedProcessingCheckout(consumer.id, providerRef);
     const res = await request.get(`/api/v1/pagos/status/${providerRef}`).set("x-test-auth", consumerAuthHeaderFor("be2-redirect"));
-    expect(res.body).toEqual({ state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" });
+    expect(res.body).toEqual({ state: "PROCESSING", orderId: null, orderNumber: null, code: "PAYMENT_PROCESSING" });
   });
 });
 
@@ -2067,5 +2075,93 @@ describe("POST /api/v1/pagos/webhook — R1-001/R3-001 fingerprint includes ship
     expect(await db.pendingCheckout.count({ where: { providerRef: providerRefFirst } })).toBe(0);
     const row = await db.pendingCheckout.findFirstOrThrow({ where: { providerRef: providerRefRetry } });
     expect(row.addressLine1).toBe("Calle Envio 1");
+  });
+});
+
+// ===========================================================================
+// order-public-numbers WU3 (PR 2, Phase 3) — GET /pagos/status/:paymentIntentId
+// orderNumber propagation, isolation, and cross-endpoint consistency (design
+// "Interfaces / Contracts", spec order-public-references §"Consumer/payment
+// response contracts" + §"Identifier, display, and isolation contract").
+// [BE2-R3-SUCCEEDED] above already proved orderId propagation at this route;
+// this block adds the orderNumber-specific proofs task 3.5 requires.
+// ===========================================================================
+
+describe("GET /api/v1/pagos/status/:paymentIntentId — order-public-numbers WU3 [OP-PAY]", () => {
+  it("[OP-PAY1] orderNumber returned here is byte-identical to the SAME order's orderNumber from GET /pedidos/:id (cross-endpoint consistency)", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    vi.clearAllMocks();
+    const { producer, deliveryMode, consumer, cartId } = await seedCheckoutReadyCart(db, cleanup, {
+      namePrefix: "op-pay1",
+      nif: "B20000501",
+    });
+    const providerRef = "pi_op_pay1_consistency";
+    cleanup.providerRefs.push(providerRef);
+    mockedConstructEvent.mockReturnValueOnce(
+      makeSucceededEvent({
+        intentId: providerRef,
+        amountCents: 700,
+        userId: consumer.id,
+        cartId,
+        deliverySelections: [{ producerId: producer.id, deliveryModeId: deliveryMode.id }],
+      }),
+    );
+    await request.post("/api/v1/pagos/webhook").set("stripe-signature", "t=1,v1=valid").send({});
+
+    const order = await db.order.findFirstOrThrow({ where: { payment: { providerRef } } });
+    expect(order.orderNumber).toEqual(expect.any(Number));
+
+    const statusRes = await request
+      .get(`/api/v1/pagos/status/${providerRef}`)
+      .set("x-test-auth", consumerAuthHeaderFor("op-pay1"));
+    expect(statusRes.status).toBe(200);
+    expect(statusRes.body).toEqual({
+      state: "SUCCEEDED",
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      code: "PAYMENT_SUCCEEDED",
+    });
+
+    const detailRes = await request
+      .get(`/api/v1/pedidos/${order.id}`)
+      .set("x-test-auth", consumerAuthHeaderFor("op-pay1"));
+    expect(detailRes.status).toBe(200);
+    // Both endpoints agree on EXACTLY the same orderNumber for the same order.
+    expect(detailRes.body.orderNumber).toBe(statusRes.body.orderNumber);
+  });
+
+  it("[OP-PAY2] cross-consumer status poll never leaks another owner's orderNumber — unowned intent stays the SAME no-leak 404", async (ctx) => {
+    if (!dbReachable) return ctx.skip();
+    const owner = await seedConsumer(db, cleanup, "op-pay2-owner");
+    const other = await seedConsumer(db, cleanup, "op-pay2-other");
+    const providerRef = "pi_op_pay2_unowned";
+    cleanup.providerRefs.push(providerRef);
+    await db.payment.create({
+      data: { providerRef, userId: owner.id, status: "FAILED", amount: 7 },
+    });
+
+    // The OWNER reading their own payment sees the real (null-orderNumber,
+    // since FAILED never has an order) status — control case.
+    const ownerRes = await request
+      .get(`/api/v1/pagos/status/${providerRef}`)
+      .set("x-test-auth", consumerAuthHeaderFor("op-pay2-owner"));
+    expect(ownerRes.status).toBe(200);
+    expect(ownerRes.body).toEqual({
+      state: "FAILED",
+      orderId: null,
+      orderNumber: null,
+      code: "PAYMENT_FAILED",
+    });
+
+    // A DIFFERENT consumer polling the SAME providerRef gets the SAME
+    // no-leak 404 as an unknown id — never a partial/degraded body leaking
+    // orderId/orderNumber existence.
+    const otherRes = await request
+      .get(`/api/v1/pagos/status/${providerRef}`)
+      .set("x-test-auth", consumerAuthHeaderFor("op-pay2-other"));
+    expect(otherRes.status).toBe(404);
+    expect(otherRes.body).toMatchObject({ code: "NOT_FOUND" });
+    expect(otherRes.body).not.toHaveProperty("orderNumber");
+    void other;
   });
 });

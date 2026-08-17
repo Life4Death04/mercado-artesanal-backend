@@ -57,9 +57,18 @@ export type CreatePaymentIntentBody = z.infer<typeof CreatePaymentIntentSchema>;
 
 export type PaymentProcessingState = "PROCESSING" | "SUCCEEDED" | "FAILED" | "PENDING" | "CANCELED";
 
+/**
+ * order-public-numbers WU3 (PR 2, Phase 3): `orderNumber` is additive here —
+ * retains `orderId` (CUID, still the sole identifier) and returns the
+ * consumer-scoped `orderNumber`, or `null` whenever `orderId` is `null` (no
+ * order exists yet for this payment). Never a formatted string.
+ *
+ * Spec: order-public-references §"Consumer/payment response contracts"
+ */
 export interface PaymentStatusView {
   state: PaymentProcessingState;
   orderId: string | null;
+  orderNumber: number | null;
   code: string;
 }
 

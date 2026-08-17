@@ -1874,3 +1874,228 @@ describe("cancelOrder — producer-wins count-guard: concurrent transition rejec
     20000,
   );
 });
+
+// ===========================================================================
+// order-public-numbers WU3 (PR 2, Phase 3) — consumer/payment response
+// propagation, real Postgres + Supertest. [O7]/[OH] above already proved the
+// SERVICE-level allocator and detail/list mapping; this block proves the
+// HTTP-level contract additions (design "Interfaces / Contracts", spec
+// order-public-references §"Consumer/payment response contracts" +
+// §"Identifier, display, and isolation contract"):
+//
+//   [OP1] GET /pedidos and /pedidos/:id expose numeric orderNumber; TWO
+//         different consumers each start independently at 1 (actor-scoped
+//         isolation, proven at the HTTP surface, not just the allocator).
+//   [OP2] cancelling an order never frees/reuses its orderNumber — the SAME
+//         consumer's NEXT order after a cancellation gets the NEXT number.
+//   [OP3] the numeric orderNumber is NOT a valid GET /pedidos/:id lookup key
+//         — supplying it where a CUID id is expected resolves to the SAME
+//         no-leak 404 as any other unknown id (spec "Public number is not an
+//         identifier").
+// ===========================================================================
+
+describe("order-public-numbers WU3 — GET /pedidos[/:id] orderNumber propagation and isolation [OP1]", () => {
+  it(
+    "[OP1] list/detail expose numeric orderNumber; two different consumers each start independently at 1",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("op1", "B10000131");
+      const consumerA = await seedConsumer("op1a");
+      const consumerB = await seedConsumer("op1b");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const productA = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "OP1 Product A", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+      const productB = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "OP1 Product B", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+
+      // Two DIFFERENT consumers, each placing their FIRST-ever order — proves
+      // actor-scoped isolation (spec "New actors begin independently at
+      // one") through the real HTTP list/detail surface, not just the
+      // allocator directly.
+      await cartService.addItem(consumerA.id, productA.id, 1);
+      const cartViewA = await cartService.getCartForCheckout(consumerA.id);
+      const { order: orderA } = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_op1_consumer_a",
+          cartViewA,
+          [{ producerId: producer.id, deliveryModeId: dm.id }],
+          tx,
+        ),
+      );
+
+      await cartService.addItem(consumerB.id, productB.id, 1);
+      const cartViewB = await cartService.getCartForCheckout(consumerB.id);
+      const { order: orderB } = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_op1_consumer_b",
+          cartViewB,
+          [{ producerId: producer.id, deliveryModeId: dm.id }],
+          tx,
+        ),
+      );
+
+      expect(orderA.orderNumber).toBe(1);
+      expect(orderB.orderNumber).toBe(1); // independent scope — NOT 2
+
+      const authA = authHeader({ sub: consumerA.auth0Sub });
+      const authB = authHeader({ sub: consumerB.auth0Sub });
+
+      const listA = await request.get("/api/v1/pedidos").set("x-test-auth", authA);
+      expect(listA.body).toHaveLength(1);
+      expect(listA.body[0]).toMatchObject({ id: orderA.id, orderNumber: 1 });
+
+      const listB = await request.get("/api/v1/pedidos").set("x-test-auth", authB);
+      expect(listB.body).toHaveLength(1);
+      expect(listB.body[0]).toMatchObject({ id: orderB.id, orderNumber: 1 });
+
+      const detailA = await request.get(`/api/v1/pedidos/${orderA.id}`).set("x-test-auth", authA);
+      expect(detailA.body).toMatchObject({ id: orderA.id, orderNumber: 1 });
+
+      // Cross-consumer isolation: A's listing never contains B's id/number
+      // and vice-versa, even though both orderNumbers are literally "1".
+      expect((listA.body as Array<{ id: string }>).map((o) => o.id)).not.toContain(orderB.id);
+      expect((listB.body as Array<{ id: string }>).map((o) => o.id)).not.toContain(orderA.id);
+    },
+    30000,
+  );
+});
+
+describe("order-public-numbers WU3 — cancellation never reuses orderNumber [OP2]", () => {
+  it(
+    "[OP2] a cancelled order's orderNumber is never reassigned — the SAME consumer's next order gets the NEXT number",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("op2", "B10000132");
+      const consumer = await seedConsumer("op2");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const product = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "OP2 Product", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+      const consumerAuth = authHeader({ sub: consumer.auth0Sub });
+
+      // First order — orderNumber 1 — then cancel it immediately.
+      await cartService.addItem(consumer.id, product.id, 1);
+      const cartView1 = await cartService.getCartForCheckout(consumer.id);
+      const { order: order1 } = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_op2_first",
+          cartView1,
+          [{ producerId: producer.id, deliveryModeId: dm.id }],
+          tx,
+        ),
+      );
+      expect(order1.orderNumber).toBe(1);
+
+      const cancelRes = await request
+        .patch(`/api/v1/pedidos/${order1.id}/cancelar`)
+        .set("x-test-auth", consumerAuth);
+      expect(cancelRes.status).toBe(200);
+      // spec "Committed numbers survive cancellation" — the response still
+      // carries the SAME orderNumber, unchanged by cancellation.
+      expect(cancelRes.body).toMatchObject({ id: order1.id, orderNumber: 1, status: "CANCELLED" });
+
+      // Second order for the SAME consumer — spec "Committed numbers survive
+      // cancellation" means number 1 MUST NOT be reassigned; this MUST land
+      // on 2, not 1.
+      await cartService.addItem(consumer.id, product.id, 1);
+      const cartView2 = await cartService.getCartForCheckout(consumer.id);
+      const { order: order2 } = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_op2_second",
+          cartView2,
+          [{ producerId: producer.id, deliveryModeId: dm.id }],
+          tx,
+        ),
+      );
+      expect(order2.orderNumber).toBe(2);
+
+      const listRes = await request.get("/api/v1/pedidos").set("x-test-auth", consumerAuth);
+      const numbers = (listRes.body as Array<{ orderNumber: number }>)
+        .map((o) => o.orderNumber)
+        .sort((a, b) => a - b);
+      expect(numbers).toEqual([1, 2]);
+    },
+    30000,
+  );
+});
+
+describe("order-public-numbers WU3 — public orderNumber is not a CUID lookup key [OP3]", () => {
+  it(
+    "[OP3] supplying the numeric orderNumber as the :id route param resolves to the SAME no-leak 404 as any unknown id",
+    async (ctx) => {
+      if (!dbReachable) {
+        ctx.skip();
+        return;
+      }
+
+      const { producer, category } = await seedProducer("op3", "B10000133");
+      const consumer = await seedConsumer("op3");
+      const dm = await db.deliveryMode.create({
+        data: { producerId: producer.id, type: "SHIPPING_FLAT_RATE", cost: 1.0, isActive: true },
+      });
+      const product = await db.product.create({
+        data: { producerId: producer.id, categoryId: category.id, name: "OP3 Product", description: "d", price: 5.0, stock: 10, isActive: true },
+      });
+
+      await cartService.addItem(consumer.id, product.id, 1);
+      const cartView = await cartService.getCartForCheckout(consumer.id);
+      const { order: created } = await prisma.$transaction((tx) =>
+        ordersService.createOrderFromPayment(
+          "pi_op3_cuid_only",
+          cartView,
+          [{ producerId: producer.id, deliveryModeId: dm.id }],
+          tx,
+        ),
+      );
+      expect(created.orderNumber).toBe(1);
+
+      const consumerAuth = authHeader({ sub: consumer.auth0Sub });
+
+      // The REAL CUID id resolves fine (control case).
+      const byId = await request
+        .get(`/api/v1/pedidos/${created.id}`)
+        .set("x-test-auth", consumerAuth);
+      expect(byId.status).toBe(200);
+
+      // The public orderNumber ("1") supplied as the route :id param MUST
+      // NOT resolve — spec "Public number is not an identifier". The
+      // orders.controller.ts route param is an unparsed raw string (no Zod
+      // schema, matching the sub-orders precedent), so `where: { id, userId }`
+      // simply finds no CUID row equal to the literal string "1" — same
+      // no-leak 404 as any other unknown id.
+      const byNumber = await request
+        .get(`/api/v1/pedidos/${created.orderNumber}`)
+        .set("x-test-auth", consumerAuth);
+      expect(byNumber.status).toBe(404);
+      expect(byNumber.body).toMatchObject({ code: "NOT_FOUND" });
+
+      // Same for cancellation — the mutation route MUST NOT resolve by number either.
+      const cancelByNumber = await request
+        .patch(`/api/v1/pedidos/${created.orderNumber}/cancelar`)
+        .set("x-test-auth", consumerAuth);
+      expect(cancelByNumber.status).toBe(404);
+      expect(cancelByNumber.body).toMatchObject({ code: "NOT_FOUND" });
+
+      // The order is untouched by the rejected number-based cancel attempt.
+      const stillPending = await db.order.findUniqueOrThrow({ where: { id: created.id } });
+      expect(stillPending.orderNumber).toBe(1);
+      const subOrder = await db.subOrder.findFirstOrThrow({ where: { orderId: created.id } });
+      expect(subOrder.status).toBe("pending");
+    },
+    30000,
+  );
+});

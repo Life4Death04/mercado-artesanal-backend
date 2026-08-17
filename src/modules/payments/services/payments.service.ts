@@ -108,13 +108,19 @@ interface AddressSnapshot {
   addressCountry: string;
 }
 
+/**
+ * order-public-numbers WU3 (PR 2, Phase 3): `orderNumber` is additive on
+ * every branch below — `null` whenever `orderId` is `null` (spec
+ * "Payment status aligns both identifiers"), otherwise the scoped
+ * `Order.orderNumber` resolved by the SAME `payment.order` select as `id`.
+ */
 export async function getPaymentStatus(
   userId: string,
   paymentIntentId: string,
 ): Promise<PaymentStatusView | null> {
   const payment = await prisma.payment.findFirst({
     where: { providerRef: paymentIntentId, userId },
-    include: { order: { select: { id: true } } },
+    include: { order: { select: { id: true, orderNumber: true } } },
   });
 
   if (!payment) {
@@ -123,26 +129,31 @@ export async function getPaymentStatus(
       select: { id: true },
     });
     if (pendingCheckout) {
-      return { state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" };
+      return { state: "PROCESSING", orderId: null, orderNumber: null, code: "PAYMENT_PROCESSING" };
     }
     return null;
   }
 
   if (payment.status === "SUCCEEDED") {
     return payment.order
-      ? { state: "SUCCEEDED", orderId: payment.order.id, code: "PAYMENT_SUCCEEDED" }
-      : { state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" };
+      ? {
+          state: "SUCCEEDED",
+          orderId: payment.order.id,
+          orderNumber: payment.order.orderNumber,
+          code: "PAYMENT_SUCCEEDED",
+        }
+      : { state: "PENDING", orderId: null, orderNumber: null, code: "PAYMENT_NEEDS_REVIEW" };
   }
   if (payment.status === "FAILED") {
-    return { state: "FAILED", orderId: null, code: "PAYMENT_FAILED" };
+    return { state: "FAILED", orderId: null, orderNumber: null, code: "PAYMENT_FAILED" };
   }
   if (payment.status === "CANCELED") {
-    return { state: "CANCELED", orderId: null, code: "PAYMENT_CANCELED" };
+    return { state: "CANCELED", orderId: null, orderNumber: null, code: "PAYMENT_CANCELED" };
   }
   if (payment.status === "PENDING") {
-    return { state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" };
+    return { state: "PENDING", orderId: null, orderNumber: null, code: "PAYMENT_NEEDS_REVIEW" };
   }
-  return { state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" };
+  return { state: "PENDING", orderId: null, orderNumber: null, code: "PAYMENT_NEEDS_REVIEW" };
 }
 
 /**

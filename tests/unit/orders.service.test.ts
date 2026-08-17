@@ -242,6 +242,9 @@ function makeMockTx(overrides: Record<string, any> = {}) {
         userId: data.userId,
         paymentId: data.paymentId,
         totalAmount: data.totalAmount,
+        // order-public-numbers WU3: echoes the allocated orderNumber back,
+        // matching a real Prisma create() returning the row it just wrote.
+        orderNumber: data.orderNumber,
         createdAt: new Date("2026-07-27T10:00:00Z"),
       })),
     },
@@ -335,6 +338,10 @@ describe("ordersService.createOrderFromPayment — idempotency pre-check [CO-IDE
   it("[CO-IDEMP] returns the existing OrderDetailView when providerRef already recorded, no writes issued", async () => {
     const existingOrder = {
       id: "order_existing",
+      // order-public-numbers WU3: mapExistingOrderDetailView must propagate
+      // the SAME orderNumber the idempotency pre-check row already carries —
+      // a replay must not lose/alter the number.
+      orderNumber: 12,
       createdAt: new Date("2026-07-01T00:00:00Z"),
       totalAmount: new Prisma.Decimal("12.00"),
       subOrders: [
@@ -371,6 +378,7 @@ describe("ordersService.createOrderFromPayment — idempotency pre-check [CO-IDE
     );
 
     expect(result.id).toBe("order_existing");
+    expect(result.orderNumber).toBe(12);
     expect(result.status).toBe("PENDING");
     expect(result.payment.status).toBe("SUCCEEDED");
     expect(tx.payment.create).not.toHaveBeenCalled();
@@ -718,7 +726,7 @@ describe("ordersService.createOrderFromPayment — public number allocation [CO-
     });
 
     const cartView = makeCartView([producerBItem, producerAItem], { userId: "user_007" });
-    await ordersService.createOrderFromPayment(
+    const { order: result } = await ordersService.createOrderFromPayment(
       "pi_alloc",
       cartView,
       [
@@ -731,6 +739,9 @@ describe("ordersService.createOrderFromPayment — public number allocation [CO-
     expect(mockedAllocateOrderNumber).toHaveBeenCalledTimes(1);
     expect(mockedAllocateOrderNumber).toHaveBeenCalledWith("user_007", tx);
     expect(tx.order.create.mock.calls[0]![0].data.orderNumber).toBe(7);
+    // order-public-numbers WU3: the allocated number propagates all the way
+    // into the response's top-level OrderDetailView.orderNumber.
+    expect(result.orderNumber).toBe(7);
 
     expect(mockedAllocateSubOrderNumber).toHaveBeenCalledTimes(2);
     expect(mockedAllocateSubOrderNumber.mock.calls[0]).toEqual(["producer_A", tx]);
@@ -1206,16 +1217,18 @@ describe("ordersService.listOrders", () => {
     expect(result).toEqual([]);
   });
 
-  it("[LO-MAP] maps each row to OrderSummaryView with derived status and producerCount = subOrders.length", async () => {
+  it("[LO-MAP] maps each row to OrderSummaryView with derived status, producerCount = subOrders.length, and orderNumber passed through (order-public-numbers WU3)", async () => {
     mockedOrder.findMany.mockResolvedValueOnce([
       {
         id: "order_A",
+        orderNumber: 9,
         createdAt: new Date("2026-07-28T10:00:00.000Z"),
         totalAmount: new Prisma.Decimal("24.00"),
         subOrders: [{ status: "pending" }, { status: "pending" }],
       },
       {
         id: "order_B",
+        orderNumber: 3,
         createdAt: new Date("2026-07-20T10:00:00.000Z"),
         totalAmount: new Prisma.Decimal("9.50"),
         subOrders: [{ status: "delivered" }],
@@ -1227,6 +1240,7 @@ describe("ordersService.listOrders", () => {
     expect(result).toEqual([
       {
         id: "order_A",
+        orderNumber: 9,
         createdAt: "2026-07-28T10:00:00.000Z",
         totalAmount: "24.00",
         status: "PENDING",
@@ -1234,6 +1248,7 @@ describe("ordersService.listOrders", () => {
       },
       {
         id: "order_B",
+        orderNumber: 3,
         createdAt: "2026-07-20T10:00:00.000Z",
         totalAmount: "9.50",
         status: "FULFILLED",
@@ -1274,9 +1289,10 @@ describe("ordersService.getOrderDetail", () => {
     );
   });
 
-  it("[GOD-MAP] maps a found row to the full OrderDetailView — nested payment/subOrders/orderLines, derived status", async () => {
+  it("[GOD-MAP] maps a found row to the full OrderDetailView — nested payment/subOrders/orderLines, derived status, orderNumber (order-public-numbers WU3)", async () => {
     mockedOrder.findFirst.mockResolvedValueOnce({
       id: "order_001",
+      orderNumber: 15,
       createdAt: new Date("2026-07-28T10:00:00.000Z"),
       totalAmount: new Prisma.Decimal("15.00"),
       payment: { status: "SUCCEEDED" },
@@ -1303,6 +1319,7 @@ describe("ordersService.getOrderDetail", () => {
 
     expect(result).toEqual({
       id: "order_001",
+      orderNumber: 15,
       createdAt: "2026-07-28T10:00:00.000Z",
       totalAmount: "15.00",
       status: "PENDING",
@@ -1353,6 +1370,9 @@ function makeCancelOrderRow(
 ) {
   return {
     id: "order_001",
+    // order-public-numbers WU3: real tx.order.findFirst({ include }) always
+    // returns every scalar field, orderNumber included.
+    orderNumber: 21,
     createdAt: new Date("2026-07-29T10:00:00.000Z"),
     totalAmount: new Prisma.Decimal("12.00"),
     payment: { status: "SUCCEEDED" },
@@ -1578,5 +1598,8 @@ describe("ordersService.cancelOrder — success mapping [CX-SUCCESS]", () => {
     expect(result.subOrders).toHaveLength(2);
     expect(result.subOrders.every((s) => s.status === "cancelled")).toBe(true);
     expect(result.payment.status).toBe("SUCCEEDED");
+    // order-public-numbers WU3: cancellation must never alter or drop the
+    // committed orderNumber (spec "Committed numbers survive cancellation").
+    expect(result.orderNumber).toBe(21);
   });
 });
