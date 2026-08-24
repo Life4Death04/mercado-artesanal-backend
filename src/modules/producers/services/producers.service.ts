@@ -41,16 +41,17 @@
  */
 import type { Producer, SubOrderStatus } from "@prisma/client";
 
+import { ACTIVE_USER_WHERE } from "@/shared/account-lifecycle";
 import {
   NotFoundError,
   ProducerHasActiveOrdersError,
   UnknownCategoryError,
 } from "@/shared/errors/errors";
 import { prisma } from "@/shared/utils/prisma";
-import { isTerminalStatus } from "../../sub-orders/services/sub-orders.service";
 
-import type { PatchProducerBody } from "../dto/producers.dto";
 import type { SubOrderStatusValue } from "../../sub-orders/dto/sub-orders.dto";
+import { isTerminalStatus } from "../../sub-orders/services/sub-orders.service";
+import type { PatchProducerBody } from "../dto/producers.dto";
 
 // ---------------------------------------------------------------------------
 // Terminal SubOrder statuses for the soft-delete guard
@@ -67,9 +68,8 @@ const ALL_SUBORDER_STATUSES: SubOrderStatusValue[] = [
   "delivered",
   "cancelled",
 ];
-const TERMINAL_SUBORDER_STATUSES: SubOrderStatus[] = ALL_SUBORDER_STATUSES.filter(
-  isTerminalStatus,
-) as SubOrderStatus[];
+const TERMINAL_SUBORDER_STATUSES: SubOrderStatus[] =
+  ALL_SUBORDER_STATUSES.filter(isTerminalStatus);
 
 // ---------------------------------------------------------------------------
 // Public projection type
@@ -272,10 +272,13 @@ export async function softDelete(producerId: string): Promise<void> {
  *
  * Spec scenario: "Public projection redacts PII"
  * Spec scenario: "Soft-deleted producer returns 404"
+ * Spec: product-catalog §"Owning account controls catalog availability" —
+ *   a producer profile is only publicly visible while its owning User is
+ *   ACTIVE (admin-user-management delta).
  */
 export async function findPublicById(id: string): Promise<PublicProducerProjection> {
   const producer = await prisma.producer.findFirst({
-    where: { id, deletedAt: null },
+    where: { id, deletedAt: null, user: ACTIVE_USER_WHERE },
     select: {
       id: true,
       businessName: true,

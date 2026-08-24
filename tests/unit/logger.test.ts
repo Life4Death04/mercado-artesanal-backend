@@ -254,6 +254,34 @@ describe("Scenario 5 — PII redaction: parametrized coverage of all redact path
       (parsed: Record<string, unknown>) =>
         (parsed as { req: { body: { password: string } } }).req.body.password,
     ],
+    // admin-database-backups — pg_dump/pg_restore argv, spawn env, stderr, paths
+    [
+      "*.args",
+      { spawn: { args: ["--format=custom", "--file", "/tmp/x.dump"] } },
+      (parsed: Record<string, unknown>) => (parsed as { spawn: { args: unknown } }).spawn.args,
+    ],
+    [
+      "*.env",
+      { spawn: { env: { PGPASSWORD: "secret" } } },
+      (parsed: Record<string, unknown>) => (parsed as { spawn: { env: unknown } }).spawn.env,
+    ],
+    [
+      "*.stderr",
+      { tool: { stderr: "pg_dump: connection refused" } },
+      (parsed: Record<string, unknown>) => (parsed as { tool: { stderr: string } }).tool.stderr,
+    ],
+    [
+      "*.archivePath",
+      { backup: { archivePath: "/var/backups/mercado/archives/abc.dump" } },
+      (parsed: Record<string, unknown>) =>
+        (parsed as { backup: { archivePath: string } }).backup.archivePath,
+    ],
+    [
+      "*.databaseUrl",
+      { target: { databaseUrl: "postgresql://user:pass@localhost/db" } },
+      (parsed: Record<string, unknown>) =>
+        (parsed as { target: { databaseUrl: string } }).target.databaseUrl,
+    ],
   ] as const)(
     "redacts path '%s' → '[REDACTED]'",
     async (

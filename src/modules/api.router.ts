@@ -31,6 +31,16 @@
  *                          (payments WU2 — unauth, raw-body, signature-verified).
  *   notificationsRouter  — Cycle 5: owner-scoped in-app notifications under
  *                          /notifications[/unread-count|/:id/read] (notifications WU3).
+ *   incidentsRouter      — Buyer purchase-support incident reporting under
+ *                          /incidencias (admin-incidents WU2). Guard:
+ *                          authenticate -> loadUser -> onboardingGate ->
+ *                          requireRole("CONSUMER", "PRODUCER").
+ *   adminRouter          — Cycle 6: ADMIN-only catalog moderation and category
+ *                          management under /admin/* (admin-catalog-control WU3).
+ *                          Guard: authenticate → loadUser → requireRole("ADMIN") →
+ *                          onboardingGate, applied per-route inside the
+ *                          module router (same per-route convention as every
+ *                          other auth-gated router here).
  *
  * Mount order: public routers (categoriesRouter, producersRouter GET /:id,
  * publicProductsRouter) are registered BEFORE auth-gated routers so they are
@@ -46,11 +56,13 @@
 import { Router } from "express";
 
 import { addressesRouter } from "./addresses/routes/addresses.routes";
+import { adminRouter } from "./admin/routes/admin.routes";
 import { authRouter } from "./auth/routes/auth.routes";
 import { cartRouter } from "./cart/routes/cart.routes";
 import { categoriesRouter } from "./categories/routes/categories.routes";
 import { deliveryModesRouter } from "./delivery-modes/routes/delivery-modes.routes";
 import { imagesRouter } from "./images/routes/images.routes";
+import { incidentsRouter } from "./incidents/routes/incidents.routes";
 import { notificationsRouter } from "./notifications/routes/notifications.routes";
 import { onboardingRouter } from "./onboarding/routes/onboarding.routes";
 import { ordersRouter } from "./orders/routes/orders.routes";
@@ -86,3 +98,5 @@ apiRouter.use(cartRouter);
 apiRouter.use(ordersRouter);
 apiRouter.use(paymentsRouter);
 apiRouter.use(notificationsRouter);
+apiRouter.use(incidentsRouter);
+apiRouter.use(adminRouter);

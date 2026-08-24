@@ -88,7 +88,7 @@ export function validateBody<S extends z.ZodTypeAny>(
     throw new ValidationFailedError(errors, "Validation failed", status);
   }
 
-  return result.data;
+  return result.data as z.output<S>;
 }
 
 // ---------------------------------------------------------------------------

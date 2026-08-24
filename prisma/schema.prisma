@@ -36,13 +36,27 @@ model User {
   createdAt     DateTime  @default(now()) @map("created_at")
   updatedAt     DateTime  @updatedAt @map("updated_at")
   deletedAt     DateTime? @map("deleted_at")
+  // admin-user-management WU1 — reversible deactivation timestamp. Null means
+  // active. Lifecycle precedence (design "Boolean vs timestamps" Decision):
+  // deletedAt wins over deactivatedAt — see src/shared/account-lifecycle.ts
+  // deriveAccountState, the single authority for this precedence.
+  deactivatedAt DateTime? @map("deactivated_at")
 
-  producer      Producer?
-  addresses     Address[]
-  cart          Cart?
-  notifications Notification[]
+  producer          Producer?
+  addresses         Address[]
+  cart              Cart?
+  notifications     Notification[]
+  // admin-incidents WU1 — named back-relations for the two distinct User
+  // roles an Incident references: the consumer who filed it and the ADMIN
+  // who resolved it (see model Incident below for the named @relation pair).
+  incidentsReported Incident[]     @relation("IncidentReporter")
+  incidentsResolved Incident[]     @relation("IncidentResolver")
 
   @@index([auth0Sub])
+  // admin-user-management WU2 — ADMIN discovery listing, page size 8,
+  // ordered createdAt DESC, id DESC, filtered to actionable roles
+  // (CONSUMER, PRODUCER) via the leading `role` column.
+  @@index([role, createdAt(sort: Desc), id(sort: Desc)])
   @@map("users")
 }
 
@@ -68,6 +82,8 @@ model Producer {
   products      Product[]
   deliveryModes DeliveryMode[]
   subOrders     SubOrder[]
+  // admin-incidents WU1 — back-relation for incidents targeting this producer.
+  incidents     Incident[]
 
   @@index([userId])
   @@map("producers")
@@ -238,6 +254,11 @@ model Product {
   reportedAt        DateTime?        @map("reported_at")
   moderationStatus  ModerationStatus @default(OK) @map("moderation_status")
   reportReason      String?          @map("report_reason")
+  // admin-catalog WU1 — latest-action moderation audit (nullable, no backfill).
+  // Distinct from reportReason (reporter's complaint) — design Decision.
+  moderatedBy       String?          @map("moderated_by")
+  moderatedAt       DateTime?        @map("moderated_at")
+  moderationReason  String?          @map("moderation_reason")
   deletedAt         DateTime?        @map("deleted_at")
   createdAt         DateTime         @default(now()) @map("created_at")
   updatedAt         DateTime         @updatedAt @map("updated_at")
@@ -251,6 +272,8 @@ model Product {
   @@index([producerId, isActive])
   @@index([categoryId, isActive])
   @@index([producerId, stock])
+  // admin-catalog WU1 — moderation queue read filters by moderationStatus.
+  @@index([moderationStatus])
   @@map("products")
 }
 
@@ -382,12 +405,23 @@ model Order {
   /// the DB level. (orders design Decision 2 — compute-on-read, sole authority
   /// is the deriveOrderStatus() function applied on every list/detail/cancel read.)
   status      OrderStatus @default(PENDING)
+  // order-public-numbers WU1 — non-fiscal reference, unique per userId,
+  // starting at 1. Allocated in-transaction by the WU2 allocator; this
+  // migration only establishes schema/backfill (see migration.sql for the
+  // nullable -> backfill -> constraints -> NOT NULL staging).
+  orderNumber Int         @map("order_number")
   createdAt   DateTime    @default(now()) @map("created_at")
   updatedAt   DateTime    @updatedAt @map("updated_at")
 
   payment   Payment    @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   subOrders SubOrder[]
 
+  // order-public-numbers WU1 — per-consumer scoped uniqueness invariant backstop.
+  @@unique([userId, orderNumber])
+  // admin-user-management WU1 — consumer activity-count reads
+  // (distinct aggregate Orders owned by a user) and the account-lifecycle
+  // checkout/deletion race guard both filter by userId.
+  @@index([userId])
   @@map("orders")
 }
 
@@ -420,6 +454,9 @@ model SubOrder {
   shipToPostalCode     String?        @map("ship_to_postal_code")
   shipToProvince       String?        @map("ship_to_province")
   shipToCountry        String?        @map("ship_to_country")
+  // order-public-numbers WU1 — non-fiscal reference, unique per producerId,
+  // starting at 1. Mirrors Order.orderNumber exactly (see that field's comment).
+  subOrderNumber       Int            @map("sub_order_number")
   createdAt            DateTime       @default(now()) @map("created_at")
   updatedAt            DateTime       @updatedAt @map("updated_at")
 
@@ -427,10 +464,41 @@ model SubOrder {
   producer     Producer     @relation(fields: [producerId], references: [id], onDelete: Restrict)
   deliveryMode DeliveryMode @relation(fields: [deliveryModeId], references: [id], onDelete: Restrict)
   orderLines   OrderLine[]
+  // admin-incidents WU1 — back-relation for incidents targeting this sub-order.
+  incidents    Incident[]
 
+  // order-public-numbers WU1 — per-producer scoped uniqueness invariant backstop.
+  @@unique([producerId, subOrderNumber])
   @@index([producerId, status])
   @@index([orderId])
   @@map("sub_orders")
+}
+
+// order-public-numbers WU1 — allocation counters, keyed by actor id (design
+// "Architecture Decisions" — selected over mutable counters on
+// users/producers to avoid coupling order writes to identity records). No
+// FK to User/Producer, same additive pattern as PendingCheckout: pure
+// operational state. last_number starts at 1 and increments atomically via
+// the WU2 allocator's `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`
+// inside the order-creation transaction, so it commits/rolls back with the
+// aggregate it numbers. This migration seeds each existing actor's counter
+// at its backfilled maximum; actors without history get no row (allocate 1).
+
+/// Per-consumer allocation counter for Order.orderNumber.
+model OrderNumberCounter {
+  userId     String @id @map("user_id")
+  lastNumber Int    @map("last_number")
+
+  @@map("order_number_counters")
+}
+
+/// Per-producer allocation counter for SubOrder.subOrderNumber. Mirrors
+/// OrderNumberCounter exactly.
+model SubOrderNumberCounter {
+  producerId String @id @map("producer_id")
+  lastNumber Int    @map("last_number")
+
+  @@map("sub_order_number_counters")
 }
 
 /// Immutable order line — historical price snapshot at the time of purchase.
@@ -502,6 +570,10 @@ enum NotificationType {
   TRACKING_ASSIGNED
   INCIDENT_REPORTED
   INCIDENT_RESOLVED
+  // admin-user-management WU3 — emitted atomically with a DEACTIVATED ->
+  // ACTIVE admin transition (notifications spec "Activation is atomic and
+  // unique").
+  ACCOUNT_ACTIVATED
 }
 
 /// Per-user in-app notification. Written IN-transaction at the existing
@@ -525,4 +597,59 @@ model Notification {
 
   @@index([userId, read])
   @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 3 — Incidents (admin-incidents, Phase 1: schema and core contract)
+// ---------------------------------------------------------------------------
+
+/// Lifecycle status of an Incident. OPEN is the initial state on create;
+/// RESOLVED is terminal — reopening is forbidden (design §"Final conditional
+/// resolution").
+enum IncidentStatus {
+  OPEN
+  RESOLVED
+}
+
+/// Consumer-reported audit of a paid, non-cancelled sub-order (RF-16,
+/// TS-036). An Incident is an immutable audit trail: report and resolution
+/// data are never overwritten, only the OPEN -> RESOLVED transition is
+/// permitted (conditionally, via `updateMany` constrained by status = OPEN
+/// and null audit fields — design Decision "Conditional write vs
+/// read/update").
+///
+/// All four FKs use `onDelete: Restrict`: incidents are audits and MUST NOT
+/// disappear or lose actors/targets when a parent row is removed. Every
+/// referenced parent (User, SubOrder, Producer) already uses soft deletion
+/// or is otherwise protected, so Restrict never blocks a legitimate delete
+/// path in this codebase (design §"Data Model and Migration").
+///
+/// No uniqueness on subOrderId — multiple reports against the same
+/// sub-order are not prohibited (design §"Data Model and Migration").
+model Incident {
+  id               String         @id @default(cuid())
+  reporterId       String         @map("reporter_id")
+  subOrderId       String         @map("sub_order_id")
+  producerId       String         @map("producer_id")
+  reportReason     String         @map("report_reason") @db.VarChar(2000)
+  status           IncidentStatus @default(OPEN)
+  resolvedById     String?        @map("resolved_by_id")
+  resolutionReason String?        @map("resolution_reason") @db.VarChar(2000)
+  resolvedAt       DateTime?      @map("resolved_at")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  reporter   User     @relation("IncidentReporter", fields: [reporterId], references: [id], onDelete: Restrict)
+  subOrder   SubOrder @relation(fields: [subOrderId], references: [id], onDelete: Restrict)
+  producer   Producer @relation(fields: [producerId], references: [id], onDelete: Restrict)
+  resolvedBy User?    @relation("IncidentResolver", fields: [resolvedById], references: [id], onDelete: Restrict)
+
+  // Consumer owner-scoped list/detail, DESC order with id tie-break.
+  @@index([reporterId, createdAt(sort: Desc), id(sort: Desc)])
+  // ADMIN all-status inbox, DESC order with id tie-break.
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  @@index([subOrderId])
+  @@index([producerId])
+  @@index([resolvedById])
+  @@map("incidents")
 }

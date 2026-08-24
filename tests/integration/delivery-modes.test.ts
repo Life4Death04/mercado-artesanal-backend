@@ -173,7 +173,7 @@ function makeCartForCheckout(producerIds: string[]) {
         stock: 10,
         isActive: true,
         deletedAt: null,
-        producer: { id: producerId, deletedAt: null },
+        producer: { id: producerId, deletedAt: null, user: { deletedAt: null, deactivatedAt: null } },
       },
     })),
   };
@@ -192,6 +192,8 @@ function mockLoadUser(user: ReturnType<typeof makeProducerUser> | null): void {
     id: user.id,
     role: user.role,
     email: user.email,
+    deletedAt: null,
+    deactivatedAt: null,
     producer: user.producerId ? { id: user.producerId } : null,
   });
 }

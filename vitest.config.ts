@@ -7,6 +7,18 @@ export default defineConfig({
     globals: true,
     environment: "node",
     pool: "forks",
+    // Integration tests share one real Postgres database and some assertions
+    // (e.g. tests/integration/payments.test.ts WU2-1..3 before/after row
+    // counts) read that shared state. Running test FILES in parallel forks
+    // let unrelated files write Payment/Order rows between a test's own
+    // before/after count, causing nondeterministic full-suite failures that
+    // do not reproduce when a file is run in isolation. Disabling file
+    // parallelism serializes file execution (fileParallelism forces
+    // maxWorkers=1) so shared-database assertions are deterministic without
+    // weakening what any test asserts. See Vitest docs: "File parallelism
+    // can be disabled ... useful in scenarios where tests share external
+    // resources, such as a database, that cannot handle concurrent access."
+    fileParallelism: false,
     sequence: {
       concurrent: false,
     },
@@ -38,6 +50,13 @@ export default defineConfig({
       // never selects the SES provider — @aws-sdk/client-ses is globally
       // mocked in tests/setup.ts regardless, but this keeps intent explicit.
       EMAIL_PROVIDER: "console",
+      // Required after admin-database-backups Phase 1 (env.ts fail-fast on
+      // missing/relative). Real Client 16 binaries are never invoked by unit
+      // tests in this PR — routes stay disabled until Phase 4.
+      BACKUP_ARTIFACT_DIR: "/tmp/mercado-test-backups",
+      PG_DUMP_PATH: "/usr/lib/postgresql/16/bin/pg_dump",
+      PG_RESTORE_PATH: "/usr/lib/postgresql/16/bin/pg_restore",
+      BACKUP_OPERATION_TIMEOUT_MS: "300000",
     },
     coverage: {
       provider: "v8",

@@ -33,8 +33,10 @@
  */
 import type { ModerationStatus, Prisma, Product, SubOrderStatus } from "@prisma/client";
 
+import { ACTIVE_USER_WHERE } from "@/shared/account-lifecycle";
 import {
   CategoryNotFoundError,
+  InvalidModerationTransitionError,
   ProductHasActiveOrdersError,
   ProductNotFoundError,
 } from "@/shared/errors/errors";
@@ -153,7 +155,7 @@ export async function create(producerId: string, input: CreateProductInput): Pro
         presentation: input.presentation ?? null,
         // Publish-on-create invariants
         isActive: true,
-        moderationStatus: "OK" as ModerationStatus,
+        moderationStatus: "OK",
       },
     });
   });
@@ -333,7 +335,7 @@ export async function report(
 ): Promise<Product> {
   return prisma.$transaction(async (tx) => {
     const product = await tx.product.findFirst({
-      where: { id: productId, moderationStatus: { not: "REMOVED" as ModerationStatus }, deletedAt: null },
+      where: { id: productId, moderationStatus: { not: "REMOVED" }, deletedAt: null },
     });
 
     if (!product) {
@@ -349,7 +351,7 @@ export async function report(
     return tx.product.update({
       where: { id: productId },
       data: {
-        moderationStatus: "REPORTED" as ModerationStatus,
+        moderationStatus: "REPORTED",
         reportedAt: new Date(),
         reportReason: reason,
       },
@@ -416,7 +418,11 @@ const PUBLIC_PRODUCT_WHERE = {
   deletedAt: null,
   isActive: true,
   moderationStatus: "OK" as ModerationStatus,
-  producer: { deletedAt: null },
+  // admin-user-management delta (product-catalog §"Owning account controls
+  // catalog availability"): a product is only publicly visible while its
+  // producer's owning User is ACTIVE, on top of the existing producer
+  // soft-delete gate.
+  producer: { deletedAt: null, user: ACTIVE_USER_WHERE },
 };
 
 /**
@@ -550,4 +556,203 @@ export async function findPublicById(id: string): Promise<PublicProductProjectio
   }
 
   return mapPublicProduct(product);
+}
+
+// ---------------------------------------------------------------------------
+// Admin moderation (admin-catalog capability — WU1)
+// ---------------------------------------------------------------------------
+
+/** Moderation actions accepted by `PATCH /admin/products/:id/moderation`. */
+export type ModerationAction = "remove" | "dismiss" | "restore";
+
+/**
+ * Reversible moderation action table — the single source of truth for every
+ * valid moderation transition. A product's CURRENT moderationStatus must
+ * equal `from` for the requested action to be allowed.
+ *
+ * Spec: admin-catalog §"Reversible audited moderation".
+ */
+const MODERATION_TRANSITIONS: Record<
+  ModerationAction,
+  { from: ModerationStatus; to: ModerationStatus }
+> = {
+  remove: { from: "REPORTED", to: "REMOVED" },
+  dismiss: { from: "REPORTED", to: "OK" },
+  restore: { from: "REMOVED", to: "OK" },
+};
+
+/** Public-safe producer identity for admin projections (no PII). */
+export interface AdminProducerIdentity {
+  id: string;
+  businessName: string;
+}
+
+/**
+ * Admin moderation/detail projection — shared by the queue list and the
+ * single-product detail read. Includes moderation state, `reportReason`,
+ * audit fields, and producer identity.
+ *
+ * Spec: admin-catalog §"Moderation queue and detail".
+ */
+export interface AdminProductProjection {
+  id: string;
+  name: string;
+  description: string;
+  price: Product["price"];
+  stock: number;
+  moderationStatus: ModerationStatus;
+  reportedAt: Date | null;
+  reportReason: string | null;
+  moderatedBy: string | null;
+  moderatedAt: Date | null;
+  moderationReason: string | null;
+  producer: AdminProducerIdentity;
+}
+
+/**
+ * Select whitelist for the admin moderation projection.
+ * `producer.select` is a PII-safety whitelist — mirrors the public-catalog
+ * pattern (PUBLIC_PRODUCT_SELECT) — NEVER replace with `include`.
+ */
+const ADMIN_PRODUCT_SELECT = {
+  id: true,
+  name: true,
+  description: true,
+  price: true,
+  stock: true,
+  moderationStatus: true,
+  reportedAt: true,
+  reportReason: true,
+  moderatedBy: true,
+  moderatedAt: true,
+  moderationReason: true,
+  producer: { select: { id: true, businessName: true } },
+} satisfies Prisma.ProductSelect;
+
+type AdminProductRow = Prisma.ProductGetPayload<{ select: typeof ADMIN_PRODUCT_SELECT }>;
+
+function mapAdminProduct(row: AdminProductRow): AdminProductProjection {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    price: row.price,
+    stock: row.stock,
+    moderationStatus: row.moderationStatus,
+    reportedAt: row.reportedAt,
+    reportReason: row.reportReason,
+    moderatedBy: row.moderatedBy,
+    moderatedAt: row.moderatedAt,
+    moderationReason: row.moderationReason,
+    producer: row.producer,
+  };
+}
+
+/**
+ * List products filtered by moderation status for the admin queue.
+ *
+ * Spec: admin-catalog §"Moderation queue and detail" — "Reported queue is filtered".
+ */
+export async function findModerationQueue(
+  moderationStatus: ModerationStatus,
+): Promise<AdminProductProjection[]> {
+  const products = await prisma.product.findMany({
+    where: { moderationStatus, deletedAt: null },
+    orderBy: [{ createdAt: "desc" }],
+    select: ADMIN_PRODUCT_SELECT,
+  });
+
+  return products.map(mapAdminProduct);
+}
+
+/**
+ * Get the admin moderation/detail projection for a single product.
+ * Unlike producer-scoped findById, this is NOT ownership-filtered — any
+ * authenticated ADMIN may read any product's moderation detail.
+ *
+ * Spec: admin-catalog §"Moderation queue and detail".
+ */
+export async function findAdminProductById(id: string): Promise<AdminProductProjection> {
+  const product = await prisma.product.findFirst({
+    where: { id, deletedAt: null },
+    select: ADMIN_PRODUCT_SELECT,
+  });
+
+  if (!product) {
+    throw new ProductNotFoundError("Product not found");
+  }
+
+  return mapAdminProduct(product);
+}
+
+/**
+ * Apply a reversible, audited moderation transition to a product.
+ *
+ * Rules per spec admin-catalog §"Reversible audited moderation":
+ *   - `remove` (REPORTED→REMOVED), `dismiss` (REPORTED→OK), `restore` (REMOVED→OK).
+ *   - Success MUST persist moderatedBy/moderatedAt/moderationReason —
+ *     `reportReason` is left untouched (distinct data, design Decision).
+ *   - An action whose `from` status does not match the product's current
+ *     status is rejected without any write (fails fast).
+ *   - Design: read-then-conditional-`updateMany` atomic guard — mirrors
+ *     orders.service.ts::cancelOrder. The conditional write is constrained
+ *     by the expected FROM status; zero updated rows means a concurrent
+ *     transition raced this call, and the operation fails closed with
+ *     status/audit data unchanged.
+ *
+ * Spec: admin-catalog §"Reversible audited moderation".
+ */
+export async function moderate(
+  productId: string,
+  adminId: string,
+  action: ModerationAction,
+  reason: string,
+): Promise<Product> {
+  return prisma.$transaction(async (tx) => {
+    const transition = MODERATION_TRANSITIONS[action];
+
+    const product = await tx.product.findFirst({
+      where: { id: productId, deletedAt: null },
+    });
+    if (!product) {
+      throw new ProductNotFoundError("Product not found");
+    }
+
+    // Fail fast on the pre-check — no write is attempted for an unsupported
+    // action given the product's current state.
+    if (product.moderationStatus !== transition.from) {
+      throw new InvalidModerationTransitionError(
+        "Product state does not allow this moderation action",
+      );
+    }
+
+    const moderatedAt = new Date();
+
+    // Atomic guard: only claims the row if it is STILL in the expected FROM
+    // status at write time. A concurrent moderate() call that already moved
+    // it away is excluded from this UPDATE, producing a count mismatch below.
+    const { count } = await tx.product.updateMany({
+      where: { id: productId, moderationStatus: transition.from },
+      data: {
+        moderationStatus: transition.to,
+        moderatedBy: adminId,
+        moderatedAt,
+        moderationReason: reason,
+      },
+    });
+
+    if (count === 0) {
+      throw new InvalidModerationTransitionError(
+        "Product state does not allow this moderation action",
+      );
+    }
+
+    return {
+      ...product,
+      moderationStatus: transition.to,
+      moderatedBy: adminId,
+      moderatedAt,
+      moderationReason: reason,
+    };
+  });
 }

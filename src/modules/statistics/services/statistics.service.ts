@@ -38,9 +38,10 @@ import { Prisma } from "@prisma/client";
 import type { Product } from "@prisma/client";
 
 import { findLowStock, findLowStockCount } from "@/modules/inventory/services/inventory.service";
-import { prisma } from "@/shared/utils/prisma";
 import { systemClock, dateBeforeClock } from "@/shared/utils/clock";
 import type { Clock } from "@/shared/utils/clock";
+import { prisma } from "@/shared/utils/prisma";
+
 import type { WindowValue, LowStockQuery } from "../dto/statistics.dto";
 
 // ---------------------------------------------------------------------------

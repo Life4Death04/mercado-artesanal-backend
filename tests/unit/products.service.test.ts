@@ -66,6 +66,7 @@ vi.mock("@/shared/utils/prisma", () => {
         findMany: vi.fn(),
         findFirst: vi.fn(),
         update: vi.fn(),
+        updateMany: vi.fn(),
       },
       category: { findFirst: vi.fn() },
       orderLine: { count: vi.fn() },
@@ -84,6 +85,7 @@ import { Decimal } from "@prisma/client/runtime/library";
 import { prisma } from "@/shared/utils/prisma";
 import {
   CategoryNotFoundError,
+  InvalidModerationTransitionError,
   ProductHasActiveOrdersError,
   ProductNotFoundError,
 } from "@/shared/errors/errors";
@@ -116,6 +118,10 @@ function makeProduct(overrides: Record<string, unknown> = {}) {
     reportedAt: null,
     moderationStatus: "OK" as ModerationStatus,
     reportReason: null,
+    // admin-catalog WU1: moderation audit fields — distinct from reportReason (design Decision).
+    moderatedBy: null as string | null,
+    moderatedAt: null as Date | null,
+    moderationReason: null as string | null,
     deletedAt: null,
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
@@ -691,7 +697,7 @@ describe("productsService.findAllPublic", () => {
         deletedAt: null,
         isActive: true,
         moderationStatus: "OK",
-        producer: { deletedAt: null },
+        producer: { deletedAt: null, user: { deletedAt: null, deactivatedAt: null } },
       }),
     );
   });
@@ -850,7 +856,7 @@ describe("productsService.findPublicById", () => {
         deletedAt: null,
         isActive: true,
         moderationStatus: "OK",
-        producer: { deletedAt: null },
+        producer: { deletedAt: null, user: { deletedAt: null, deactivatedAt: null } },
       }),
     );
   });
@@ -871,6 +877,346 @@ describe("productsService.findPublicById", () => {
     (mockedPrisma.product as any).findFirst.mockResolvedValueOnce(null);
 
     await expect(productsService.findPublicById("product_hidden")).rejects.toThrow(
+      ProductNotFoundError,
+    );
+  });
+});
+
+// ===========================================================================
+// moderate (admin-catalog capability — WU1, Phase 1: Moderation Foundation)
+//
+// Spec: admin-catalog §"Reversible audited moderation"
+//   - remove:   REPORTED → REMOVED
+//   - dismiss:  REPORTED → OK
+//   - restore:  REMOVED  → OK
+//   - Success MUST persist moderatedBy/moderatedAt/moderationReason, separate
+//     from reportReason.
+//   - Unsupported transition MUST be rejected WITHOUT changing status/audit data.
+//
+// Design: read-then-conditional-`updateMany` atomic guard — mirrors the exact
+// pattern in orders.service.ts::cancelOrder (validate via an action table,
+// then a conditional write constrained by the expected FROM status; zero
+// updated rows means a race occurred and the call fails closed).
+// ===========================================================================
+
+describe("productsService.moderate", () => {
+  it("[remove] transitions REPORTED→REMOVED and persists moderatedBy/moderatedAt/moderationReason", async () => {
+    const reported = makeProduct({
+      moderationStatus: "REPORTED" as ModerationStatus,
+      reportReason: "spam",
+    });
+
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const fakeTx = {
+          product: {
+            findFirst: vi.fn().mockResolvedValue(reported),
+            updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          },
+        };
+        return fn(fakeTx as unknown as typeof prisma);
+      },
+    );
+
+    const result = await productsService.moderate(
+      "product_001",
+      "admin_001",
+      "remove",
+      "policy violation",
+    );
+
+    expect(result.moderationStatus).toBe("REMOVED");
+    expect(result.moderatedBy).toBe("admin_001");
+    expect(result.moderatedAt).toBeInstanceOf(Date);
+    expect(result.moderationReason).toBe("policy violation");
+    // reportReason MUST remain untouched — distinct from moderation audit data.
+    expect(result.reportReason).toBe("spam");
+  });
+
+  it("[dismiss] transitions REPORTED→OK and persists audit fields", async () => {
+    const reported = makeProduct({
+      moderationStatus: "REPORTED" as ModerationStatus,
+      reportReason: "spam",
+    });
+
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const fakeTx = {
+          product: {
+            findFirst: vi.fn().mockResolvedValue(reported),
+            updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          },
+        };
+        return fn(fakeTx as unknown as typeof prisma);
+      },
+    );
+
+    const result = await productsService.moderate(
+      "product_001",
+      "admin_002",
+      "dismiss",
+      "false positive",
+    );
+
+    expect(result.moderationStatus).toBe("OK");
+    expect(result.moderatedBy).toBe("admin_002");
+    expect(result.moderatedAt).toBeInstanceOf(Date);
+    expect(result.moderationReason).toBe("false positive");
+  });
+
+  it("[restore] transitions REMOVED→OK and persists audit fields", async () => {
+    const removed = makeProduct({
+      moderationStatus: "REMOVED" as ModerationStatus,
+      moderatedBy: "admin_001",
+      moderatedAt: new Date("2026-01-05T00:00:00Z"),
+      moderationReason: "policy violation",
+    });
+
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const fakeTx = {
+          product: {
+            findFirst: vi.fn().mockResolvedValue(removed),
+            updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          },
+        };
+        return fn(fakeTx as unknown as typeof prisma);
+      },
+    );
+
+    const result = await productsService.moderate(
+      "product_001",
+      "admin_003",
+      "restore",
+      "appeal accepted",
+    );
+
+    expect(result.moderationStatus).toBe("OK");
+    expect(result.moderatedBy).toBe("admin_003");
+    expect(result.moderatedAt).toBeInstanceOf(Date);
+    expect(result.moderationReason).toBe("appeal accepted");
+  });
+
+  it("throws InvalidModerationTransitionError when action does not match current state (remove on OK product)", async () => {
+    const okProduct = makeProduct({ moderationStatus: "OK" as ModerationStatus });
+    const mockUpdateMany = vi.fn();
+
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const fakeTx = {
+          product: {
+            findFirst: vi.fn().mockResolvedValue(okProduct),
+            updateMany: mockUpdateMany,
+          },
+        };
+        return fn(fakeTx as unknown as typeof prisma);
+      },
+    );
+
+    await expect(
+      productsService.moderate("product_001", "admin_001", "remove", "policy violation"),
+    ).rejects.toThrow(InvalidModerationTransitionError);
+
+    // Fails fast on the pre-check — no write is even attempted.
+    expect(mockUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("throws InvalidModerationTransitionError when restore is requested on an OK product", async () => {
+    const okProduct = makeProduct({ moderationStatus: "OK" as ModerationStatus });
+    const mockUpdateMany = vi.fn();
+
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const fakeTx = {
+          product: {
+            findFirst: vi.fn().mockResolvedValue(okProduct),
+            updateMany: mockUpdateMany,
+          },
+        };
+        return fn(fakeTx as unknown as typeof prisma);
+      },
+    );
+
+    await expect(
+      productsService.moderate("product_001", "admin_001", "restore", "n/a"),
+    ).rejects.toThrow(InvalidModerationTransitionError);
+
+    expect(mockUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("throws InvalidModerationTransitionError on a raced transition (updateMany count=0) — no second write is attempted", async () => {
+    const reported = makeProduct({ moderationStatus: "REPORTED" as ModerationStatus });
+    const mockUpdateMany = vi.fn().mockResolvedValue({ count: 0 });
+
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const fakeTx = {
+          product: {
+            findFirst: vi.fn().mockResolvedValue(reported),
+            updateMany: mockUpdateMany,
+          },
+        };
+        return fn(fakeTx as unknown as typeof prisma);
+      },
+    );
+
+    await expect(
+      productsService.moderate("product_001", "admin_001", "dismiss", "false positive"),
+    ).rejects.toThrow(InvalidModerationTransitionError);
+
+    // Exactly one conditional write attempted — the race is detected, not retried blindly.
+    expect(mockUpdateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("[mutation-verify] updateMany is constrained by the expected FROM status (conditional write prevents lost updates)", async () => {
+    const reported = makeProduct({ moderationStatus: "REPORTED" as ModerationStatus });
+    const mockUpdateMany = vi.fn().mockResolvedValue({ count: 1 });
+
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const fakeTx = {
+          product: {
+            findFirst: vi.fn().mockResolvedValue(reported),
+            updateMany: mockUpdateMany,
+          },
+        };
+        return fn(fakeTx as unknown as typeof prisma);
+      },
+    );
+
+    await productsService.moderate("product_001", "admin_001", "remove", "policy violation");
+
+    expect(mockUpdateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: "product_001", moderationStatus: "REPORTED" }),
+        data: expect.objectContaining({
+          moderationStatus: "REMOVED",
+          moderatedBy: "admin_001",
+          moderationReason: "policy violation",
+        }),
+      }),
+    );
+  });
+
+  it("throws ProductNotFoundError when the product does not exist", async () => {
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+        const fakeTx = {
+          product: {
+            findFirst: vi.fn().mockResolvedValue(null),
+            updateMany: vi.fn(),
+          },
+        };
+        return fn(fakeTx as unknown as typeof prisma);
+      },
+    );
+
+    await expect(
+      productsService.moderate("product_missing", "admin_001", "remove", "policy violation"),
+    ).rejects.toThrow(ProductNotFoundError);
+  });
+});
+
+// ===========================================================================
+// findModerationQueue (admin-catalog capability — WU1)
+// Spec: admin-catalog §"Moderation queue and detail" — "Reported queue is filtered"
+// ===========================================================================
+
+describe("productsService.findModerationQueue", () => {
+  it("[Reported queue is filtered] filters by the requested moderationStatus", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findModerationQueue("REPORTED" as ModerationStatus);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.where.moderationStatus).toBe("REPORTED");
+  });
+
+  it("[Reported queue is filtered] maps rows to producer identity + report/audit fields", async () => {
+    const row = {
+      id: "product_reported_1",
+      name: "Queso Curado",
+      description: "Queso artesanal.",
+      price: new Decimal("8.00"),
+      stock: 15,
+      moderationStatus: "REPORTED" as ModerationStatus,
+      reportedAt: new Date("2026-02-01T00:00:00Z"),
+      reportReason: "counterfeit",
+      moderatedBy: null,
+      moderatedAt: null,
+      moderationReason: null,
+      producer: { id: "prod_009", businessName: "Quesería del Valle" },
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([row]);
+
+    const results = await productsService.findModerationQueue("REPORTED" as ModerationStatus);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toEqual(
+      expect.objectContaining({
+        id: "product_reported_1",
+        moderationStatus: "REPORTED",
+        reportReason: "counterfeit",
+        producer: { id: "prod_009", businessName: "Quesería del Valle" },
+      }),
+    );
+  });
+
+  it("[select whitelist] producer projection excludes PII fields (nif, userId, address lines)", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findModerationQueue("REPORTED" as ModerationStatus);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.select.producer.select).toEqual({ id: true, businessName: true });
+    expect(call.select.producer.select).not.toHaveProperty("nif");
+    expect(call.select.producer.select).not.toHaveProperty("userId");
+    expect(call.select.producer.select).not.toHaveProperty("addressLine1");
+  });
+});
+
+// ===========================================================================
+// findAdminProductById (admin-catalog capability — WU1)
+// Spec: admin-catalog §"Moderation queue and detail"
+// ===========================================================================
+
+describe("productsService.findAdminProductById", () => {
+  it("returns moderation/detail projection with producer identity, report and audit fields", async () => {
+    const row = {
+      id: "product_001",
+      name: "Aceite de Oliva",
+      description: "Aceite artesanal.",
+      price: new Decimal("12.50"),
+      stock: 100,
+      moderationStatus: "REMOVED" as ModerationStatus,
+      reportedAt: new Date("2026-02-01T00:00:00Z"),
+      reportReason: "spam",
+      moderatedBy: "admin_001",
+      moderatedAt: new Date("2026-02-02T00:00:00Z"),
+      moderationReason: "policy violation",
+      producer: { id: "prod_001", businessName: "Apiarios del Sur" },
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findFirst.mockResolvedValueOnce(row);
+
+    const result = await productsService.findAdminProductById("product_001");
+
+    expect(result.reportReason).toBe("spam");
+    expect(result.moderatedBy).toBe("admin_001");
+    expect(result.moderationReason).toBe("policy violation");
+    expect(result.producer).toEqual({ id: "prod_001", businessName: "Apiarios del Sur" });
+  });
+
+  it("throws ProductNotFoundError when the product does not exist", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findFirst.mockResolvedValueOnce(null);
+
+    await expect(productsService.findAdminProductById("product_missing")).rejects.toThrow(
       ProductNotFoundError,
     );
   });

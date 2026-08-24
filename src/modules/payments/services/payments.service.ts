@@ -57,6 +57,7 @@ import type {
   CreateOrderFromPaymentResult,
   DeliverySelection,
 } from "@/modules/orders/services/orders.service";
+import { lockAndAssertOwnersActive } from "@/shared/account-lifecycle";
 import { dispatchEmails } from "@/shared/email/email-provider";
 import {
   CartItemNotAvailableError,
@@ -107,13 +108,19 @@ interface AddressSnapshot {
   addressCountry: string;
 }
 
+/**
+ * order-public-numbers WU3 (PR 2, Phase 3): `orderNumber` is additive on
+ * every branch below — `null` whenever `orderId` is `null` (spec
+ * "Payment status aligns both identifiers"), otherwise the scoped
+ * `Order.orderNumber` resolved by the SAME `payment.order` select as `id`.
+ */
 export async function getPaymentStatus(
   userId: string,
   paymentIntentId: string,
 ): Promise<PaymentStatusView | null> {
   const payment = await prisma.payment.findFirst({
     where: { providerRef: paymentIntentId, userId },
-    include: { order: { select: { id: true } } },
+    include: { order: { select: { id: true, orderNumber: true } } },
   });
 
   if (!payment) {
@@ -122,26 +129,31 @@ export async function getPaymentStatus(
       select: { id: true },
     });
     if (pendingCheckout) {
-      return { state: "PROCESSING", orderId: null, code: "PAYMENT_PROCESSING" };
+      return { state: "PROCESSING", orderId: null, orderNumber: null, code: "PAYMENT_PROCESSING" };
     }
     return null;
   }
 
   if (payment.status === "SUCCEEDED") {
     return payment.order
-      ? { state: "SUCCEEDED", orderId: payment.order.id, code: "PAYMENT_SUCCEEDED" }
-      : { state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" };
+      ? {
+          state: "SUCCEEDED",
+          orderId: payment.order.id,
+          orderNumber: payment.order.orderNumber,
+          code: "PAYMENT_SUCCEEDED",
+        }
+      : { state: "PENDING", orderId: null, orderNumber: null, code: "PAYMENT_NEEDS_REVIEW" };
   }
   if (payment.status === "FAILED") {
-    return { state: "FAILED", orderId: null, code: "PAYMENT_FAILED" };
+    return { state: "FAILED", orderId: null, orderNumber: null, code: "PAYMENT_FAILED" };
   }
   if (payment.status === "CANCELED") {
-    return { state: "CANCELED", orderId: null, code: "PAYMENT_CANCELED" };
+    return { state: "CANCELED", orderId: null, orderNumber: null, code: "PAYMENT_CANCELED" };
   }
   if (payment.status === "PENDING") {
-    return { state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" };
+    return { state: "PENDING", orderId: null, orderNumber: null, code: "PAYMENT_NEEDS_REVIEW" };
   }
-  return { state: "PENDING", orderId: null, code: "PAYMENT_NEEDS_REVIEW" };
+  return { state: "PENDING", orderId: null, orderNumber: null, code: "PAYMENT_NEEDS_REVIEW" };
 }
 
 /**
@@ -346,9 +358,43 @@ export async function createPaymentIntent(
     )
     .digest("hex");
 
+  // Step 6c (design "Post-Stripe snapshot vs locked preflight" — LOCKED
+  // PREFLIGHT, replaces the former post-Stripe PendingCheckout create):
+  // one transaction locks the COMPLETE consumer + producer-owner User set,
+  // re-asserts every one of them ACTIVE, then upserts the immutable
+  // PendingCheckout address-content row keyed by the content fingerprint —
+  // `providerRef` stays whatever it already was (null on first call; a
+  // genuine retry's upsert `update` branch is a no-op, preserving a
+  // previously-bound providerRef untouched). Locks are released when this
+  // transaction commits, BEFORE any Stripe I/O — this closes the race where
+  // deletion's redaction could otherwise interleave between address-content
+  // computation and persistence (design "closes deletion's PII-repopulation
+  // race").
+  await prisma.$transaction(async (tx) => {
+    await lockAndAssertOwnersActive(tx, userId, [...cartProducerIds]);
+
+    await tx.pendingCheckout.upsert({
+      where: { fingerprint: idempotencyKey },
+      create: {
+        fingerprint: idempotencyKey,
+        userId,
+        addressLine1: addressSnapshot?.addressLine1 ?? "",
+        addressLine2: addressSnapshot?.addressLine2 ?? null,
+        addressCity: addressSnapshot?.addressCity ?? "",
+        addressPostalCode: addressSnapshot?.addressPostalCode ?? "",
+        addressProvince: addressSnapshot?.addressProvince ?? "",
+        ...(addressSnapshot ? { addressCountry: addressSnapshot.addressCountry } : {}),
+      },
+      // Address content is immutable once written (design Fork 1) — a
+      // retry of the SAME fingerprint touches nothing here.
+      update: {},
+    });
+  });
+
   // Step 7: Stripe call — idempotencyKey = content fingerprint, failure -> 502, never leaked raw.
+  let intent: Awaited<ReturnType<StripeClient["createPaymentIntent"]>>;
   try {
-    const intent = await client.createPaymentIntent({
+    intent = await client.createPaymentIntent({
       amount: total.toNumber(),
       currency: "eur",
       idempotencyKey,
@@ -358,52 +404,36 @@ export async function createPaymentIntent(
         deliverySelections: deliverySelectionsMetadata,
       },
     });
-    // Bind an existing fingerprint-keyed row (a genuine retry of the SAME
-    // checkout content — spec "Webhook replay creates no duplicate
-    // snapshot") to the new providerRef; the row's address content, once
-    // written, is NEVER rewritten here (immutability — spec "Editing the
-    // address after ordering does not mutate the order").
-    const updated = await prisma.pendingCheckout.updateMany({
-      where: { fingerprint: idempotencyKey, userId },
-      data: { providerRef: intent.id },
-    });
-    if (updated.count === 0) {
-      try {
-        // Address content: real snapshot for a shipping cart with a
-        // resolved `addressSnapshot` (Step 3c above); empty placeholders
-        // otherwise (all-pickup, or the BE-2 ownership-only row shape WU1
-        // already relied on) — spec "no PendingCheckout address snapshot
-        // MUST be written" for an ignored/absent addressId.
-        await prisma.pendingCheckout.create({
-          data: {
-            fingerprint: idempotencyKey,
-            providerRef: intent.id,
-            userId,
-            addressLine1: addressSnapshot?.addressLine1 ?? "",
-            addressLine2: addressSnapshot?.addressLine2 ?? null,
-            addressCity: addressSnapshot?.addressCity ?? "",
-            addressPostalCode: addressSnapshot?.addressPostalCode ?? "",
-            addressProvince: addressSnapshot?.addressProvince ?? "",
-            ...(addressSnapshot ? { addressCountry: addressSnapshot.addressCountry } : {}),
-          },
-        });
-      } catch (err) {
-        if (!isUniqueConstraintViolation(err)) {
-          throw err;
-        }
-        const raced = await prisma.pendingCheckout.updateMany({
-          where: { fingerprint: idempotencyKey, userId },
-          data: { providerRef: intent.id },
-        });
-        if (raced.count === 0) {
-          throw err;
-        }
-      }
-    }
-    return { clientSecret: intent.client_secret };
   } catch (err) {
     throw new PaymentIntentCreationError("Failed to create payment intent", err);
   }
+
+  // Step 7b (design "second transaction re-locks the same set and updates
+  // ONLY providerRef/provider metadata on that fingerprint; it MUST NOT
+  // create a row or write address columns"): deliberately OUTSIDE the
+  // Stripe try/catch above — a lifecycle denial here is a distinct,
+  // properly-coded rejection (403/409), never masked as a 502 Stripe
+  // failure. The row is GUARANTEED to exist from the Step 6c preflight
+  // (it may since have been sanitized by a tombstone redaction — still
+  // present, just with redacted address content — see account-lifecycle
+  // §"Approved tombstone redaction"). A zero-count bind means preflight
+  // state is missing — "Missing preflight state fails closed": never
+  // silently proceed to create an order without the immutable address
+  // snapshot this binding depends on.
+  const bound = await prisma.$transaction(async (tx) => {
+    await lockAndAssertOwnersActive(tx, userId, [...cartProducerIds]);
+    return tx.pendingCheckout.updateMany({
+      where: { fingerprint: idempotencyKey, userId },
+      data: { providerRef: intent.id },
+    });
+  });
+  if (bound.count === 0) {
+    throw new PaymentIntentCreationError(
+      "PendingCheckout preflight row missing at bind time — failing closed, no order will be created",
+    );
+  }
+
+  return { clientSecret: intent.client_secret };
 }
 
 // ===========================================================================
@@ -755,7 +785,12 @@ async function handleSucceededEvent(event: StripeEvent): Promise<void> {
       const result = await createOrderFromPayment(intent.id, cartView, deliverySelections, tx);
       await tx.payment.updateMany({ where: { providerRef: intent.id }, data: { userId } });
       return result;
-    });
+    },
+    {
+      timeout: 15_000,
+      maxWait: 5_000,
+    }
+  );
 
   // Cycle 5 notifications (design "Emission wiring"): dispatch the
   // transaction's `pendingEmails` AFTER it commits — fire-after-commit,

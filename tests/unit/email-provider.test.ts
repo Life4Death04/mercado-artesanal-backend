@@ -42,6 +42,11 @@ const BASE_VALID_ENV = {
   S3_PUBLIC_BASE_URL: "https://cdn.example.com",
   STRIPE_SECRET_KEY: "sk_test_dummy_for_env_test",
   STRIPE_WEBHOOK_SECRET: "whsec_dummy_for_env_test",
+  // Required after admin-database-backups Phase 1 (env.ts fail-fast).
+  BACKUP_ARTIFACT_DIR: "/var/backups/mercado",
+  PG_DUMP_PATH: "/usr/lib/postgresql/16/bin/pg_dump",
+  PG_RESTORE_PATH: "/usr/lib/postgresql/16/bin/pg_restore",
+  BACKUP_OPERATION_TIMEOUT_MS: "300000",
 };
 
 function fakeMessage(to: string): EmailMessage {

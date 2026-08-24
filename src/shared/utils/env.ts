@@ -25,6 +25,27 @@ const EnvSchema = z
     // (src/shared/email/ses-email-provider.ts). An unrecognized value fails
     // boot here (fail-fast), before any provider is constructed.
     EMAIL_PROVIDER: z.enum(["console", "ses"]).default("console"),
+    // admin-database-backups — private artifact root (realpath'd, non-public,
+    // mode 0700 per design "Storage and Safety") that stores archives,
+    // manifests, tombstones, and operation receipts. Absolute path required —
+    // a missing or relative value fails boot (design: "boot fails closed").
+    BACKUP_ARTIFACT_DIR: z
+      .string()
+      .min(1)
+      .refine((v) => v.startsWith("/"), "must be an absolute path"),
+    // Host PostgreSQL Client 16 executables. Absolute paths only — no PATH
+    // lookup, shell, or Docker authority (design "Trusted PostgreSQL runtime").
+    PG_DUMP_PATH: z
+      .string()
+      .min(1)
+      .refine((v) => v.startsWith("/"), "must be an absolute path"),
+    PG_RESTORE_PATH: z
+      .string()
+      .min(1)
+      .refine((v) => v.startsWith("/"), "must be an absolute path"),
+    // Deadline (ms) for a single dump/restore child-process step before the
+    // runner aborts it and marks the operation FAILED (design "Data Flow").
+    BACKUP_OPERATION_TIMEOUT_MS: z.coerce.number().int().positive(),
   })
   .superRefine((v, ctx) => {
     // Positive check: fail-closed when NODE_ENV === "production" and URL is not HTTPS.

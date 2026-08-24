@@ -167,6 +167,7 @@ function makeUser(overrides: Partial<User> = {}): User {
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     deletedAt: null,
+    deactivatedAt: null,
     ...overrides,
   };
 }
@@ -176,7 +177,15 @@ function makeUser(overrides: Partial<User> = {}): User {
  * Call BEFORE each test that needs an authenticated user.
  */
 function mockLoadUser(user: User | null): void {
-  const projection = user ? { id: user.id, role: user.role, email: user.email } : null;
+  const projection = user
+    ? {
+        id: user.id,
+        role: user.role,
+        email: user.email,
+        deletedAt: user.deletedAt ?? null,
+        deactivatedAt: user.deactivatedAt ?? null,
+      }
+    : null;
   mockedUser.findUnique.mockResolvedValueOnce(projection);
 }
 
@@ -196,6 +205,7 @@ function makeProducer(overrides: Record<string, unknown> = {}) {
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     deletedAt: null,
+    user: { deletedAt: null, deactivatedAt: null },
     ...overrides,
   };
 }

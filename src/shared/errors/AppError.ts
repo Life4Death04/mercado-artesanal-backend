@@ -47,7 +47,23 @@ export type ErrorCode =
   | "CART_ITEM_NOT_AVAILABLE"
   // Cycle 5 additions — payments slice (consumer-purchase-flow 3/3)
   | "PAYMENT_INTENT_CREATION_FAILED"
-  | "WEBHOOK_SIGNATURE_INVALID";
+  | "WEBHOOK_SIGNATURE_INVALID"
+  // Cycle 6 additions — admin-catalog-control (admin cycle 1/3)
+  | "INVALID_MODERATION_TRANSITION"
+  | "CATEGORY_SLUG_CONFLICT"
+  // admin-incidents WU1 additions
+  | "INCIDENT_ALREADY_RESOLVED"
+  // admin-user-management additions — account lifecycle error contract
+  | "ACCOUNT_INACTIVE"
+  | "ACCOUNT_DELETED"
+  | "USER_HAS_ACTIVE_ORDERS"
+  // admin-database-backups additions — backup/restore error contract
+  | "BACKUP_NOT_FOUND"
+  | "BACKUP_OPERATION_NOT_FOUND"
+  | "BACKUP_NOT_RESTORABLE"
+  | "BACKUP_OPERATION_CONFLICT"
+  | "BACKUP_RUNTIME_UNAVAILABLE"
+  | "BACKUP_OPERATION_FAILED";
 
 export interface ProblemDetails {
   type: string;

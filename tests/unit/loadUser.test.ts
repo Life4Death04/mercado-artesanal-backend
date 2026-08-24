@@ -32,7 +32,7 @@ vi.mock("@/shared/utils/prisma", () => {
 import type { NextFunction, Request, Response } from "express";
 import { prisma } from "@/shared/utils/prisma";
 import { loadUser } from "@/shared/middleware/loadUser";
-import { UnauthorizedError } from "@/shared/errors/errors";
+import { AccountInactiveError, UnauthorizedError } from "@/shared/errors/errors";
 
 const mockedPrisma = vi.mocked(prisma);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -74,6 +74,8 @@ describe("loadUser — PRODUCER role", () => {
       id: "user_001",
       role: "PRODUCER",
       email: "producer@example.com",
+      deletedAt: null,
+      deactivatedAt: null,
       producer: { id: "prod_001" },
     });
 
@@ -97,6 +99,8 @@ describe("loadUser — PRODUCER role", () => {
       id: "user_002",
       role: "PRODUCER",
       email: "p2@example.com",
+      deletedAt: null,
+      deactivatedAt: null,
       producer: { id: "prod_002" },
     });
 
@@ -122,6 +126,8 @@ describe("loadUser — PRODUCER role", () => {
       id: "user_003",
       role: "PRODUCER",
       email: "p3@example.com",
+      deletedAt: null,
+      deactivatedAt: null,
       producer: null,
     });
 
@@ -150,6 +156,8 @@ describe("loadUser — non-PRODUCER roles", () => {
       id: "user_010",
       role: "CONSUMER",
       email: "consumer@example.com",
+      deletedAt: null,
+      deactivatedAt: null,
       producer: null,
     });
 
@@ -172,6 +180,8 @@ describe("loadUser — non-PRODUCER roles", () => {
       id: "user_020",
       role: "ADMIN",
       email: "admin@example.com",
+      deletedAt: null,
+      deactivatedAt: null,
       producer: null,
     });
 
@@ -213,5 +223,99 @@ describe("loadUser — existing behavior (non-regression)", () => {
 
     expect(next).toHaveBeenCalledWith(expect.any(UnauthorizedError));
     expect(req.user).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// admin-user-management delta — account lifecycle denial
+// Spec: admin-bootstrap §"Soft-deleted users cannot be authorized"
+// Spec: account-lifecycle §"Backend-wide lifecycle denial"
+// ---------------------------------------------------------------------------
+
+describe("loadUser — account lifecycle denial (admin-user-management)", () => {
+  it("sets req.user = null when the matched User is soft-deleted (tombstone)", async () => {
+    const req = buildReq("auth0|deleted1") as Request;
+    const res = buildRes() as Response;
+    const next = buildNext();
+
+    mockedUser["findUnique"].mockResolvedValueOnce({
+      id: "user_del_001",
+      role: "CONSUMER",
+      email: "deleted+user_del_001@tombstone.invalid",
+      deletedAt: new Date("2026-01-01T00:00:00.000Z"),
+      deactivatedAt: null,
+      producer: null,
+    });
+
+    await loadUser(req, res, next);
+
+    expect(req.user).toBeNull();
+    expect(next).toHaveBeenCalledWith(); // no error — treated as absent
+  });
+
+  it("treats deleted precedence: both timestamps set still resolves to req.user = null (never AccountInactiveError)", async () => {
+    const req = buildReq("auth0|deleted2") as Request;
+    const res = buildRes() as Response;
+    const next = buildNext();
+
+    mockedUser["findUnique"].mockResolvedValueOnce({
+      id: "user_del_002",
+      role: "CONSUMER",
+      email: "deleted+user_del_002@tombstone.invalid",
+      deletedAt: new Date("2026-01-02T00:00:00.000Z"),
+      deactivatedAt: new Date("2026-01-01T00:00:00.000Z"),
+      producer: null,
+    });
+
+    await loadUser(req, res, next);
+
+    expect(req.user).toBeNull();
+    expect(next).toHaveBeenCalledWith();
+  });
+
+  it("calls next(AccountInactiveError) when the matched User is deactivated but not deleted", async () => {
+    const req = buildReq("auth0|deactivated1") as Request;
+    const res = buildRes() as Response;
+    const next = buildNext();
+
+    mockedUser["findUnique"].mockResolvedValueOnce({
+      id: "user_deact_001",
+      role: "PRODUCER",
+      email: "producer@example.com",
+      deletedAt: null,
+      deactivatedAt: new Date("2026-01-01T00:00:00.000Z"),
+      producer: { id: "prod_deact_001" },
+    });
+
+    await loadUser(req, res, next);
+
+    expect(next).toHaveBeenCalledWith(expect.any(AccountInactiveError));
+    const errArg = (next as ReturnType<typeof vi.fn>).mock.calls[0]![0] as AccountInactiveError;
+    expect(errArg.status).toBe(403);
+    expect(errArg.code).toBe("ACCOUNT_INACTIVE");
+    expect(req.user).toBeUndefined();
+  });
+
+  it("queries deletedAt and deactivatedAt so lifecycle state can be evaluated", async () => {
+    const req = buildReq("auth0|active1") as Request;
+    const res = buildRes() as Response;
+    const next = buildNext();
+
+    mockedUser["findUnique"].mockResolvedValueOnce({
+      id: "user_active_001",
+      role: "CONSUMER",
+      email: "active@example.com",
+      deletedAt: null,
+      deactivatedAt: null,
+      producer: null,
+    });
+
+    await loadUser(req, res, next);
+
+    expect(mockedUser["findUnique"]).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({ deletedAt: true, deactivatedAt: true }),
+      }),
+    );
   });
 });

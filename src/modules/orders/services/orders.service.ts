@@ -59,6 +59,7 @@ import { requiresDestinationAddress } from "@/modules/delivery-modes/delivery-mo
 import { decrementStock, restockProduct } from "@/modules/inventory/services/inventory.service";
 import * as notificationsService from "@/modules/notifications/services/notifications.service";
 import type { PendingEmail } from "@/modules/notifications/services/notifications.service";
+import { lockAndAssertOwnersActive } from "@/shared/account-lifecycle";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
@@ -70,6 +71,8 @@ import { prisma } from "@/shared/utils/prisma";
 
 import type { OrderSummaryView } from "../dto/orders.dto";
 import { mapOrderSummaryView } from "../dto/orders.dto";
+
+import { allocateOrderNumber, allocateSubOrderNumber } from "./order-number-allocator";
 
 // ---------------------------------------------------------------------------
 // Internal type alias (consistent with inventory.service.ts pattern)
@@ -112,6 +115,7 @@ export interface SubOrderView {
 
 export interface OrderDetailView {
   id: string;
+  orderNumber: number;
   createdAt: string;
   totalAmount: string;
   status: OrderStatusValue;
@@ -202,6 +206,7 @@ interface ExistingSubOrderRow {
 
 interface ExistingOrderRow {
   id: string;
+  orderNumber: number;
   createdAt: Date;
   totalAmount: DecimalValue;
   subOrders: ExistingSubOrderRow[];
@@ -237,6 +242,7 @@ function mapExistingOrderDetailView(
   const subOrders = order.subOrders.map(mapSubOrderView);
   return {
     id: order.id,
+    orderNumber: order.orderNumber,
     createdAt: order.createdAt.toISOString(),
     totalAmount: order.totalAmount.toFixed(2),
     status: deriveOrderStatus(subOrders.map((s) => s.status)),
@@ -268,7 +274,9 @@ function mapExistingOrderDetailView(
  *       retain `shippingByProducer`/`deliveryModeByProducer` maps.
  *   4. Compute totals with `Prisma.Decimal`, from the cart snapshot + the
  *       step-3a maps, BEFORE any create call.
- *   5. `payment.create` then `order.create`, both persisting the step-4 total.
+ *   5. `payment.create`, then (order-public-numbers WU2) `allocateOrderNumber`
+ *       on this tx, then `order.create` persisting the step-4 total + the
+ *       allocated `orderNumber`.
  *   5a. (Cycle 5 notifications, design "Emission wiring") emit
  *       `PAYMENT_CONFIRMED` + `ORDER_CREATED` (base copy) to the order's
  *       owning Consumer, collected into `pendingEmails`.
@@ -277,10 +285,12 @@ function mapExistingOrderDetailView(
  *       the immutable address snapshot `payments.service.ts` wrote at
  *       intent-creation time. `null` when no matching row exists (all-pickup
  *       checkout, or a webhook-only caller with no prior intent).
- *   6. Group items by producer -> one `subOrder.create` each, copying the
- *       step-5b snapshot into `shipTo*` for `SHIPPING_FLAT_RATE` producers
- *       only (PICKUP stays null), retaining each created id in
- *       `subOrderIdByProducer`. (Cycle 5 notifications) emits ONE
+ *   6. Group items by producer, SORTED producerId order (order-public-numbers
+ *       WU2, design "sorted order") -> `allocateSubOrderNumber` then one
+ *       `subOrder.create` each, copying the step-5b snapshot into `shipTo*`
+ *       for `SHIPPING_FLAT_RATE` producers only (PICKUP stays null),
+ *       retaining each created id in `subOrderIdByProducer`. (Cycle 5
+ *       notifications) emits ONE
  *       `ORDER_CREATED` (producer-audience copy override) per SubOrder,
  *       fanning out to every sub-order Producer, also collected into
  *       `pendingEmails`.
@@ -339,6 +349,52 @@ export async function createOrderFromPayment(
   // Step 1: empty cart rejection.
   if (cartView.items.length === 0) {
     throw new EmptyCartCheckoutError("Cannot checkout an empty cart");
+  }
+
+  // Step 1b (account-lifecycle §"Commerce lifecycle consistency" —
+  // "Checkout MUST re-evaluate consumer and all producer-owner lifecycle
+  // states before committing"; design "createOrderFromPayment locks the
+  // same set before availability/order writes"): lock the consumer + every
+  // distinct producer-owner User row, then assert all ACTIVE. Either this
+  // order-creation transaction wins the lock first and proceeds, or a
+  // concurrent admin deactivate/delete (which takes the SAME row lock to
+  // write `deactivatedAt`/`deletedAt`) wins and this call observes the
+  // now-inactive state and fails closed — checkout never commits after
+  // observing a deactivated/deleted owner.
+  const cartProducerIdsForLock = [...new Set(cartView.items.map((item) => item.producerId))];
+  await lockAndAssertOwnersActive(tx, cartView.userId, cartProducerIdsForLock);
+
+  // Step 1c — re-check idempotency AFTER the lock (orders §"Duplicate
+  // webhook must not double-create an order"). Step 0's plain SELECT ran
+  // BEFORE any lock was held, so two genuinely concurrent duplicate calls
+  // can both miss it (neither committed yet) and both then queue on the
+  // SAME Step 1b lock. The loser only unblocks after the winner has fully
+  // committed — including deleting the checked-out cart items (step 9) —
+  // so without this re-check the loser would wrongly observe "cart items
+  // gone" (CartItemNotAvailableError) instead of idempotently returning the
+  // now-committed order. This mirrors Step 0 exactly; it is intentionally
+  // NOT extracted into a shared helper to keep both call sites' step
+  // numbering and intent independently readable.
+  const existingPaymentAfterLock = await tx.payment.findUnique({
+    where: { providerRef: stripeIntentId },
+    include: {
+      order: {
+        include: {
+          subOrders: {
+            include: { orderLines: true, deliveryMode: { select: { type: true } } },
+          },
+        },
+      },
+    },
+  });
+  if (existingPaymentAfterLock?.order) {
+    return {
+      order: mapExistingOrderDetailView(
+        existingPaymentAfterLock.order,
+        existingPaymentAfterLock.status,
+      ),
+      pendingEmails: [],
+    };
   }
 
   // Derived once, reused by the live re-check (step 2) and the cart clear (step 9).
@@ -456,6 +512,11 @@ export async function createOrderFromPayment(
   }
 
   // Step 5: Payment then Order, both persisting the SAME computed total.
+  // (order-public-numbers WU2, design "Data Flow"): allocate the consumer's
+  // scoped orderNumber on THIS tx right before Order.create — the counter
+  // write commits and rolls back with the aggregate (design "Architecture
+  // Decisions"). Runs AFTER payment.create so the WU1 P2002 idempotency
+  // backstop (design Decision 4) still fires before any counter write.
   const payment = await tx.payment.create({
     data: {
       providerRef: stripeIntentId,
@@ -463,11 +524,13 @@ export async function createOrderFromPayment(
       amount: total,
     },
   });
+  const orderNumber = await allocateOrderNumber(cartView.userId, tx);
   const order = await tx.order.create({
     data: {
       userId: cartView.userId,
       paymentId: payment.id,
       totalAmount: total,
+      orderNumber,
     },
   });
 
@@ -532,19 +595,30 @@ export async function createOrderFromPayment(
 
   const subOrderIdByProducer = new Map<string, string>();
   const subOrderStatusByProducer = new Map<string, SubOrderStatusValue>();
-  for (const producerId of itemsByProducer.keys()) {
+  // (order-public-numbers WU2, design "The producer variant is identical" +
+  // "Producer IDs are processed in sorted order, matching the repository's
+  // deterministic multi-row lock convention"): sort producerIds so each
+  // run's subOrderNumber allocation order is deterministic, mirroring the
+  // ascending-id lock convention in user-row-lock.ts.
+  const sortedProducerIds = [...itemsByProducer.keys()].sort();
+  for (const producerId of sortedProducerIds) {
     const deliveryModeId = deliveryModeByProducer.get(producerId)!;
     // Snapshot flows to delivery modes that require a destination address.
     // PICKUP SubOrders leave every
     // `shipTo*` column null, matching the schema default.
     const modeType = modesById.get(deliveryModeId)!.type;
     const needsDestinationAddress = requiresDestinationAddress(modeType);
+    // (order-public-numbers WU2): allocate this producer's scoped
+    // subOrderNumber on THIS tx right before SubOrder.create — commits and
+    // rolls back with the aggregate, same as the orderNumber allocation above.
+    const subOrderNumber = await allocateSubOrderNumber(producerId, tx);
     const subOrder = await tx.subOrder.create({
       data: {
         orderId: order.id,
         producerId,
         deliveryModeId,
         shippingCostSnapshot: shippingByProducer.get(producerId)!,
+        subOrderNumber,
         ...(needsDestinationAddress && pendingCheckout
           ? {
               shipToLine1: pendingCheckout.addressLine1,
@@ -624,6 +698,7 @@ export async function createOrderFromPayment(
   return {
     order: {
       id: order.id,
+      orderNumber: order.orderNumber,
       createdAt: order.createdAt.toISOString(),
       totalAmount: total.toFixed(2),
       status: deriveOrderStatus(subOrders.map((s) => s.status)),
@@ -660,6 +735,7 @@ export async function listOrders(userId: string): Promise<OrderSummaryView[]> {
     orderBy: { createdAt: "desc" },
     select: {
       id: true,
+      orderNumber: true,
       createdAt: true,
       totalAmount: true,
       subOrders: { select: { status: true } },
@@ -670,6 +746,7 @@ export async function listOrders(userId: string): Promise<OrderSummaryView[]> {
     const statuses = order.subOrders.map((s) => s.status);
     return mapOrderSummaryView({
       id: order.id,
+      orderNumber: order.orderNumber,
       createdAt: order.createdAt,
       totalAmount: order.totalAmount,
       status: deriveOrderStatus(statuses),

@@ -67,7 +67,9 @@ vi.mock("@/modules/cart/services/cart.service", () => ({
 }));
 
 // ---------------------------------------------------------------------------
-// Mock prisma singleton — WU1 only touches deliveryMode.findMany directly.
+// Mock prisma singleton — WU1 only touches deliveryMode.findMany directly;
+// admin-user-management adds the locked-preflight $transaction wrapping
+// `pendingCheckout.upsert` (Step 6c) / `updateMany` (Step 7b bind).
 // ---------------------------------------------------------------------------
 vi.mock("@/shared/utils/prisma", () => ({
   prisma: {
@@ -76,13 +78,33 @@ vi.mock("@/shared/utils/prisma", () => ({
     },
     pendingCheckout: {
       updateMany: vi.fn(),
-      create: vi.fn(),
+      upsert: vi.fn(),
+      // order-public-numbers WU3 — getPaymentStatus's PROCESSING branch.
+      findFirst: vi.fn(),
     },
     // checkout-contracts WU4 (BE-3) — addressId ownership resolution.
     address: {
       findFirst: vi.fn(),
     },
+    // order-public-numbers WU3 — getPaymentStatus reads Payment + nested Order.
+    payment: {
+      findFirst: vi.fn(),
+    },
+    $transaction: vi.fn(),
   },
+}));
+
+// ---------------------------------------------------------------------------
+// Mock the account-lifecycle locked-owner guard — admin-user-management adds
+// this call inside the Step 6c/7b transactions. WU1's original scope (this
+// file) exercises intent-creation business rules only; the guard's own
+// lock/deny behavior has dedicated coverage elsewhere (account-lifecycle
+// unit tests + the real-Postgres concurrency integration suite) — mocked
+// here as an always-passes no-op so this file stays scoped to WU1 (per its
+// own header comment: "WU1 only touches deliveryMode.findMany directly").
+// ---------------------------------------------------------------------------
+vi.mock("@/shared/account-lifecycle", () => ({
+  lockAndAssertOwnersActive: vi.fn().mockResolvedValue(undefined),
 }));
 
 // ---------------------------------------------------------------------------
@@ -126,12 +148,15 @@ import { stripeClient } from "@/modules/payments/services/stripe.client";
 import * as paymentsService from "@/modules/payments/services/payments.service";
 
 const mockedGetCartForCheckout = vi.mocked(getCartForCheckout);
+const mockedPrisma = vi.mocked(prisma);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedDeliveryMode = vi.mocked(prisma).deliveryMode as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedPendingCheckout = vi.mocked(prisma).pendingCheckout as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockedAddress = vi.mocked(prisma).address as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockedPayment = vi.mocked(prisma).payment as any;
 const mockedCreatePaymentIntent = vi.mocked(stripeClient.createPaymentIntent);
 
 // ---------------------------------------------------------------------------
@@ -186,6 +211,14 @@ function makeSelection(overrides: Partial<DeliverySelection> = {}): DeliverySele
 beforeEach(() => {
   vi.clearAllMocks();
   mockedPendingCheckout.updateMany.mockResolvedValue({ count: 1 });
+  mockedPendingCheckout.upsert.mockResolvedValue({});
+  // The locked-preflight (Step 6c) and bind (Step 7b) both run inside
+  // prisma.$transaction — default implementation just invokes the callback
+  // against the SAME mocked prisma delegates (mirrors the project-wide
+  // `mockedPrisma.$transaction.mockImplementationOnce((fn) => fn(mockedPrisma))`
+  // convention used across other integration test files).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  mockedPrisma.$transaction.mockImplementation((fn: any) => fn(mockedPrisma));
 });
 
 // ---------------------------------------------------------------------------
@@ -564,7 +597,6 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
       makeDeliveryModeRow({ type: "PERSONAL_DELIVERY" }),
     ]);
     mockedAddress.findFirst.mockResolvedValueOnce(makeAddressRow());
-    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
     mockedCreatePaymentIntent.mockResolvedValueOnce({
       id: "pi_personal",
       client_secret: "secret_personal",
@@ -575,15 +607,16 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
     expect(mockedAddress.findFirst).toHaveBeenCalledWith({
       where: { id: "addr_A", userId: "user_001", deletedAt: null },
     });
-    expect(mockedPendingCheckout.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({ addressLine1: "Calle Envio 1" }),
-    });
+    expect(mockedPendingCheckout.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ addressLine1: "Calle Envio 1" }),
+      }),
+    );
   });
 
   it("[CPI-ADDR-PICKUP-IGNORED] pickup-only selection with a supplied addressId -> ignored, no address lookup, no snapshot content written", async () => {
     mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView([makeCartItem()]));
     mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryModeRow({ type: "PICKUP" })]);
-    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
     mockedCreatePaymentIntent.mockResolvedValueOnce({
       id: "pi_pickup",
       client_secret: "secret_pickup",
@@ -597,17 +630,19 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
 
     expect(result).toEqual({ clientSecret: "secret_pickup" });
     expect(mockedAddress.findFirst).not.toHaveBeenCalled();
-    expect(mockedPendingCheckout.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        addressLine1: "",
-        addressLine2: null,
-        addressCity: "",
-        addressPostalCode: "",
-        addressProvince: "",
+    expect(mockedPendingCheckout.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          addressLine1: "",
+          addressLine2: null,
+          addressCity: "",
+          addressPostalCode: "",
+          addressProvince: "",
+        }),
       }),
-    });
-    const createCallData = mockedPendingCheckout.create.mock.calls[0]?.[0]?.data;
-    expect(createCallData).not.toHaveProperty("addressCountry");
+    );
+    const upsertCallData = mockedPendingCheckout.upsert.mock.calls[0]?.[0]?.create;
+    expect(upsertCallData).not.toHaveProperty("addressCountry");
   });
 
   it("[CPI-ADDR-OWNERSHIP] addressId resolves to null (unknown or not owned) -> ValidationFailedError, no Stripe call", async () => {
@@ -643,7 +678,6 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
         country: "ES",
       }),
     );
-    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
     mockedCreatePaymentIntent.mockResolvedValueOnce({
       id: "pi_shipping",
       client_secret: "secret_shipping",
@@ -656,16 +690,18 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
     );
 
     expect(result).toEqual({ clientSecret: "secret_shipping" });
-    expect(mockedPendingCheckout.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        addressLine1: "Avenida Real 42",
-        addressLine2: "Piso 3",
-        addressCity: "Alicante",
-        addressPostalCode: "03001",
-        addressProvince: "Alicante",
-        addressCountry: "ES",
+    expect(mockedPendingCheckout.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          addressLine1: "Avenida Real 42",
+          addressLine2: "Piso 3",
+          addressCity: "Alicante",
+          addressPostalCode: "03001",
+          addressProvince: "Alicante",
+          addressCountry: "ES",
+        }),
       }),
-    });
+    );
   });
 
   // R1-001/R3-001 correction (review-bf06f52e2bf5b337): the idempotency
@@ -682,7 +718,6 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
       makeDeliveryModeRow({ type: "SHIPPING_FLAT_RATE" }),
     ]);
     mockedAddress.findFirst.mockResolvedValueOnce(makeAddressRow({ id: "addr_A" }));
-    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
     mockedCreatePaymentIntent.mockResolvedValueOnce({
       id: "pi_addr_A",
       client_secret: "secret_addr_A",
@@ -693,7 +728,6 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
     mockedAddress.findFirst.mockResolvedValueOnce(
       makeAddressRow({ id: "addr_B", line1: "Otra Calle 9", city: "Sevilla" }),
     );
-    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
     mockedCreatePaymentIntent.mockResolvedValueOnce({
       id: "pi_addr_B",
       client_secret: "secret_addr_B",
@@ -706,4 +740,100 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
     expect(firstKey).toBeTruthy();
     expect(secondKey).not.toBe(firstKey);
   });
+});
+
+// ---------------------------------------------------------------------------
+// order-public-numbers WU3 (PR 2, Phase 3) — payments.service.getPaymentStatus
+// `orderNumber` propagation (design "Consumer/payment response contracts",
+// spec scenario "Payment status aligns both identifiers": SUCCEEDED-with-order
+// returns (orderId, orderNumber) TOGETHER; every other branch returns
+// (orderId: null, orderNumber: null) — never one without the other.
+// ---------------------------------------------------------------------------
+
+describe("payments.service.getPaymentStatus — orderNumber propagation (order-public-numbers WU3)", () => {
+  it("[GPS-SELECT] requests both id and orderNumber on the nested order include", async () => {
+    mockedPayment.findFirst.mockResolvedValueOnce(null);
+    mockedPendingCheckout.findFirst.mockResolvedValueOnce(null);
+
+    await paymentsService.getPaymentStatus("user_001", "pi_select");
+
+    expect(mockedPayment.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: { order: { select: { id: true, orderNumber: true } } },
+      }),
+    );
+  });
+
+  it("[GPS-NULL] no Payment row and no PendingCheckout -> returns null", async () => {
+    mockedPayment.findFirst.mockResolvedValueOnce(null);
+    mockedPendingCheckout.findFirst.mockResolvedValueOnce(null);
+
+    const result = await paymentsService.getPaymentStatus("user_001", "pi_absent");
+
+    expect(result).toBeNull();
+  });
+
+  it("[GPS-PROCESSING] no Payment row but an owner-bound PendingCheckout -> PROCESSING, orderId/orderNumber both null", async () => {
+    mockedPayment.findFirst.mockResolvedValueOnce(null);
+    mockedPendingCheckout.findFirst.mockResolvedValueOnce({ id: "pc_1" });
+
+    const result = await paymentsService.getPaymentStatus("user_001", "pi_processing");
+
+    expect(result).toEqual({
+      state: "PROCESSING",
+      orderId: null,
+      orderNumber: null,
+      code: "PAYMENT_PROCESSING",
+    });
+  });
+
+  it("[GPS-SUCCEEDED] SUCCEEDED payment WITH an order -> orderId AND orderNumber together", async () => {
+    mockedPayment.findFirst.mockResolvedValueOnce({
+      status: "SUCCEEDED",
+      order: { id: "order_cuid_1", orderNumber: 7 },
+    });
+
+    const result = await paymentsService.getPaymentStatus("user_001", "pi_succeeded");
+
+    expect(result).toEqual({
+      state: "SUCCEEDED",
+      orderId: "order_cuid_1",
+      orderNumber: 7,
+      code: "PAYMENT_SUCCEEDED",
+    });
+  });
+
+  it("[GPS-SUCCEEDED-NO-ORDER] SUCCEEDED payment with no order yet -> PENDING/NEEDS_REVIEW, orderId/orderNumber both null", async () => {
+    mockedPayment.findFirst.mockResolvedValueOnce({ status: "SUCCEEDED", order: null });
+
+    const result = await paymentsService.getPaymentStatus("user_001", "pi_needs_review");
+
+    expect(result).toEqual({
+      state: "PENDING",
+      orderId: null,
+      orderNumber: null,
+      code: "PAYMENT_NEEDS_REVIEW",
+    });
+  });
+
+  it.each([
+    ["FAILED", "FAILED", "PAYMENT_FAILED"],
+    ["CANCELED", "CANCELED", "PAYMENT_CANCELED"],
+    ["PENDING", "PENDING", "PAYMENT_NEEDS_REVIEW"],
+    ["REFUNDED", "PENDING", "PAYMENT_NEEDS_REVIEW"],
+  ] as const)(
+    "[GPS-%s] %s payment -> orderId AND orderNumber are both null",
+    async (paymentStatus, expectedState, expectedCode) => {
+      mockedPayment.findFirst.mockResolvedValueOnce({ status: paymentStatus, order: null });
+
+      const result = await paymentsService.getPaymentStatus("user_001", `pi_${paymentStatus}`);
+
+      expect(result).toEqual({
+        state: expectedState,
+        orderId: null,
+        orderNumber: null,
+        code: expectedCode,
+      });
+    },
+  );
 });
