@@ -44,6 +44,7 @@ import { requireRole } from "@/shared/middleware/requireRole";
 import * as adminIncidentsController from "../../incidents/controllers/admin-incidents.controller";
 import * as adminUsersController from "../controllers/admin-users.controller";
 import * as adminController from "../controllers/admin.controller";
+import * as databaseBackupsController from "../controllers/database-backups.controller";
 
 export const adminRouter: Router = Router();
 
@@ -97,3 +98,10 @@ adminRouter.patch("/admin/users/:id/activate", adminUsersController.activateUser
 adminRouter.patch("/admin/users/:id/deactivate", adminUsersController.deactivateUser);
 
 adminRouter.delete("/admin/users/:id", adminUsersController.deleteUser);
+
+// Database backup creation and operation polling
+adminRouter.post("/admin/database-backups", databaseBackupsController.createBackup);
+adminRouter.get(
+  "/admin/database-backup-operations/:id",
+  databaseBackupsController.getBackupOperation,
+);

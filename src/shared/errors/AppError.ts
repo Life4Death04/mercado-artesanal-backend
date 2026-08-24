@@ -56,7 +56,14 @@ export type ErrorCode =
   // admin-user-management additions — account lifecycle error contract
   | "ACCOUNT_INACTIVE"
   | "ACCOUNT_DELETED"
-  | "USER_HAS_ACTIVE_ORDERS";
+  | "USER_HAS_ACTIVE_ORDERS"
+  // admin-database-backups additions — backup/restore error contract
+  | "BACKUP_NOT_FOUND"
+  | "BACKUP_OPERATION_NOT_FOUND"
+  | "BACKUP_NOT_RESTORABLE"
+  | "BACKUP_OPERATION_CONFLICT"
+  | "BACKUP_RUNTIME_UNAVAILABLE"
+  | "BACKUP_OPERATION_FAILED";
 
 export interface ProblemDetails {
   type: string;

@@ -14,38 +14,38 @@
  *     released cleanly before the process exits.
  */
 import "dotenv/config";
+import { prepareDatabaseBackups } from "@/modules/admin/services/database-backups.service";
 import { env } from "@/shared/utils/env";
 import { logger } from "@/shared/utils/logger";
 import { prisma } from "@/shared/utils/prisma";
 
 import { createApp } from "./app";
 
-const app = createApp();
-
-const server = app.listen(env.PORT, () => {
-  logger.info({ port: env.PORT, env: env.NODE_ENV }, "Server listening");
-});
-
-function shutdown(signal: string): void {
-  logger.info({ signal }, "Shutdown signal received — closing gracefully");
-  server.close(() => {
-    prisma
-      .$disconnect()
-      .then(() => {
-        logger.info("Server closed and Prisma disconnected");
-        process.exit(0);
-      })
-      .catch((err: unknown) => {
-        logger.error({ err }, "Error during Prisma disconnect");
-        process.exit(1);
-      });
+async function start(): Promise<void> {
+  await prepareDatabaseBackups();
+  const app = createApp();
+  const server = app.listen(env.PORT, () => {
+    logger.info({ port: env.PORT, env: env.NODE_ENV }, "Server listening");
   });
+
+  function shutdown(signal: string): void {
+    logger.info({ signal }, "Shutdown signal received — closing gracefully");
+    server.close(() => {
+      prisma
+        .$disconnect()
+        .then(() => process.exit(0))
+        .catch((err: unknown) => {
+          logger.error({ err }, "Error during Prisma disconnect");
+          process.exit(1);
+        });
+    });
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-process.on("SIGTERM", () => {
-  shutdown("SIGTERM");
-});
-
-process.on("SIGINT", () => {
-  shutdown("SIGINT");
+void start().catch((err: unknown) => {
+  logger.fatal({ err }, "Startup readiness check failed");
+  process.exit(1);
 });

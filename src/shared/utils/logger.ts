@@ -28,6 +28,9 @@
  *   - *.token / *.accessToken / *.idToken / *.refreshToken — JWT-shaped credentials
  *   - req.body.email              — email in POST bodies
  *   - req.body.password           — password in POST bodies
+ *   - *.args / *.env / *.stderr   — pg_dump/pg_restore argv, spawn env, stderr
+ *   - *.archivePath / *.manifestPath / *.tempPath / *.pgPassfilePath — paths
+ *   - *.databaseUrl               — connection strings (admin-database-backups)
  *
  * Redaction is enforced at the logger level — callers cannot bypass it.
  * No other logger (console.log, winston, etc.) may be used in production paths.
@@ -53,6 +56,17 @@ export const REDACT_CONFIG: pino.redactOptions = {
     "*.refreshToken",
     "req.body.email",
     "req.body.password",
+    // admin-database-backups — never log pg_dump/pg_restore argv, spawn env
+    // (PGPASSWORD/PGPASSFILE), filesystem paths, or captured stderr
+    // (design "Storage and Safety": "Never log args/env/paths/stderr/URLs").
+    "*.args",
+    "*.env",
+    "*.stderr",
+    "*.archivePath",
+    "*.manifestPath",
+    "*.tempPath",
+    "*.pgPassfilePath",
+    "*.databaseUrl",
   ],
   censor: "[REDACTED]",
 };
