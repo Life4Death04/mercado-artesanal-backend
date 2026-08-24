@@ -16,11 +16,12 @@
  *   order-fulfillment §"Producer read of own SubOrders"
  *   order-fulfillment §"State machine"
  *   order-fulfillment §"Idempotent transitions"
- *   order-fulfillment §"Tracking number deferred"
+ *   order-fulfillment §"Tracking number on shipment" (MODIFIED)
  *   design — API surface table, Controller layer is thin
  */
 import type { NextFunction, Request, Response } from "express";
 
+import { dispatchEmails } from "@/shared/email/email-provider";
 import { UnauthorizedError } from "@/shared/errors/errors";
 import { validateBody } from "@/shared/validation/zod";
 
@@ -91,10 +92,25 @@ export async function getSubOrder(
  * Transitions SubOrder status via state machine. Returns 200 with updated SubOrder.
  * Returns 404 NOT_FOUND for cross-producer or missing IDs.
  * Returns 409 INVALID_ORDER_TRANSITION for invalid transitions.
- * Returns 422 VALIDATION_FAILED when body contains `trackingNumber` or unknown keys.
+ * Returns 422 VALIDATION_FAILED when body contains an unknown key, or when
+ * `trackingNumber` violates the tracking gate (wrong transition, PICKUP,
+ * immutable overwrite, or missing on a shipping `→sent`).
  *
- * Spec: order-fulfillment §"Tracking number deferred"
- * Scenario: "Attempt to set trackingNumber rejected"
+ * Cycle 5 notifications (design "Emission wiring", Phase 5):
+ * `subOrdersService.transition()` now returns `{ subOrder, pendingEmails }`
+ * instead of a bare `SubOrder` — this controller unwraps `subOrder` for the
+ * wire response (identical shape to before) and dispatches `pendingEmails`
+ * via the shared `dispatchEmails` AFTER `transition()` resolves, i.e. AFTER
+ * its `$transaction` has committed (fire-after-commit, best-effort — a
+ * dispatch failure never surfaces as a controller error).
+ *
+ * Spec: order-fulfillment §"Tracking number on shipment" (MODIFIED)
+ * Scenarios: "Shipping sub-order transitions to sent with a valid
+ * trackingNumber", "Shipping sub-order to sent without trackingNumber
+ * rejected", "PICKUP sub-order rejects trackingNumber", "Already-set
+ * trackingNumber cannot be overwritten", "trackingNumber rejected on a
+ * non-sent transition", "Same-status no-op cannot set trackingNumber"
+ * Spec: notifications §"Sub-order status change and tracking notify the consumer"
  */
 export async function patchSubOrder(
   req: Request,
@@ -106,7 +122,13 @@ export async function patchSubOrder(
 
     const { id } = req.params as { id: string };
     const body = validateBody(PatchSubOrderBodySchema, req.body);
-    const subOrder = await subOrdersService.transition(req.user.producerId, id, body);
+    const { subOrder, pendingEmails } = await subOrdersService.transition(
+      req.user.producerId,
+      id,
+      body,
+    );
+
+    await dispatchEmails(pendingEmails);
 
     res.status(200).json(subOrder);
   } catch (err) {

@@ -79,6 +79,24 @@ vi.mock("@/modules/inventory/services/inventory.service", () => ({
   restockProduct: vi.fn(),
 }));
 
+// ---------------------------------------------------------------------------
+// Mock notifications service (Cycle 5 notifications Phase 4) — the fake
+// `tx` from `makeMockTx()` below has no `tx.notification` delegate, so the
+// REAL `createNotification` (which calls `tx.notification.create`) would
+// crash against it. `createOrderFromPayment`'s notification EMISSION
+// wiring is proven separately (real DB) in
+// `tests/integration/orders.test.ts` [N-EMIT-*]; this file only proves the
+// checkout-write-contract logic that predates Cycle 5, so the emission
+// call is swapped for an observable no-op spy instead.
+// ---------------------------------------------------------------------------
+vi.mock("@/modules/notifications/services/notifications.service", () => ({
+  createNotification: vi.fn().mockResolvedValue({
+    to: "mock-recipient@test.local",
+    subject: "mock subject",
+    body: "mock body",
+  }),
+}));
+
 import { decrementStock, restockProduct } from "@/modules/inventory/services/inventory.service";
 import {
   CartItemNotAvailableError,
@@ -103,7 +121,9 @@ const mockedTransaction = vi.mocked(prisma).$transaction as any;
 // Fixtures
 // ---------------------------------------------------------------------------
 
-function makeCartItemForCheckout(overrides: Partial<CartItemForCheckout> = {}): CartItemForCheckout {
+function makeCartItemForCheckout(
+  overrides: Partial<CartItemForCheckout> = {},
+): CartItemForCheckout {
   return {
     cartItemId: "item_001",
     productId: "product_001",
@@ -122,7 +142,10 @@ function makeCartItemForCheckout(overrides: Partial<CartItemForCheckout> = {}): 
   };
 }
 
-function makeCartView(items: CartItemForCheckout[], overrides: Partial<CartForCheckout> = {}): CartForCheckout {
+function makeCartView(
+  items: CartItemForCheckout[],
+  overrides: Partial<CartForCheckout> = {},
+): CartForCheckout {
   return {
     cartId: "cart_001",
     userId: "user_001",
@@ -172,6 +195,13 @@ function makeMockTx(overrides: Record<string, any> = {}) {
         providerRef: data.providerRef,
       })),
     },
+    // Cycle 5 notifications: `order.userId` is a BARE column (no Prisma
+    // relation — see orders.service.ts "Emission wiring" comment), so
+    // createOrderFromPayment resolves the recipient email via a separate
+    // `tx.user.findUnique` — mocked below.
+    user: {
+      findUnique: vi.fn().mockResolvedValue({ email: "consumer@test.local" }),
+    },
     order: {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       create: vi.fn().mockImplementation(async ({ data }: any) => ({
@@ -191,6 +221,13 @@ function makeMockTx(overrides: Record<string, any> = {}) {
         deliveryModeId: data.deliveryModeId,
         shippingCostSnapshot: data.shippingCostSnapshot,
         status: "pending",
+        // Cycle 5 notifications: `include: { producer: { select: { userId,
+        // user } } }` resolves each producer's recipient email in-tx for
+        // the ORDER_CREATED fan-out.
+        producer: {
+          userId: `producerUser_${data.producerId}`,
+          user: { email: `${data.producerId}@test.local` },
+        },
       })),
     },
     orderLine: {
@@ -293,7 +330,7 @@ describe("ordersService.createOrderFromPayment — idempotency pre-check [CO-IDE
     });
 
     const cartView = makeCartView([makeCartItemForCheckout()]);
-    const result = await ordersService.createOrderFromPayment(
+    const { order: result } = await ordersService.createOrderFromPayment(
       "pi_123",
       cartView,
       [{ producerId: "producer_A", deliveryModeId: "dm_A" }],
@@ -314,9 +351,9 @@ describe("ordersService.createOrderFromPayment — empty cart rejection [CO-EMPT
     const tx = makeMockTx();
     const cartView = makeCartView([]);
 
-    await expect(
-      ordersService.createOrderFromPayment("pi_123", cartView, [], tx),
-    ).rejects.toThrow(EmptyCartCheckoutError);
+    await expect(ordersService.createOrderFromPayment("pi_123", cartView, [], tx)).rejects.toThrow(
+      EmptyCartCheckoutError,
+    );
     expect(tx.cartItem.findMany).not.toHaveBeenCalled();
     expect(tx.payment.create).not.toHaveBeenCalled();
   });
@@ -361,7 +398,11 @@ describe("ordersService.createOrderFromPayment — availability gates [CO-SNAPSH
   it("[CO-LIVE-UNAVAIL] live re-check finds an inactive product, all-or-nothing rejection, no writes", async () => {
     const tx = makeMockTx({
       cartItem: {
-        findMany: vi.fn().mockResolvedValue([makeLiveCartItemRow({ product: { ...makeLiveCartItemRow().product, isActive: false } })]),
+        findMany: vi
+          .fn()
+          .mockResolvedValue([
+            makeLiveCartItemRow({ product: { ...makeLiveCartItemRow().product, isActive: false } }),
+          ]),
         deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
       },
     });
@@ -385,9 +426,9 @@ describe("ordersService.createOrderFromPayment — deliverySelections validation
     const tx = makeMockTx();
     const cartView = makeCartView([makeCartItemForCheckout({ producerId: "producer_A" })]);
 
-    await expect(
-      ordersService.createOrderFromPayment("pi_123", cartView, [], tx),
-    ).rejects.toThrow(ValidationFailedError);
+    await expect(ordersService.createOrderFromPayment("pi_123", cartView, [], tx)).rejects.toThrow(
+      ValidationFailedError,
+    );
     expect(tx.payment.create).not.toHaveBeenCalled();
   });
 
@@ -425,7 +466,9 @@ describe("ordersService.createOrderFromPayment — deliverySelections validation
   it("[CO-SEL-MISMATCH] resolved DeliveryMode.producerId != selection.producerId -> ValidationFailedError", async () => {
     const tx = makeMockTx({
       deliveryMode: {
-        findMany: vi.fn().mockResolvedValue([makeDeliveryModeRow({ producerId: "producer_OTHER" })]),
+        findMany: vi
+          .fn()
+          .mockResolvedValue([makeDeliveryModeRow({ producerId: "producer_OTHER" })]),
       },
     });
     const cartView = makeCartView([makeCartItemForCheckout({ producerId: "producer_A" })]);
@@ -442,7 +485,9 @@ describe("ordersService.createOrderFromPayment — deliverySelections validation
 
   it("[CO-SEL-INACTIVE] resolved DeliveryMode.isActive = false -> ValidationFailedError", async () => {
     const tx = makeMockTx({
-      deliveryMode: { findMany: vi.fn().mockResolvedValue([makeDeliveryModeRow({ isActive: false })]) },
+      deliveryMode: {
+        findMany: vi.fn().mockResolvedValue([makeDeliveryModeRow({ isActive: false })]),
+      },
     });
     const cartView = makeCartView([makeCartItemForCheckout({ producerId: "producer_A" })]);
 
@@ -487,20 +532,38 @@ describe("ordersService.createOrderFromPayment — exact D4 step order [CO-ORDER
         makeLiveCartItemRow({
           id: "item_A",
           productId: "product_A",
-          product: { id: "product_A", isActive: true, deletedAt: null, producer: { id: "producer_A", deletedAt: null } },
+          product: {
+            id: "product_A",
+            isActive: true,
+            deletedAt: null,
+            producer: { id: "producer_A", deletedAt: null },
+          },
         }),
         makeLiveCartItemRow({
           id: "item_B",
           productId: "product_B",
-          product: { id: "product_B", isActive: true, deletedAt: null, producer: { id: "producer_B", deletedAt: null } },
+          product: {
+            id: "product_B",
+            isActive: true,
+            deletedAt: null,
+            producer: { id: "producer_B", deletedAt: null },
+          },
         }),
       ];
     });
     tx.deliveryMode.findMany.mockImplementation(async () => {
       calls.push("deliveryMode.findMany");
       return [
-        makeDeliveryModeRow({ id: "dm_A", producerId: "producer_A", cost: new Prisma.Decimal("2.00") }),
-        makeDeliveryModeRow({ id: "dm_B", producerId: "producer_B", cost: new Prisma.Decimal("4.00") }),
+        makeDeliveryModeRow({
+          id: "dm_A",
+          producerId: "producer_A",
+          cost: new Prisma.Decimal("2.00"),
+        }),
+        makeDeliveryModeRow({
+          id: "dm_B",
+          producerId: "producer_B",
+          cost: new Prisma.Decimal("4.00"),
+        }),
       ];
     });
     const originalPaymentCreate = tx.payment.create.getMockImplementation()!;
@@ -561,9 +624,13 @@ describe("ordersService.createOrderFromPayment — exact D4 step order [CO-ORDER
     const deleteManyIdx = calls.indexOf("cartItem.deleteMany");
 
     // subOrder creates happen before any orderLine create
-    expect(Math.max(subOrderIdxA, subOrderIdxB)).toBeLessThan(Math.min(orderLineIdxA, orderLineIdxB));
+    expect(Math.max(subOrderIdxA, subOrderIdxB)).toBeLessThan(
+      Math.min(orderLineIdxA, orderLineIdxB),
+    );
     // orderLine creates happen before decrementStock calls
-    expect(Math.max(orderLineIdxA, orderLineIdxB)).toBeLessThan(Math.min(decrementIdxA, decrementIdxB));
+    expect(Math.max(orderLineIdxA, orderLineIdxB)).toBeLessThan(
+      Math.min(decrementIdxA, decrementIdxB),
+    );
     // decrementStock calls happen before the final cart clear
     expect(Math.max(decrementIdxA, decrementIdxB)).toBeLessThan(deleteManyIdx);
     // cart clear is the LAST call
@@ -600,22 +667,57 @@ describe("ordersService.createOrderFromPayment — Decimal totals [CO-DECIMAL]",
     const tx = makeMockTx({
       cartItem: {
         findMany: vi.fn().mockResolvedValue([
-          makeLiveCartItemRow({ id: "item_A1", productId: "product_A1", product: { id: "product_A1", isActive: true, deletedAt: null, producer: { id: "producer_A", deletedAt: null } } }),
-          makeLiveCartItemRow({ id: "item_A2", productId: "product_A2", product: { id: "product_A2", isActive: true, deletedAt: null, producer: { id: "producer_A", deletedAt: null } } }),
-          makeLiveCartItemRow({ id: "item_B", productId: "product_B", product: { id: "product_B", isActive: true, deletedAt: null, producer: { id: "producer_B", deletedAt: null } } }),
+          makeLiveCartItemRow({
+            id: "item_A1",
+            productId: "product_A1",
+            product: {
+              id: "product_A1",
+              isActive: true,
+              deletedAt: null,
+              producer: { id: "producer_A", deletedAt: null },
+            },
+          }),
+          makeLiveCartItemRow({
+            id: "item_A2",
+            productId: "product_A2",
+            product: {
+              id: "product_A2",
+              isActive: true,
+              deletedAt: null,
+              producer: { id: "producer_A", deletedAt: null },
+            },
+          }),
+          makeLiveCartItemRow({
+            id: "item_B",
+            productId: "product_B",
+            product: {
+              id: "product_B",
+              isActive: true,
+              deletedAt: null,
+              producer: { id: "producer_B", deletedAt: null },
+            },
+          }),
         ]),
         deleteMany: vi.fn().mockResolvedValue({ count: 3 }),
       },
       deliveryMode: {
         findMany: vi.fn().mockResolvedValue([
-          makeDeliveryModeRow({ id: "dm_A", producerId: "producer_A", cost: new Prisma.Decimal("2.00") }),
-          makeDeliveryModeRow({ id: "dm_B", producerId: "producer_B", cost: new Prisma.Decimal("4.00") }),
+          makeDeliveryModeRow({
+            id: "dm_A",
+            producerId: "producer_A",
+            cost: new Prisma.Decimal("2.00"),
+          }),
+          makeDeliveryModeRow({
+            id: "dm_B",
+            producerId: "producer_B",
+            cost: new Prisma.Decimal("4.00"),
+          }),
         ]),
       },
     });
 
     const cartView = makeCartView([producerAItem1, producerAItem2, producerBItem]);
-    const result = await ordersService.createOrderFromPayment(
+    const { order: result } = await ordersService.createOrderFromPayment(
       "pi_123",
       cartView,
       [
@@ -629,9 +731,13 @@ describe("ordersService.createOrderFromPayment — Decimal totals [CO-DECIMAL]",
     expect(result.totalAmount).toBe("29.00");
     const paymentCreateArg = tx.payment.create.mock.calls[0]![0];
     expect(paymentCreateArg.data.amount).toBeInstanceOf(Prisma.Decimal);
-    expect((paymentCreateArg.data.amount as InstanceType<typeof Prisma.Decimal>).toFixed(2)).toBe("29.00");
+    expect((paymentCreateArg.data.amount as InstanceType<typeof Prisma.Decimal>).toFixed(2)).toBe(
+      "29.00",
+    );
     const orderCreateArg = tx.order.create.mock.calls[0]![0];
-    expect((orderCreateArg.data.totalAmount as InstanceType<typeof Prisma.Decimal>).toFixed(2)).toBe("29.00");
+    expect(
+      (orderCreateArg.data.totalAmount as InstanceType<typeof Prisma.Decimal>).toFixed(2),
+    ).toBe("29.00");
   });
 });
 
@@ -655,21 +761,47 @@ describe("ordersService.createOrderFromPayment — maps for shipping/deliveryMod
     const tx = makeMockTx({
       cartItem: {
         findMany: vi.fn().mockResolvedValue([
-          makeLiveCartItemRow({ id: "item_A", productId: "product_A", product: { id: "product_A", isActive: true, deletedAt: null, producer: { id: "producer_A", deletedAt: null } } }),
-          makeLiveCartItemRow({ id: "item_B", productId: "product_B", product: { id: "product_B", isActive: true, deletedAt: null, producer: { id: "producer_B", deletedAt: null } } }),
+          makeLiveCartItemRow({
+            id: "item_A",
+            productId: "product_A",
+            product: {
+              id: "product_A",
+              isActive: true,
+              deletedAt: null,
+              producer: { id: "producer_A", deletedAt: null },
+            },
+          }),
+          makeLiveCartItemRow({
+            id: "item_B",
+            productId: "product_B",
+            product: {
+              id: "product_B",
+              isActive: true,
+              deletedAt: null,
+              producer: { id: "producer_B", deletedAt: null },
+            },
+          }),
         ]),
         deleteMany: vi.fn().mockResolvedValue({ count: 2 }),
       },
       deliveryMode: {
         findMany: vi.fn().mockResolvedValue([
-          makeDeliveryModeRow({ id: "dm_A", producerId: "producer_A", cost: new Prisma.Decimal("2.00") }),
-          makeDeliveryModeRow({ id: "dm_B", producerId: "producer_B", cost: new Prisma.Decimal("4.00") }),
+          makeDeliveryModeRow({
+            id: "dm_A",
+            producerId: "producer_A",
+            cost: new Prisma.Decimal("2.00"),
+          }),
+          makeDeliveryModeRow({
+            id: "dm_B",
+            producerId: "producer_B",
+            cost: new Prisma.Decimal("4.00"),
+          }),
         ]),
       },
     });
 
     const cartView = makeCartView([producerAItem, producerBItem]);
-    const result = await ordersService.createOrderFromPayment(
+    const { order: result } = await ordersService.createOrderFromPayment(
       "pi_123",
       cartView,
       [
@@ -682,13 +814,21 @@ describe("ordersService.createOrderFromPayment — maps for shipping/deliveryMod
     // subOrder.create called once per producer, with the correct shipping/deliveryMode from the maps
     expect(tx.subOrder.create).toHaveBeenCalledTimes(2);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const subOrderCallA = tx.subOrder.create.mock.calls.find((c: any) => c[0].data.producerId === "producer_A")![0];
+    const subOrderCallA = tx.subOrder.create.mock.calls.find(
+      (c: any) => c[0].data.producerId === "producer_A",
+    )![0];
     expect(subOrderCallA.data.deliveryModeId).toBe("dm_A");
-    expect((subOrderCallA.data.shippingCostSnapshot as InstanceType<typeof Prisma.Decimal>).toFixed(2)).toBe("2.00");
+    expect(
+      (subOrderCallA.data.shippingCostSnapshot as InstanceType<typeof Prisma.Decimal>).toFixed(2),
+    ).toBe("2.00");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const subOrderCallB = tx.subOrder.create.mock.calls.find((c: any) => c[0].data.producerId === "producer_B")![0];
+    const subOrderCallB = tx.subOrder.create.mock.calls.find(
+      (c: any) => c[0].data.producerId === "producer_B",
+    )![0];
     expect(subOrderCallB.data.deliveryModeId).toBe("dm_B");
-    expect((subOrderCallB.data.shippingCostSnapshot as InstanceType<typeof Prisma.Decimal>).toFixed(2)).toBe("4.00");
+    expect(
+      (subOrderCallB.data.shippingCostSnapshot as InstanceType<typeof Prisma.Decimal>).toFixed(2),
+    ).toBe("4.00");
 
     // Response maps each SubOrder to its own producer's orderLines only
     const subOrderViewA = result.subOrders.find((s) => s.producerId === "producer_A")!;
@@ -700,9 +840,13 @@ describe("ordersService.createOrderFromPayment — maps for shipping/deliveryMod
 
     // OrderLine.create was called with the subOrderId belonging to the SAME producer
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const orderLineCallA = tx.orderLine.create.mock.calls.find((c: any) => c[0].data.productId === "product_A")![0];
+    const orderLineCallA = tx.orderLine.create.mock.calls.find(
+      (c: any) => c[0].data.productId === "product_A",
+    )![0];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const orderLineCallB = tx.orderLine.create.mock.calls.find((c: any) => c[0].data.productId === "product_B")![0];
+    const orderLineCallB = tx.orderLine.create.mock.calls.find(
+      (c: any) => c[0].data.productId === "product_B",
+    )![0];
     expect(orderLineCallA.data.subOrderId).toBe(subOrderViewA.id);
     expect(orderLineCallB.data.subOrderId).toBe(subOrderViewB.id);
   });
@@ -740,20 +884,40 @@ describe("ordersService.createOrderFromPayment — BE-3 shipTo* snapshot copy [C
           makeLiveCartItemRow({
             id: "item_ship",
             productId: "product_ship",
-            product: { id: "product_ship", isActive: true, deletedAt: null, producer: { id: "producer_ship", deletedAt: null } },
+            product: {
+              id: "product_ship",
+              isActive: true,
+              deletedAt: null,
+              producer: { id: "producer_ship", deletedAt: null },
+            },
           }),
           makeLiveCartItemRow({
             id: "item_pick",
             productId: "product_pick",
-            product: { id: "product_pick", isActive: true, deletedAt: null, producer: { id: "producer_pick", deletedAt: null } },
+            product: {
+              id: "product_pick",
+              isActive: true,
+              deletedAt: null,
+              producer: { id: "producer_pick", deletedAt: null },
+            },
           }),
         ]),
         deleteMany: vi.fn().mockResolvedValue({ count: 2 }),
       },
       deliveryMode: {
         findMany: vi.fn().mockResolvedValue([
-          makeDeliveryModeRow({ id: "dm_ship", producerId: "producer_ship", type: "SHIPPING_FLAT_RATE", cost: new Prisma.Decimal("2.00") }),
-          makeDeliveryModeRow({ id: "dm_pick", producerId: "producer_pick", type: "PICKUP", cost: new Prisma.Decimal("0.00") }),
+          makeDeliveryModeRow({
+            id: "dm_ship",
+            producerId: "producer_ship",
+            type: "SHIPPING_FLAT_RATE",
+            cost: new Prisma.Decimal("2.00"),
+          }),
+          makeDeliveryModeRow({
+            id: "dm_pick",
+            producerId: "producer_pick",
+            type: "PICKUP",
+            cost: new Prisma.Decimal("0.00"),
+          }),
         ]),
       },
       pendingCheckout: {
@@ -772,11 +936,17 @@ describe("ordersService.createOrderFromPayment — BE-3 shipTo* snapshot copy [C
       tx,
     );
 
-    expect(tx.pendingCheckout.findUnique).toHaveBeenCalledWith({ where: { providerRef: "pi_shipto" } });
+    expect(tx.pendingCheckout.findUnique).toHaveBeenCalledWith({
+      where: { providerRef: "pi_shipto" },
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const shipCall = tx.subOrder.create.mock.calls.find((c: any) => c[0].data.producerId === "producer_ship")![0];
+    const shipCall = tx.subOrder.create.mock.calls.find(
+      (c: any) => c[0].data.producerId === "producer_ship",
+    )![0];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const pickCall = tx.subOrder.create.mock.calls.find((c: any) => c[0].data.producerId === "producer_pick")![0];
+    const pickCall = tx.subOrder.create.mock.calls.find(
+      (c: any) => c[0].data.producerId === "producer_pick",
+    )![0];
 
     expect(shipCall.data.shipToLine1).toBe("Calle Test 1");
     expect(shipCall.data.shipToCity).toBe("Madrid");
@@ -804,6 +974,38 @@ describe("ordersService.createOrderFromPayment — BE-3 shipTo* snapshot copy [C
     const call = tx.subOrder.create.mock.calls[0]![0];
     expect(call.data.shipToLine1).toBeUndefined();
   });
+
+  it("copies the destination snapshot into a PERSONAL_DELIVERY SubOrder", async () => {
+    const tx = makeMockTx({
+      deliveryMode: {
+        findMany: vi.fn().mockResolvedValue([makeDeliveryModeRow({ type: "PERSONAL_DELIVERY" })]),
+      },
+      pendingCheckout: {
+        findUnique: vi.fn().mockResolvedValue({
+          addressLine1: "Calle Personal 7",
+          addressLine2: null,
+          addressCity: "Madrid",
+          addressPostalCode: "28001",
+          addressProvince: "Madrid",
+          addressCountry: "ES",
+        }),
+      },
+    });
+
+    await ordersService.createOrderFromPayment(
+      "pi_personal",
+      makeCartView([makeCartItemForCheckout()]),
+      [{ producerId: "producer_A", deliveryModeId: "dm_A" }],
+      tx,
+    );
+
+    expect(tx.subOrder.create.mock.calls[0]![0].data).toEqual(
+      expect.objectContaining({
+        shipToLine1: "Calle Personal 7",
+        shipToPostalCode: "28001",
+      }),
+    );
+  });
 });
 
 describe("ordersService.createOrderFromPayment — snapshot line mapping [CO-SNAPSHOT-LINE]", () => {
@@ -812,9 +1014,11 @@ describe("ordersService.createOrderFromPayment — snapshot line mapping [CO-SNA
     // the created OrderLine must still reflect the FROZEN cart snapshot value.
     const tx = makeMockTx({
       cartItem: {
-        findMany: vi.fn().mockResolvedValue([
-          makeLiveCartItemRow({ unitPriceSnapshot: new Prisma.Decimal("999.99") }),
-        ]),
+        findMany: vi
+          .fn()
+          .mockResolvedValue([
+            makeLiveCartItemRow({ unitPriceSnapshot: new Prisma.Decimal("999.99") }),
+          ]),
         deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
       },
     });
@@ -823,7 +1027,7 @@ describe("ordersService.createOrderFromPayment — snapshot line mapping [CO-SNA
       makeCartItemForCheckout({ unitPriceSnapshot: "5.00", quantity: 2 }),
     ]);
 
-    const result = await ordersService.createOrderFromPayment(
+    const { order: result } = await ordersService.createOrderFromPayment(
       "pi_123",
       cartView,
       [{ producerId: "producer_A", deliveryModeId: "dm_A" }],
@@ -831,7 +1035,9 @@ describe("ordersService.createOrderFromPayment — snapshot line mapping [CO-SNA
     );
 
     const orderLineCreateArg = tx.orderLine.create.mock.calls[0]![0];
-    expect((orderLineCreateArg.data.unitPriceSnapshot as InstanceType<typeof Prisma.Decimal>).toFixed(2)).toBe("5.00");
+    expect(
+      (orderLineCreateArg.data.unitPriceSnapshot as InstanceType<typeof Prisma.Decimal>).toFixed(2),
+    ).toBe("5.00");
     expect(result.subOrders[0]!.orderLines[0]!.unitPriceSnapshot).toBe("5.00");
   });
 });
@@ -1079,7 +1285,9 @@ describe("ordersService.cancelOrder — in-tx read + ownership [CX-INTX-READ][CX
   });
 
   it("[CX-404] unknown or unowned id -> NotFoundError, no restock/updateMany issued", async () => {
-    const tx = makeCancelMockTx({ order: { findFirst: vi.fn().mockResolvedValue(null), update: vi.fn() } });
+    const tx = makeCancelMockTx({
+      order: { findFirst: vi.fn().mockResolvedValue(null), update: vi.fn() },
+    });
     stubTransaction(tx);
 
     await expect(ordersService.cancelOrder("user_001", "bogus-id")).rejects.toBeInstanceOf(
@@ -1094,9 +1302,9 @@ describe("ordersService.cancelOrder — derived-PENDING pre-check [CX-PRECHECK]"
   it("[CX-PRECHECK] a non-pending SubOrder (derived status != PENDING) fast-fails with InvalidOrderTransitionError, no restock issued", async () => {
     const tx = makeCancelMockTx({
       order: {
-        findFirst: vi.fn().mockResolvedValue(
-          makeCancelOrderRow([makeCancelSubOrderRow({ status: "preparing" })]),
-        ),
+        findFirst: vi
+          .fn()
+          .mockResolvedValue(makeCancelOrderRow([makeCancelSubOrderRow({ status: "preparing" })])),
         update: vi.fn(),
       },
     });
@@ -1112,9 +1320,9 @@ describe("ordersService.cancelOrder — derived-PENDING pre-check [CX-PRECHECK]"
   it("[CX-PRECHECK-CANCELLED] an already-CANCELLED order fast-fails with InvalidOrderTransitionError (no silent no-op)", async () => {
     const tx = makeCancelMockTx({
       order: {
-        findFirst: vi.fn().mockResolvedValue(
-          makeCancelOrderRow([makeCancelSubOrderRow({ status: "cancelled" })]),
-        ),
+        findFirst: vi
+          .fn()
+          .mockResolvedValue(makeCancelOrderRow([makeCancelSubOrderRow({ status: "cancelled" })])),
         update: vi.fn(),
       },
     });
@@ -1134,20 +1342,38 @@ describe("ordersService.cancelOrder — restockProduct per line [CX-RESTOCK]", (
         id: "subOrder_A",
         producerId: "producer_A",
         orderLines: [
-          { id: "line_1", productId: "product_A1", quantity: 2, unitPriceSnapshot: new Prisma.Decimal("5.00") },
-          { id: "line_2", productId: "product_A2", quantity: 1, unitPriceSnapshot: new Prisma.Decimal("3.00") },
+          {
+            id: "line_1",
+            productId: "product_A1",
+            quantity: 2,
+            unitPriceSnapshot: new Prisma.Decimal("5.00"),
+          },
+          {
+            id: "line_2",
+            productId: "product_A2",
+            quantity: 1,
+            unitPriceSnapshot: new Prisma.Decimal("3.00"),
+          },
         ],
       }),
       makeCancelSubOrderRow({
         id: "subOrder_B",
         producerId: "producer_B",
         orderLines: [
-          { id: "line_3", productId: "product_B1", quantity: 4, unitPriceSnapshot: new Prisma.Decimal("1.00") },
+          {
+            id: "line_3",
+            productId: "product_B1",
+            quantity: 4,
+            unitPriceSnapshot: new Prisma.Decimal("1.00"),
+          },
         ],
       }),
     ];
     const tx = makeCancelMockTx({
-      order: { findFirst: vi.fn().mockResolvedValue(makeCancelOrderRow(subOrders)), update: vi.fn() },
+      order: {
+        findFirst: vi.fn().mockResolvedValue(makeCancelOrderRow(subOrders)),
+        update: vi.fn(),
+      },
       subOrder: { updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
     });
     stubTransaction(tx);
@@ -1180,7 +1406,10 @@ describe("ordersService.cancelOrder — guarded updateMany [CX-UPDATEMANY][CX-CO
       makeCancelSubOrderRow({ id: "subOrder_B", producerId: "producer_B", orderLines: [] }),
     ];
     const tx = makeCancelMockTx({
-      order: { findFirst: vi.fn().mockResolvedValue(makeCancelOrderRow(subOrders)), update: vi.fn() },
+      order: {
+        findFirst: vi.fn().mockResolvedValue(makeCancelOrderRow(subOrders)),
+        update: vi.fn(),
+      },
       // Only 1 row matched the conditional WHERE — a concurrent producer transition
       // flipped the other SubOrder away from "pending" between the pre-check and this write.
       subOrder: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
@@ -1213,12 +1442,20 @@ describe("ordersService.cancelOrder — success mapping [CX-SUCCESS]", () => {
         producerId: "producer_B",
         status: "pending",
         orderLines: [
-          { id: "line_2", productId: "product_B", quantity: 1, unitPriceSnapshot: new Prisma.Decimal("10.00") },
+          {
+            id: "line_2",
+            productId: "product_B",
+            quantity: 1,
+            unitPriceSnapshot: new Prisma.Decimal("10.00"),
+          },
         ],
       }),
     ];
     const tx = makeCancelMockTx({
-      order: { findFirst: vi.fn().mockResolvedValue(makeCancelOrderRow(subOrders)), update: vi.fn() },
+      order: {
+        findFirst: vi.fn().mockResolvedValue(makeCancelOrderRow(subOrders)),
+        update: vi.fn(),
+      },
       subOrder: { updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
     });
     stubTransaction(tx);

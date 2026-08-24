@@ -122,6 +122,25 @@ describe("subOrdersService.findAll", () => {
 
     expect(result).toEqual([]);
   });
+
+  it("includes deliveryMode.type in the query so producer reads can gate tracking behavior", async () => {
+    // Spec: order-fulfillment §"Consumer sub-order read exposes tracking and
+    // delivery mode" (ADDED) — "Producer sub-order reads MUST also expose
+    // deliveryMode.type".
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.subOrder as any).findMany.mockResolvedValueOnce([]);
+
+    await subOrdersService.findAll("prod_001");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const callArgs = (mockedPrisma.subOrder as any).findMany.mock.calls[0][0] as Record<
+      string,
+      unknown
+    >;
+    expect((callArgs.include as Record<string, unknown>).deliveryMode).toEqual({
+      select: { type: true },
+    });
+  });
 });
 
 // ===========================================================================
@@ -169,5 +188,25 @@ describe("subOrdersService.findById", () => {
     await expect(
       subOrdersService.findById("prod_001", "nonexistent_id"),
     ).rejects.toThrow(NotFoundError);
+  });
+
+  it("includes deliveryMode.type in the query so producer reads can gate tracking behavior", async () => {
+    // Spec: order-fulfillment §"Consumer sub-order read exposes tracking and
+    // delivery mode" (ADDED) — "Producer sub-order reads MUST also expose
+    // deliveryMode.type".
+    const so = makeSubOrder();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.subOrder as any).findFirst.mockResolvedValueOnce(so);
+
+    await subOrdersService.findById("prod_001", "so_001");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const callArgs = (mockedPrisma.subOrder as any).findFirst.mock.calls[0][0] as Record<
+      string,
+      unknown
+    >;
+    expect((callArgs.include as Record<string, unknown>).deliveryMode).toEqual({
+      select: { type: true },
+    });
   });
 });

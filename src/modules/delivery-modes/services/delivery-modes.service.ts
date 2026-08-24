@@ -26,7 +26,8 @@
  *   spec delivery-modes §"Producer-scoped CRUD", §"PICKUP without pickupLocation rejected",
  *                        §"Cross-producer read returns 404", §"Delete blocked by active SubOrder reference"
  */
-import type { DeliveryMode, SubOrderStatus } from "@prisma/client";
+import type { DeliveryMode, DeliveryModeType, SubOrderStatus } from "@prisma/client";
+import { Decimal } from "@prisma/client/runtime/library";
 
 import { getCartForCheckout } from "@/modules/cart/services/cart.service";
 import {
@@ -54,31 +55,132 @@ export interface DeliveryModesForProducerView {
 // Design: count SubOrder rows where status IN (pending, preparing, sent)
 // ---------------------------------------------------------------------------
 const ACTIVE_SUBORDER_STATUSES: SubOrderStatus[] = ["pending", "preparing", "sent"];
+const MAX_DELIVERY_MODE_COST = 99_999_999.99;
 
 // ---------------------------------------------------------------------------
-// PICKUP invariant guard — shared by create and update
+// Type-specific configuration normalization — shared by create and update
 // ---------------------------------------------------------------------------
 
-/**
- * Enforce the PICKUP+pickupLocation invariant.
- *
- * If `effectiveType` is "PICKUP" and `effectivePickupLocation` is absent or empty,
- * throw ValidationFailedError (422) before any DB write.
- *
- * Called by both `create()` (with direct input fields) and `update()` (with merged
- * effective values: `input.type ?? existingType`, `input.pickupLocation ?? existingPickupLocation`).
- *
- * Spec: delivery-modes §"PICKUP without pickupLocation rejected"
- */
-function ensurePickupLocationForPickup(
-  effectiveType: string | undefined,
-  effectivePickupLocation: string | null | undefined,
-): void {
-  if (effectiveType === "PICKUP" && !effectivePickupLocation) {
+type DeliveryConfiguration = Pick<
+  DeliveryMode,
+  | "coverageZone"
+  | "carrierCompany"
+  | "notes"
+  | "pickupLocation"
+  | "pickupLocationName"
+  | "pickupStreet"
+  | "pickupMunicipality"
+  | "pickupPostalCode"
+  | "pickupOpeningHours"
+>;
+
+function buildCompatibilityPickupLocation(configuration: DeliveryConfiguration): string | null {
+  if (!configuration.pickupStreet) {
+    return configuration.pickupLocation;
+  }
+
+  const municipality = [configuration.pickupPostalCode, configuration.pickupMunicipality]
+    .filter(Boolean)
+    .join(" ");
+
+  return [configuration.pickupLocationName, configuration.pickupStreet, municipality]
+    .filter(Boolean)
+    .join(", ");
+}
+
+function normalizeConfiguration(
+  type: DeliveryModeType,
+  configuration: DeliveryConfiguration,
+  pickupLocationSource: "derive" | "preserve" = "derive",
+): DeliveryConfiguration {
+  if (type === "PICKUP") {
+    if (!configuration.pickupLocation && !configuration.pickupStreet) {
+      throw new ValidationFailedError([
+        {
+          path: "pickupLocation",
+          message: "pickupLocation or pickupStreet is required when type is PICKUP",
+        },
+      ]);
+    }
+
+    return {
+      ...configuration,
+      coverageZone: null,
+      carrierCompany: null,
+      pickupLocation:
+        pickupLocationSource === "derive"
+          ? buildCompatibilityPickupLocation(configuration)
+          : configuration.pickupLocation,
+    };
+  }
+
+  return {
+    ...configuration,
+    carrierCompany: type === "SHIPPING_FLAT_RATE" ? configuration.carrierCompany : null,
+    pickupLocation: null,
+    pickupLocationName: null,
+    pickupStreet: null,
+    pickupMunicipality: null,
+    pickupPostalCode: null,
+    pickupOpeningHours: null,
+  };
+}
+
+function configurationFromInput(input: CreateDeliveryModeBody): DeliveryConfiguration {
+  return {
+    coverageZone: input.coverageZone ?? null,
+    carrierCompany: input.carrierCompany ?? null,
+    notes: input.notes ?? null,
+    pickupLocation: input.pickupLocation ?? null,
+    pickupLocationName: input.pickupLocationName ?? null,
+    pickupStreet: input.pickupStreet ?? null,
+    pickupMunicipality: input.pickupMunicipality ?? null,
+    pickupPostalCode: input.pickupPostalCode ?? null,
+    pickupOpeningHours: input.pickupOpeningHours ?? null,
+  };
+}
+
+function mergeConfiguration(
+  current: DeliveryConfiguration,
+  input: UpdateDeliveryModeBody,
+): DeliveryConfiguration {
+  return {
+    coverageZone: input.coverageZone === undefined ? current.coverageZone : input.coverageZone,
+    carrierCompany:
+      input.carrierCompany === undefined ? current.carrierCompany : input.carrierCompany,
+    notes: input.notes === undefined ? current.notes : input.notes,
+    pickupLocation:
+      input.pickupLocation === undefined ? current.pickupLocation : input.pickupLocation,
+    pickupLocationName:
+      input.pickupLocationName === undefined
+        ? current.pickupLocationName
+        : input.pickupLocationName,
+    pickupStreet: input.pickupStreet === undefined ? current.pickupStreet : input.pickupStreet,
+    pickupMunicipality:
+      input.pickupMunicipality === undefined
+        ? current.pickupMunicipality
+        : input.pickupMunicipality,
+    pickupPostalCode:
+      input.pickupPostalCode === undefined ? current.pickupPostalCode : input.pickupPostalCode,
+    pickupOpeningHours:
+      input.pickupOpeningHours === undefined
+        ? current.pickupOpeningHours
+        : input.pickupOpeningHours,
+  };
+}
+
+function ensureValidCost(cost: number): void {
+  if (
+    !Number.isFinite(cost) ||
+    cost < 0 ||
+    cost > MAX_DELIVERY_MODE_COST ||
+    new Decimal(cost).decimalPlaces() > 2
+  ) {
     throw new ValidationFailedError([
       {
-        path: "pickupLocation",
-        message: "pickupLocation is required when type is PICKUP",
+        path: "cost",
+        message:
+          "cost must be finite, nonnegative, within Decimal(10,2), and have at most 2 decimals",
       },
     ]);
   }
@@ -91,8 +193,8 @@ function ensurePickupLocationForPickup(
 /**
  * Create a new delivery mode for a producer.
  *
- * PICKUP guard: if type === 'PICKUP' and pickupLocation is absent/empty,
- * throw ValidationFailedError (422). The test expects VALIDATION_FAILED code.
+ * PICKUP requires either the legacy location string or a structured street.
+ * Structured pickup data also refreshes the compatibility location string.
  *
  * Spec: delivery-modes §"PICKUP without pickupLocation rejected"
  */
@@ -100,17 +202,15 @@ export async function create(
   producerId: string,
   input: CreateDeliveryModeBody,
 ): Promise<DeliveryMode> {
-  // PICKUP guard — enforced via shared invariant helper.
-  // Produces VALIDATION_FAILED (422) when PICKUP has no pickupLocation.
-  ensurePickupLocationForPickup(input.type, input.pickupLocation);
+  ensureValidCost(input.cost);
+  const configuration = normalizeConfiguration(input.type, configurationFromInput(input));
 
   return prisma.deliveryMode.create({
     data: {
       producerId,
       type: input.type,
       cost: input.cost,
-      coverageZone: input.coverageZone ?? null,
-      pickupLocation: input.pickupLocation ?? null,
+      ...configuration,
     },
   });
 }
@@ -175,10 +275,7 @@ export async function findActiveForCartProducers(
  *
  * Spec: delivery-modes §"Cross-producer read returns 404"
  */
-export async function findById(
-  producerId: string,
-  id: string,
-): Promise<DeliveryMode> {
+export async function findById(producerId: string, id: string): Promise<DeliveryMode> {
   const dm = await prisma.deliveryMode.findFirst({
     where: { id, producerId },
   });
@@ -196,17 +293,11 @@ export async function findById(
 
 /**
  * Partially update a delivery mode owned by the producer.
- * Runs inside $transaction: findFirst guard → PICKUP invariant check → update.
+ * Runs inside $transaction: findFirst guard → effective configuration normalization → update.
  * Cross-producer: DeliveryModeNotFoundError (404) — no-leak.
  *
- * PICKUP invariant for partial updates:
- *   - effectiveType = input.type ?? existing dm.type
- *   - effectivePickupLocation = input.pickupLocation (from patch) ?? existing dm.pickupLocation
- *   - If effectiveType is "PICKUP" and effectivePickupLocation is absent/empty → ValidationFailedError (422)
- *   This handles:
- *     1. Patching type to "PICKUP" without a location (and existing row has no location).
- *     2. Patching type to "PICKUP" while the existing row already has a location (allowed).
- *     3. Clearing pickupLocation while type remains "PICKUP" → rejected.
+ * Effective values merge the patch with the persisted row. Type-inapplicable
+ * fields are cleared and structured pickup data refreshes pickupLocation.
  *
  * Spec: delivery-modes §"Producer-scoped CRUD" — update
  *       delivery-modes §"PICKUP without pickupLocation rejected"
@@ -223,21 +314,56 @@ export async function update(
       throw new DeliveryModeNotFoundError("Delivery mode not found");
     }
 
-    // PICKUP invariant — evaluate against merged (effective) values.
-    // Use payload value when present; fall back to the persisted row value.
     const effectiveType = input.type ?? dm.type;
-    const effectivePickupLocation =
-      input.pickupLocation !== undefined ? input.pickupLocation : dm.pickupLocation;
-
-    ensurePickupLocationForPickup(effectiveType, effectivePickupLocation);
+    ensureValidCost(input.cost ?? dm.cost.toNumber());
+    const structuredPickupLocationPatched =
+      input.pickupLocationName !== undefined ||
+      input.pickupStreet !== undefined ||
+      input.pickupMunicipality !== undefined ||
+      input.pickupPostalCode !== undefined;
+    const pickupLocationSource =
+      structuredPickupLocationPatched || (dm.type !== "PICKUP" && effectiveType === "PICKUP")
+        ? "derive"
+        : "preserve";
+    const configuration = normalizeConfiguration(
+      effectiveType,
+      mergeConfiguration(dm, input),
+      pickupLocationSource,
+    );
+    if (dm.type === effectiveType) {
+      configuration.coverageZone =
+        input.coverageZone === undefined ? dm.coverageZone : configuration.coverageZone;
+      configuration.carrierCompany =
+        input.carrierCompany === undefined ? dm.carrierCompany : configuration.carrierCompany;
+      configuration.notes = input.notes === undefined ? dm.notes : configuration.notes;
+      configuration.pickupLocation =
+        input.pickupLocation === undefined && !structuredPickupLocationPatched
+          ? dm.pickupLocation
+          : configuration.pickupLocation;
+      configuration.pickupLocationName =
+        input.pickupLocationName === undefined
+          ? dm.pickupLocationName
+          : configuration.pickupLocationName;
+      configuration.pickupStreet =
+        input.pickupStreet === undefined ? dm.pickupStreet : configuration.pickupStreet;
+      configuration.pickupMunicipality =
+        input.pickupMunicipality === undefined
+          ? dm.pickupMunicipality
+          : configuration.pickupMunicipality;
+      configuration.pickupPostalCode =
+        input.pickupPostalCode === undefined ? dm.pickupPostalCode : configuration.pickupPostalCode;
+      configuration.pickupOpeningHours =
+        input.pickupOpeningHours === undefined
+          ? dm.pickupOpeningHours
+          : configuration.pickupOpeningHours;
+    }
 
     return tx.deliveryMode.update({
       where: { id },
       data: {
         ...(input.type !== undefined && { type: input.type }),
         ...(input.cost !== undefined && { cost: input.cost }),
-        ...(input.coverageZone !== undefined && { coverageZone: input.coverageZone }),
-        ...(input.pickupLocation !== undefined && { pickupLocation: input.pickupLocation }),
+        ...configuration,
         ...(input.isActive !== undefined && { isActive: input.isActive }),
       },
     });
@@ -269,10 +395,7 @@ export async function update(
  * Spec: delivery-modes §"Delete blocked by active SubOrder reference"
  * Design: §"Delivery-modes delete guard" — reuse ProducerHasActiveOrdersError (canonical)
  */
-export async function hardDelete(
-  producerId: string,
-  id: string,
-): Promise<void> {
+export async function hardDelete(producerId: string, id: string): Promise<void> {
   await prisma.$transaction(async (tx) => {
     // Step 1: ownership guard — 404-no-leak
     const dm = await tx.deliveryMode.findFirst({ where: { id, producerId } });

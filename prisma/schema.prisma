@@ -37,9 +37,10 @@ model User {
   updatedAt     DateTime  @updatedAt @map("updated_at")
   deletedAt     DateTime? @map("deleted_at")
 
-  producer  Producer?
-  addresses Address[]
-  cart      Cart?
+  producer      Producer?
+  addresses     Address[]
+  cart          Cart?
+  notifications Notification[]
 
   @@index([auth0Sub])
   @@map("users")
@@ -135,11 +136,12 @@ enum ModerationStatus {
   REMOVED
 }
 
-/// Delivery mode types supported in Cycle 2.
-/// PICKUP: buyer collects at producer's location.
-/// SHIPPING_FLAT_RATE: producer ships at a fixed cost.
-/// Enum widening (e.g., COURIER) requires a new SDD cycle amending delivery-modes spec.
+/// Producer-configurable delivery mode types.
+/// PERSONAL_DELIVERY: producer delivers to the consumer's destination address.
+/// PICKUP: buyer collects at a configured pickup point.
+/// SHIPPING_FLAT_RATE: producer ships through a carrier at a fixed cost.
 enum DeliveryModeType {
+  PERSONAL_DELIVERY
   PICKUP
   SHIPPING_FLAT_RATE
 }
@@ -269,20 +271,27 @@ model ProductImage {
   @@map("product_images")
 }
 
-/// Producer delivery configuration. PICKUP and SHIPPING_FLAT_RATE only in Cycle 2.
+/// Producer delivery configuration. Each row is one selectable checkout option.
 /// Cycle 3 checkout reads active rows and snapshots cost into SubOrder.shippingCostSnapshot.
 /// Hard delete allowed only when no non-terminal SubOrder references this row;
 /// otherwise PATCH { isActive: false } MUST be used (delete guard = 409).
 model DeliveryMode {
-  id             String           @id @default(cuid())
-  producerId     String           @map("producer_id")
-  type           DeliveryModeType
-  cost           Decimal          @db.Decimal(10, 2)
-  coverageZone   String?          @map("coverage_zone")
-  pickupLocation String?          @map("pickup_location")
-  isActive       Boolean          @default(true) @map("is_active")
-  createdAt      DateTime         @default(now()) @map("created_at")
-  updatedAt      DateTime         @updatedAt @map("updated_at")
+  id                 String           @id @default(cuid())
+  producerId         String           @map("producer_id")
+  type               DeliveryModeType
+  cost               Decimal          @db.Decimal(10, 2)
+  coverageZone       String?          @map("coverage_zone")
+  carrierCompany     String?          @map("carrier_company")
+  notes              String?
+  pickupLocation     String?          @map("pickup_location")
+  pickupLocationName String?          @map("pickup_location_name")
+  pickupStreet       String?          @map("pickup_street")
+  pickupMunicipality String?          @map("pickup_municipality")
+  pickupPostalCode   String?          @map("pickup_postal_code")
+  pickupOpeningHours String?          @map("pickup_opening_hours")
+  isActive           Boolean          @default(true) @map("is_active")
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
 
   producer  Producer   @relation(fields: [producerId], references: [id], onDelete: Restrict)
   subOrders SubOrder[]
@@ -383,13 +392,16 @@ model Order {
 }
 
 /// Producer-scoped slice of a consumer Order. One SubOrder per producer per Order.
-/// trackingNumber MUST remain null in Cycle 2 — settable only after COURIER mode ships (RF-21).
+/// trackingNumber is settable via the producer transition API only on the PATCH
+/// that moves a SubOrder INTO `sent` (order-fulfillment §"Tracking number on
+/// shipment"): mandatory only for SHIPPING_FLAT_RATE, forbidden for
+/// PERSONAL_DELIVERY and PICKUP, and immutable once non-null. Always null until then.
 /// shippingCostSnapshot is written by Cycle 3 checkout from DeliveryMode.cost at order time.
 /// Idempotent PATCH: if current.status === target, return current with no UPDATE issued.
 ///
 /// shipTo* (checkout-contracts WU1, design Fork 4) — immutable address
 /// snapshot, written ONCE at `createOrderFromPayment` step 6 for
-/// SHIPPING_FLAT_RATE producers only (copied from the matching
+/// delivery modes that require a destination address (copied from the matching
 /// `PendingCheckout` row); PICKUP SubOrders leave every shipTo* column null.
 /// Mirrors the `shippingCostSnapshot` immutability precedent exactly — never
 /// updated after insert, so a later profile address edit cannot alter an
@@ -474,4 +486,43 @@ model CartItem {
   @@unique([cartId, productId], name: "cart_product_unique")
   @@index([cartId])
   @@map("cart_items")
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 5 — Notifications (notifications, Phase 1: schema foundation)
+// ---------------------------------------------------------------------------
+
+/// In-app notification event types. INCIDENT_REPORTED and INCIDENT_RESOLVED
+/// are contract-only in Cycle 5 — valid enum values with no emitting code
+/// path yet (incident emission is out of scope, per product-scope decision C).
+enum NotificationType {
+  PAYMENT_CONFIRMED
+  ORDER_CREATED
+  SUBORDER_STATUS_CHANGED
+  TRACKING_ASSIGNED
+  INCIDENT_REPORTED
+  INCIDENT_RESOLVED
+}
+
+/// Per-user in-app notification. Written IN-transaction at the existing
+/// payments/orders and sub-orders tx seams (Cycle 5 design) — the row is
+/// atomic with the business write it announces. `data` is read-only
+/// informational payload, never joined. Owner-scoped reads only; the
+/// service layer MUST filter by `userId` on every list/count/mark-read.
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String           @map("user_id")
+  type      NotificationType
+  title     String
+  body      String
+  data      Json?
+  read      Boolean          @default(false)
+  readAt    DateTime?        @map("read_at")
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+  @@map("notifications")
 }

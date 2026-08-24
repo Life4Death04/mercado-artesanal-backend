@@ -125,6 +125,38 @@ function makeProduct(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * Raw public-select Prisma row fixture (public-catalog capability).
+ * Shape mirrors PUBLIC_PRODUCT_SELECT — a subset of Product plus nested
+ * category/producer selections, NOT the full Product row.
+ */
+function makePublicProductRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "product_pub_001",
+    name: "Miel de Romero",
+    description: "Miel artesanal de romero.",
+    price: new Decimal("10.00"),
+    stock: 20,
+    ingredients: null,
+    allergens: [],
+    weight: null,
+    presentation: null,
+    categoryId: "cat_001",
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    images: [] as Array<{ id: string; position: number; s3Key: string; createdAt: Date }>,
+    category: { id: "cat_001", slug: "miel", name: "Miel" },
+    producer: {
+      id: "prod_001",
+      businessName: "Apiarios del Sur",
+      description: "Productor artesanal.",
+      addressCity: "Sevilla",
+      addressProvince: "Sevilla",
+      addressCountry: "ES",
+    },
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
 });
@@ -635,6 +667,210 @@ describe("productsService.report", () => {
     );
 
     await expect(productsService.report("product_removed", "spam")).rejects.toThrow(
+      ProductNotFoundError,
+    );
+  });
+});
+
+// ===========================================================================
+// findAllPublic (public-catalog capability)
+// Spec: public-catalog §"PUB-R1", §"PUB-R3", §"PUB-R4"
+// ===========================================================================
+
+describe("productsService.findAllPublic", () => {
+  it("[PUB-R3] applies the four-condition visibility where clause", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findAllPublic({});
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.where).toEqual(
+      expect.objectContaining({
+        deletedAt: null,
+        isActive: true,
+        moderationStatus: "OK",
+        producer: { deletedAt: null },
+      }),
+    );
+  });
+
+  it("[PUB-R1] filters by categoryId when provided", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findAllPublic({ categoryId: "cat_002" });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.where.categoryId).toBe("cat_002");
+  });
+
+  it("[PUB-R1] omits the categoryId filter when not provided", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findAllPublic({});
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.where.categoryId).toBeUndefined();
+  });
+
+  it("[PUB-R1] filters stock > 0 when available=true", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findAllPublic({ available: true });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.where.stock).toEqual({ gt: 0 });
+  });
+
+  it("[PUB-R1] does not filter stock when available is absent", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findAllPublic({});
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.where.stock).toBeUndefined();
+  });
+
+  it("[PUB-R1] orders by price asc when sort=asc", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findAllPublic({ sort: "asc" });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.orderBy).toEqual({ price: "asc" });
+  });
+
+  it("[PUB-R1] orders by price desc when sort=desc", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findAllPublic({ sort: "desc" });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.orderBy).toEqual({ price: "desc" });
+  });
+
+  it("[PUB-R4] select whitelist exposes producer SAFE fields only — PII excluded", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([]);
+
+    await productsService.findAllPublic({});
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findMany.mock.calls[0][0];
+    expect(call.select.producer.select).toEqual({
+      id: true,
+      businessName: true,
+      description: true,
+      addressCity: true,
+      addressProvince: true,
+      addressCountry: true,
+    });
+    expect(call.select.producer.select).not.toHaveProperty("nif");
+    expect(call.select.producer.select).not.toHaveProperty("userId");
+    expect(call.select.producer.select).not.toHaveProperty("addressLine1");
+    expect(call.select.producer.select).not.toHaveProperty("addressLine2");
+    expect(call.select.producer.select).not.toHaveProperty("addressPostalCode");
+    expect(call.select.producer).not.toHaveProperty("include");
+  });
+
+  it("[PUB-R4] maps image rows to { id, position, url } — s3Key MUST NOT appear", async () => {
+    const row = makePublicProductRow({
+      images: [
+        { id: "img_1", position: 0, s3Key: "products/x.jpg", createdAt: new Date() },
+      ],
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([row]);
+
+    const results = await productsService.findAllPublic({});
+
+    expect(results[0]!.images).toEqual([
+      { id: "img_1", position: 0, url: "https://test-cdn.example.com/products/x.jpg" },
+    ]);
+    expect(results[0]!.images[0]).not.toHaveProperty("s3Key");
+  });
+
+  it("[PUB-R4] returns images: [] for a product with zero ProductImage rows", async () => {
+    const row = makePublicProductRow({ images: [] });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([row]);
+
+    const results = await productsService.findAllPublic({});
+
+    expect(results[0]!.images).toEqual([]);
+  });
+
+  it("[PUB-R4] maps producer to public-safe nested address shape", async () => {
+    const row = makePublicProductRow();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findMany.mockResolvedValueOnce([row]);
+
+    const results = await productsService.findAllPublic({});
+
+    expect(results[0]!.producer).toEqual({
+      id: "prod_001",
+      businessName: "Apiarios del Sur",
+      description: "Productor artesanal.",
+      address: { city: "Sevilla", province: "Sevilla", country: "ES" },
+    });
+    expect(results[0]!.category).toEqual({ id: "cat_001", slug: "miel", name: "Miel" });
+  });
+});
+
+// ===========================================================================
+// findPublicById (public-catalog capability)
+// Spec: public-catalog §"PUB-R2", §"PUB-R3", §"PUB-R4"
+// ===========================================================================
+
+describe("productsService.findPublicById", () => {
+  it("[PUB-R2,R3] applies id plus the four-condition visibility where clause", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findFirst.mockResolvedValueOnce(makePublicProductRow());
+
+    await productsService.findPublicById("product_pub_001");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (mockedPrisma.product as any).findFirst.mock.calls[0][0];
+    expect(call.where).toEqual(
+      expect.objectContaining({
+        id: "product_pub_001",
+        deletedAt: null,
+        isActive: true,
+        moderationStatus: "OK",
+        producer: { deletedAt: null },
+      }),
+    );
+  });
+
+  it("[PUB-R2] returns the public projection for a visible product", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findFirst.mockResolvedValueOnce(makePublicProductRow());
+
+    const result = await productsService.findPublicById("product_pub_001");
+
+    expect(result.id).toBe("product_pub_001");
+    expect(result.category).toEqual({ id: "cat_001", slug: "miel", name: "Miel" });
+    expect(result.images).toEqual([]);
+  });
+
+  it("[PUB-R2,R3] throws ProductNotFoundError (404-no-leak) when hidden or missing", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.product as any).findFirst.mockResolvedValueOnce(null);
+
+    await expect(productsService.findPublicById("product_hidden")).rejects.toThrow(
       ProductNotFoundError,
     );
   });

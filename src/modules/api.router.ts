@@ -12,6 +12,9 @@
  *   categoriesRouter     — Cycle 2: GET /categories, GET /categories/:slug (PUBLIC — no auth)
  *   producersRouter      — Cycle 2: PATCH /producers/me, DELETE /producers/me (producer);
  *                          GET /producers/:id (PUBLIC — no auth)
+ *   publicProductsRouter — Cycle 6: GET /products, GET /products/:id (PUBLIC —
+ *                          no auth; public-catalog capability). Dedicated
+ *                          zero-guard router — imports NO middleware.
  *   authRouter           — POST /auth/sync
  *   usersRouter          — GET /users/me
  *   onboardingRouter     — POST /users/me/onboarding/consumer|producer
@@ -26,12 +29,19 @@
  *   paymentsRouter       — Cycle 5: POST /pagos/intent (payments WU1 — authenticated
  *                          Stripe PaymentIntent creation) + POST /pagos/webhook
  *                          (payments WU2 — unauth, raw-body, signature-verified).
+ *   notificationsRouter  — Cycle 5: owner-scoped in-app notifications under
+ *                          /notifications[/unread-count|/:id/read] (notifications WU3).
  *
- * Mount order: public routers (categoriesRouter, producersRouter GET /:id) are registered
- * BEFORE auth-gated routers so they are reachable without any auth header.
+ * Mount order: public routers (categoriesRouter, producersRouter GET /:id,
+ * publicProductsRouter) are registered BEFORE auth-gated routers so they are
+ * reachable without any auth header.
  * Note on producersRouter: it registers both public (GET /producers/:id) and producer-scoped
  * (PATCH /producers/me, DELETE /producers/me) routes. Express resolves /producers/me before
  * /producers/:id because literal segments take priority over param segments.
+ * Note on publicProductsRouter vs productsRouter: publicProductsRouter mounts
+ * GET /products and GET /products/:id; productsRouter (auth-gated) only mounts
+ * /producers/me/products* and /products/:id/report — no path collision, but
+ * publicProductsRouter is still registered first per the public-block convention.
  */
 import { Router } from "express";
 
@@ -41,11 +51,13 @@ import { cartRouter } from "./cart/routes/cart.routes";
 import { categoriesRouter } from "./categories/routes/categories.routes";
 import { deliveryModesRouter } from "./delivery-modes/routes/delivery-modes.routes";
 import { imagesRouter } from "./images/routes/images.routes";
+import { notificationsRouter } from "./notifications/routes/notifications.routes";
 import { onboardingRouter } from "./onboarding/routes/onboarding.routes";
 import { ordersRouter } from "./orders/routes/orders.routes";
 import { paymentsRouter } from "./payments/routes/payments.routes";
 import { producersRouter } from "./producers/routes/producers.routes";
 import { productsRouter } from "./products/routes/products.routes";
+import { publicProductsRouter } from "./products/routes/public-products.routes";
 import { statisticsRouter } from "./statistics/routes/statistics.routes";
 import { subOrdersRouter } from "./sub-orders/routes/sub-orders.routes";
 import { usersRouter } from "./users/routes/users.routes";
@@ -55,8 +67,10 @@ export const apiRouter: Router = Router();
 // Public routes — no auth required
 // producersRouter is registered here because GET /producers/:id is public;
 // the PATCH and DELETE /producers/me routes inside it carry their own producerGuard.
+// publicProductsRouter imports NO middleware — impossible to attach a guard here.
 apiRouter.use(categoriesRouter);
 apiRouter.use(producersRouter);
+apiRouter.use(publicProductsRouter);
 
 // Auth-gated routes
 apiRouter.use(authRouter);
@@ -71,3 +85,4 @@ apiRouter.use(statisticsRouter);
 apiRouter.use(cartRouter);
 apiRouter.use(ordersRouter);
 apiRouter.use(paymentsRouter);
+apiRouter.use(notificationsRouter);

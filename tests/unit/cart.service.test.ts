@@ -146,6 +146,7 @@ function makeProduct(overrides: Record<string, unknown> = {}) {
     deletedAt: null,
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
+    images: [] as Array<{ id: string; position: number; s3Key: string }>,
     producer: makeProducer(),
     ...overrides,
   };
@@ -224,7 +225,15 @@ describe("cartService.getCartView — synthetic empty view [G1]", () => {
 
 describe("cartService.getCartView — populated view mapping [G2]", () => {
   it("[G2] maps a populated cart with computed isAvailable = true for active product + active producer", async () => {
-    const cart = makeCart({ items: [makeCartItem()] });
+    const cart = makeCart({
+      items: [
+        makeCartItem({
+          product: makeProduct({
+            images: [{ id: "image_001", position: 0, s3Key: "products/product_001/main.jpg" }],
+          }),
+        }),
+      ],
+    });
     mockedCartFindUnique.mockResolvedValueOnce(cart);
 
     const view = await cartService.getCartView("user_001");
@@ -244,9 +253,17 @@ describe("cartService.getCartView — populated view mapping [G2]", () => {
         price: "12.50",
         stock: 10,
         isActive: true,
+        images: [
+          {
+            id: "image_001",
+            position: 0,
+            url: "https://test-cdn.example.com/products/product_001/main.jpg",
+          },
+        ],
         producer: { id: "producer_001", isActive: true },
       },
     });
+    expect(JSON.stringify(view)).not.toContain("s3Key");
     expect(view.createdAt).toBe("2026-01-01T00:00:00.000Z");
     expect(view.updatedAt).toBe("2026-01-01T00:00:00.000Z");
   });
@@ -260,6 +277,25 @@ describe("cartService.getCartView — single-query seam [G3]", () => {
     await cartService.getCartView("user_001");
 
     expect(mockedPrisma.cart.findUnique).toHaveBeenCalledOnce();
+    expect(mockedCartFindUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: {
+          items: {
+            include: {
+              product: {
+                include: {
+                  producer: true,
+                  images: {
+                    orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+                    select: { id: true, position: true, s3Key: true },
+                  },
+                },
+              },
+            },
+          },
+        },
+      }),
+    );
     expect(mockedPrisma.cart.upsert).not.toHaveBeenCalled();
     expect(mockedPrisma.cartItem.findUnique).not.toHaveBeenCalled();
     expect(mockedPrisma.cartItem.upsert).not.toHaveBeenCalled();
@@ -359,6 +395,17 @@ describe("cartService.addItem — first add creates cart + item with live-price 
     );
     expect(result.unitPriceSnapshot).toBe("12.50");
     expect(result.quantity).toBe(2);
+    expect(result.product.images).toEqual([]);
+    expect(mockedProductFindUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: expect.objectContaining({
+          images: {
+            orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+            select: { id: true, position: true, s3Key: true },
+          },
+        }),
+      }),
+    );
   });
 });
 
@@ -537,6 +584,22 @@ describe("cartService.updateItemQuantity — update within stock [P1]", () => {
     );
     expect(result.quantity).toBe(4);
     expect(result.unitPriceSnapshot).toBe("12.50");
+    expect(result.product.images).toEqual([]);
+    expect(mockedCartItemUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: {
+          product: {
+            include: {
+              producer: true,
+              images: {
+                orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+                select: { id: true, position: true, s3Key: true },
+              },
+            },
+          },
+        },
+      }),
+    );
   });
 });
 

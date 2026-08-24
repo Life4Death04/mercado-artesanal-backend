@@ -221,6 +221,7 @@ function makeProduct(overrides: Record<string, unknown> = {}) {
     deletedAt: null,
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
+    images: [] as Array<{ id: string; position: number; s3Key: string }>,
     producer: makeProducer(),
     ...overrides,
   };
@@ -408,7 +409,16 @@ describe("GET /api/v1/carrito — real behavior (PR #2)", () => {
   it("[C-GET-2] returns 200 with populated items and computed isAvailable", async () => {
     const user = makeUser();
     mockLoadUser(user);
-    const cart = makeCart({ userId: user.id, items: [makeCartItem()] });
+    const cart = makeCart({
+      userId: user.id,
+      items: [
+        makeCartItem({
+          product: makeProduct({
+            images: [{ id: "image_cart_001", position: 0, s3Key: "cart/product-main.jpg" }],
+          }),
+        }),
+      ],
+    });
     mockedCart.findUnique.mockResolvedValueOnce(cart);
 
     const res = await request.get("/api/v1/carrito").set("x-test-auth", authHeader(consumerClaim()));
@@ -421,7 +431,17 @@ describe("GET /api/v1/carrito — real behavior (PR #2)", () => {
       quantity: 2,
       unitPriceSnapshot: "12.50",
       isAvailable: true,
+      product: {
+        images: [
+          {
+            id: "image_cart_001",
+            position: 0,
+            url: "https://test-cdn.example.com/cart/product-main.jpg",
+          },
+        ],
+      },
     });
+    expect(JSON.stringify(res.body)).not.toContain("s3Key");
   });
 });
 
@@ -458,6 +478,7 @@ describe("POST /api/v1/carrito/items — real behavior (PR #2)", () => {
       productId: "product_cart_001",
       quantity: 2,
       unitPriceSnapshot: "12.50",
+      product: { images: [] },
     });
   });
 
@@ -541,7 +562,11 @@ describe("PATCH /api/v1/carrito/items/:itemId — real behavior (PR #3)", () => 
       .send({ quantity: 4 });
 
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ quantity: 4, unitPriceSnapshot: "12.50" });
+    expect(res.body).toMatchObject({
+      quantity: 4,
+      unitPriceSnapshot: "12.50",
+      product: { images: [] },
+    });
   });
 
   it("[C-PATCH-2] returns 422 QUANTITY_EXCEEDS_STOCK when quantity exceeds live stock", async () => {

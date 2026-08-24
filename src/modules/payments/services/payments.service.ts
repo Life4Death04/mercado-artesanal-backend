@@ -51,8 +51,13 @@ import type { DeliveryModeType, Prisma } from "@prisma/client";
 import { Prisma as PrismaValue } from "@prisma/client";
 
 import { getCartForCheckout } from "@/modules/cart/services/cart.service";
+import { requiresDestinationAddress } from "@/modules/delivery-modes/delivery-mode.policy";
 import { createOrderFromPayment } from "@/modules/orders/services/orders.service";
-import type { DeliverySelection, OrderDetailView } from "@/modules/orders/services/orders.service";
+import type {
+  CreateOrderFromPaymentResult,
+  DeliverySelection,
+} from "@/modules/orders/services/orders.service";
+import { dispatchEmails } from "@/shared/email/email-provider";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
@@ -102,7 +107,10 @@ interface AddressSnapshot {
   addressCountry: string;
 }
 
-export async function getPaymentStatus(userId: string, paymentIntentId: string): Promise<PaymentStatusView | null> {
+export async function getPaymentStatus(
+  userId: string,
+  paymentIntentId: string,
+): Promise<PaymentStatusView | null> {
   const payment = await prisma.payment.findFirst({
     where: { providerRef: paymentIntentId, userId },
     include: { order: { select: { id: true } } },
@@ -146,7 +154,7 @@ export async function getPaymentStatus(userId: string, paymentIntentId: string):
  *   against LIVE `DeliveryMode` rows.
  * @param addressId - OPTIONAL at this signature level (checkout-contracts
  *   BE-3, design Fork 1). Required by Step 3c WHEN any resolved selection
- *   is `SHIPPING_FLAT_RATE`; ignored for an all-pickup cart.
+ *   requires a destination address; ignored for an all-pickup cart.
  * @param client - injectable `StripeClient` (defaults to the module
  *   singleton); tests supply a mock via the `@/modules/payments/services/stripe.client`
  *   module mock rather than this parameter, but the parameter keeps the
@@ -241,9 +249,10 @@ export async function createPaymentIntent(
   // immutably"). An `addressId` supplied for an all-pickup cart is IGNORED
   // (spec "Pickup-only cart ignores a supplied addressId") — `addressSnapshot`
   // stays `null` and Step 7 below writes no address content for it.
-  const requiresAddress = [...deliveryModeByProducer.values()].some(
-    (modeId) => modesById.get(modeId)?.type === "SHIPPING_FLAT_RATE",
-  );
+  const requiresAddress = [...deliveryModeByProducer.values()].some((modeId) => {
+    const type = modesById.get(modeId)?.type;
+    return type !== undefined && requiresDestinationAddress(type);
+  });
   let addressSnapshot: AddressSnapshot | null = null;
   if (requiresAddress) {
     if (!addressId) {
@@ -740,20 +749,27 @@ async function handleSucceededEvent(event: StripeEvent): Promise<void> {
     }
   }
 
-  const attempt = (): Promise<OrderDetailView> =>
+  const attempt = (): Promise<CreateOrderFromPaymentResult> =>
     prisma.$transaction(async (tx) => {
       await tx.payment.deleteMany({ where: { providerRef: intent.id, status: "FAILED" } });
-      const order = await createOrderFromPayment(intent.id, cartView, deliverySelections, tx);
+      const result = await createOrderFromPayment(intent.id, cartView, deliverySelections, tx);
       await tx.payment.updateMany({ where: { providerRef: intent.id }, data: { userId } });
-      return order;
+      return result;
     });
 
+  // Cycle 5 notifications (design "Emission wiring"): dispatch the
+  // transaction's `pendingEmails` AFTER it commits — fire-after-commit,
+  // best-effort (`dispatchEmails` never throws; a provider failure is
+  // caught+logged per-message and never rolls back the already-committed
+  // order/notification writes above).
   try {
-    await attempt();
+    const result = await attempt();
+    await dispatchEmails(result.pendingEmails);
   } catch (err: unknown) {
     if (!isUniqueConstraintViolation(err)) {
       throw err;
     }
-    await attempt();
+    const result = await attempt();
+    await dispatchEmails(result.pendingEmails);
   }
 }

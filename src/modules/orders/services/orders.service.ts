@@ -55,7 +55,10 @@ import type { Prisma } from "@prisma/client";
 import { Prisma as PrismaValue } from "@prisma/client";
 
 import type { CartForCheckout, CartItemForCheckout } from "@/modules/cart/services/cart.service";
+import { requiresDestinationAddress } from "@/modules/delivery-modes/delivery-mode.policy";
 import { decrementStock, restockProduct } from "@/modules/inventory/services/inventory.service";
+import * as notificationsService from "@/modules/notifications/services/notifications.service";
+import type { PendingEmail } from "@/modules/notifications/services/notifications.service";
 import {
   CartItemNotAvailableError,
   EmptyCartCheckoutError,
@@ -82,6 +85,7 @@ type DecimalValue = InstanceType<typeof PrismaValue.Decimal>;
 export type OrderStatusValue = "PENDING" | "PARTIAL" | "FULFILLED" | "CANCELLED";
 export type SubOrderStatusValue = "pending" | "preparing" | "sent" | "delivered" | "cancelled";
 export type PaymentStatusValue = "PENDING" | "SUCCEEDED" | "FAILED" | "CANCELED" | "REFUNDED";
+export type DeliveryModeTypeValue = "PERSONAL_DELIVERY" | "PICKUP" | "SHIPPING_FLAT_RATE";
 
 export interface DeliverySelection {
   producerId: string;
@@ -101,6 +105,8 @@ export interface SubOrderView {
   status: SubOrderStatusValue;
   shippingCostSnapshot: string;
   deliveryModeId: string;
+  trackingNumber: string | null;
+  deliveryMode: { type: DeliveryModeTypeValue };
   orderLines: OrderLineView[];
 }
 
@@ -111,6 +117,21 @@ export interface OrderDetailView {
   status: OrderStatusValue;
   payment: { status: PaymentStatusValue };
   subOrders: SubOrderView[];
+}
+
+/**
+ * `createOrderFromPayment`'s return contract (Cycle 5 notifications design
+ * "Emission wiring", Phase 4). `order` is the SAME frozen `OrderDetailView`
+ * shape this function always returned; `pendingEmails` is the
+ * fire-after-commit dispatch intent for every Notification written during
+ * THIS call (empty on the step-0 idempotent no-op path — a replay creates
+ * no new notification, so it has nothing to dispatch). The CALLER
+ * (`payments.service.ts`) is responsible for invoking `dispatchEmails` from
+ * `@/shared/email/email-provider` AFTER its transaction commits.
+ */
+export interface CreateOrderFromPaymentResult {
+  order: OrderDetailView;
+  pendingEmails: PendingEmail[];
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +195,8 @@ interface ExistingSubOrderRow {
   status: string;
   shippingCostSnapshot: DecimalValue;
   deliveryModeId: string;
+  trackingNumber: string | null;
+  deliveryMode: { type: DeliveryModeTypeValue };
   orderLines: ExistingOrderLineRow[];
 }
 
@@ -200,6 +223,8 @@ function mapSubOrderView(subOrder: ExistingSubOrderRow): SubOrderView {
     status: subOrder.status as SubOrderStatusValue,
     shippingCostSnapshot: subOrder.shippingCostSnapshot.toFixed(2),
     deliveryModeId: subOrder.deliveryModeId,
+    trackingNumber: subOrder.trackingNumber,
+    deliveryMode: subOrder.deliveryMode,
     orderLines: subOrder.orderLines.map(mapOrderLineView),
   };
 }
@@ -230,7 +255,8 @@ function mapExistingOrderDetailView(
  *
  * Step order (design Decision 4, MUST NOT be reordered):
  *   0. Idempotency pre-check on `Payment.providerRef` — if found, RETURN the
- *      existing `OrderDetailView` (idempotent no-op), no writes.
+ *      existing `OrderDetailView` (idempotent no-op), no writes, no
+ *      notification emitted (`pendingEmails: []`).
  *   1. Reject an empty cart -> `EmptyCartCheckoutError` (422).
  *   2. Live availability re-check: snapshot fast-fail, then a SINGLE batched
  *      `cartItem.findMany`, asserting COMPLETENESS before availability
@@ -243,6 +269,9 @@ function mapExistingOrderDetailView(
  *   4. Compute totals with `Prisma.Decimal`, from the cart snapshot + the
  *       step-3a maps, BEFORE any create call.
  *   5. `payment.create` then `order.create`, both persisting the step-4 total.
+ *   5a. (Cycle 5 notifications, design "Emission wiring") emit
+ *       `PAYMENT_CONFIRMED` + `ORDER_CREATED` (base copy) to the order's
+ *       owning Consumer, collected into `pendingEmails`.
  *   5b. (checkout-contracts BE-3, design Fork 4 — ADDITIVE, does not reorder
  *       0-9 above) ONE `pendingCheckout.findUnique({ providerRef })` read —
  *       the immutable address snapshot `payments.service.ts` wrote at
@@ -251,11 +280,20 @@ function mapExistingOrderDetailView(
  *   6. Group items by producer -> one `subOrder.create` each, copying the
  *       step-5b snapshot into `shipTo*` for `SHIPPING_FLAT_RATE` producers
  *       only (PICKUP stays null), retaining each created id in
- *       `subOrderIdByProducer`.
+ *       `subOrderIdByProducer`. (Cycle 5 notifications) emits ONE
+ *       `ORDER_CREATED` (producer-audience copy override) per SubOrder,
+ *       fanning out to every sub-order Producer, also collected into
+ *       `pendingEmails`.
  *   7. One `orderLine.create` per item, `unitPriceSnapshot` copied AS-IS from
  *       the cart snapshot, `subOrderId` resolved via `subOrderIdByProducer`.
  *   8. `decrementStock(productId, quantity, tx)` per line (frozen contract).
  *   9. Snapshot-scoped `cartItem.deleteMany` (NOT userId-scoped).
+ *
+ * Returns `{ order, pendingEmails }` (design "Emission wiring" — return
+ * shape). `pendingEmails` is the fire-after-commit dispatch intent for
+ * every Notification written above; the CALLER (`payments.service.ts`)
+ * dispatches them via the shared `dispatchEmails` AFTER its transaction
+ * commits — best-effort, never blocking or rolling back this write.
  *
  * Any throw rolls back the caller's `tx`. A P2002 from step 5's
  * `payment.create` (webhook idempotency backstop, `Payment.providerRef @unique`)
@@ -273,24 +311,29 @@ export async function createOrderFromPayment(
   cartView: CartForCheckout,
   deliverySelections: DeliverySelection[],
   tx: PrismaTx,
-): Promise<OrderDetailView> {
-  // Step 0: idempotency pre-check — FIRST, before any write.
+): Promise<CreateOrderFromPaymentResult> {
+  // Step 0: idempotency pre-check — FIRST, before any write. A replay finds
+  // the already-committed order and emits NO notification (pendingEmails
+  // stays empty) — free-rides this existing early-return guard rather than
+  // adding new idempotency logic (design "Emission wiring").
   const existingPayment = await tx.payment.findUnique({
     where: { providerRef: stripeIntentId },
     include: {
       order: {
         include: {
-          subOrders: { include: { orderLines: true } },
+          subOrders: {
+            include: { orderLines: true, deliveryMode: { select: { type: true } } },
+          },
         },
       },
     },
   });
 
   if (existingPayment?.order) {
-    return mapExistingOrderDetailView(
-      existingPayment.order,
-      existingPayment.status,
-    );
+    return {
+      order: mapExistingOrderDetailView(existingPayment.order, existingPayment.status),
+      pendingEmails: [],
+    };
   }
 
   // Step 1: empty cart rejection.
@@ -363,7 +406,12 @@ export async function createOrderFromPayment(
     const mode = modesById.get(selection.deliveryModeId);
     if (!mode) {
       throw new ValidationFailedError(
-        [{ path: "deliverySelections", message: `Unknown deliveryModeId: ${selection.deliveryModeId}` }],
+        [
+          {
+            path: "deliverySelections",
+            message: `Unknown deliveryModeId: ${selection.deliveryModeId}`,
+          },
+        ],
         "Invalid delivery selections",
       );
     }
@@ -387,7 +435,12 @@ export async function createOrderFromPayment(
   // Bijection completeness — every cart producerId MUST have exactly one selection.
   if (deliveryModeByProducer.size !== cartProducerIds.size) {
     throw new ValidationFailedError(
-      [{ path: "deliverySelections", message: "Missing a deliverySelection for one or more cart producers" }],
+      [
+        {
+          path: "deliverySelections",
+          message: "Missing a deliverySelection for one or more cart producers",
+        },
+      ],
       "Invalid delivery selections",
     );
   }
@@ -418,6 +471,44 @@ export async function createOrderFromPayment(
     },
   });
 
+  // Cycle 5 notifications (design "Emission wiring"): PAYMENT_CONFIRMED and
+  // ORDER_CREATED (base/consumer copy) both go to the order's owning
+  // Consumer. `Order.userId` is intentionally a BARE column, not a Prisma
+  // relation (money-webhook exception — prisma pitfall #1), so the
+  // recipient email cannot be nested-included on `order.create` itself; one
+  // extra in-tx `user.findUnique` resolves it instead (deviation from the
+  // design note's literal "order.user" phrasing — see apply-progress
+  // Deviations). Collected here and returned as `pendingEmails` — the
+  // CALLER dispatches AFTER this transaction commits (fire-after-commit,
+  // best-effort). Placed AFTER order.create (this step) so a throw in any
+  // EARLIER step (steps 0-4) never emits a notification for a write that
+  // never happened.
+  const orderOwner = await tx.user.findUnique({
+    where: { id: order.userId },
+    select: { email: true },
+  });
+  // `order.userId` is FK-guaranteed, so this is a "cannot happen" guard — but
+  // resolve it as a controlled NotFoundError rather than a raw non-null
+  // assertion, so a missing row never becomes an uncaught TypeError mid-tx.
+  if (!orderOwner) {
+    throw new NotFoundError("Order owner not found");
+  }
+  const pendingEmails: PendingEmail[] = [];
+  pendingEmails.push(
+    await notificationsService.createNotification(tx, {
+      userId: order.userId,
+      type: "PAYMENT_CONFIRMED",
+      toEmail: orderOwner.email,
+    }),
+  );
+  pendingEmails.push(
+    await notificationsService.createNotification(tx, {
+      userId: order.userId,
+      type: "ORDER_CREATED",
+      toEmail: orderOwner.email,
+    }),
+  );
+
   // Step 5b (checkout-contracts BE-3, design Fork 4): resolve the immutable
   // address snapshot ONCE — looked up by `providerRef` (set by
   // `payments.service.ts` right after Stripe returns the PaymentIntent id,
@@ -443,17 +534,18 @@ export async function createOrderFromPayment(
   const subOrderStatusByProducer = new Map<string, SubOrderStatusValue>();
   for (const producerId of itemsByProducer.keys()) {
     const deliveryModeId = deliveryModeByProducer.get(producerId)!;
-    // Snapshot flows to SHIPPING_FLAT_RATE SubOrders only (spec "Snapshot
-    // flows to shipping SubOrders only") — PICKUP SubOrders leave every
+    // Snapshot flows to delivery modes that require a destination address.
+    // PICKUP SubOrders leave every
     // `shipTo*` column null, matching the schema default.
-    const isShippingProducer = modesById.get(deliveryModeId)?.type === "SHIPPING_FLAT_RATE";
+    const modeType = modesById.get(deliveryModeId)!.type;
+    const needsDestinationAddress = requiresDestinationAddress(modeType);
     const subOrder = await tx.subOrder.create({
       data: {
         orderId: order.id,
         producerId,
         deliveryModeId,
         shippingCostSnapshot: shippingByProducer.get(producerId)!,
-        ...(isShippingProducer && pendingCheckout
+        ...(needsDestinationAddress && pendingCheckout
           ? {
               shipToLine1: pendingCheckout.addressLine1,
               shipToLine2: pendingCheckout.addressLine2,
@@ -464,9 +556,28 @@ export async function createOrderFromPayment(
             }
           : {}),
       },
+      // Cycle 5 notifications (design "Emission wiring"): resolves this
+      // SubOrder's owning Producer's userId + recipient email in-tx, for
+      // the ORDER_CREATED fan-out below.
+      include: { producer: { select: { userId: true, user: { select: { email: true } } } } },
     });
     subOrderIdByProducer.set(producerId, subOrder.id);
     subOrderStatusByProducer.set(producerId, subOrder.status);
+
+    // ORDER_CREATED fan-out — one notification per sub-order Producer, with
+    // the producer-audience copy override (maintainer decision
+    // sdd/notifications/copy-audience-decision). Emitted per-SubOrder so a
+    // two-producer order fans out to the Consumer (above) + BOTH Producers
+    // = three notifications / three emails (spec "Order created fans out to
+    // consumer + two producers").
+    pendingEmails.push(
+      await notificationsService.createNotification(tx, {
+        userId: subOrder.producer.userId,
+        type: "ORDER_CREATED",
+        audience: "producer",
+        toEmail: subOrder.producer.user.email,
+      }),
+    );
   }
 
   // Step 7: one OrderLine per item, snapshot copied AS-IS, subOrderId resolved via the step-6 map.
@@ -493,22 +604,33 @@ export async function createOrderFromPayment(
   // Step 9: snapshot-scoped cart clear — NOT userId-scoped.
   await tx.cartItem.deleteMany({ where: { id: { in: checkoutedCartItemIds } } });
 
-  const subOrders: SubOrderView[] = [...itemsByProducer.keys()].map((producerId) => ({
-    id: subOrderIdByProducer.get(producerId)!,
-    producerId,
-    status: subOrderStatusByProducer.get(producerId)!,
-    shippingCostSnapshot: shippingByProducer.get(producerId)!.toFixed(2),
-    deliveryModeId: deliveryModeByProducer.get(producerId)!,
-    orderLines: orderLinesByProducer.get(producerId) ?? [],
-  }));
+  const subOrders: SubOrderView[] = [...itemsByProducer.keys()].map((producerId) => {
+    const deliveryModeId = deliveryModeByProducer.get(producerId)!;
+    return {
+      id: subOrderIdByProducer.get(producerId)!,
+      producerId,
+      status: subOrderStatusByProducer.get(producerId)!,
+      shippingCostSnapshot: shippingByProducer.get(producerId)!.toFixed(2),
+      deliveryModeId,
+      // A freshly created SubOrder never has a trackingNumber yet — it is
+      // only ever set later by a producer transition() into "sent" (see
+      // sub-orders.service.ts trackingNumber gate).
+      trackingNumber: null,
+      deliveryMode: { type: modesById.get(deliveryModeId)!.type },
+      orderLines: orderLinesByProducer.get(producerId) ?? [],
+    };
+  });
 
   return {
-    id: order.id,
-    createdAt: order.createdAt.toISOString(),
-    totalAmount: total.toFixed(2),
-    status: deriveOrderStatus(subOrders.map((s) => s.status)),
-    payment: { status: payment.status },
-    subOrders,
+    order: {
+      id: order.id,
+      createdAt: order.createdAt.toISOString(),
+      totalAmount: total.toFixed(2),
+      status: deriveOrderStatus(subOrders.map((s) => s.status)),
+      payment: { status: payment.status },
+      subOrders,
+    },
+    pendingEmails,
   };
 }
 
@@ -576,7 +698,9 @@ export async function getOrderDetail(userId: string, orderId: string): Promise<O
     where: { id: orderId, userId },
     include: {
       payment: { select: { status: true } },
-      subOrders: { include: { orderLines: true } },
+      subOrders: {
+        include: { orderLines: true, deliveryMode: { select: { type: true } } },
+      },
     },
   });
 
@@ -643,7 +767,9 @@ export async function cancelOrder(userId: string, orderId: string): Promise<Orde
       where: { id: orderId, userId },
       include: {
         payment: { select: { status: true } },
-        subOrders: { include: { orderLines: true } },
+        subOrders: {
+          include: { orderLines: true, deliveryMode: { select: { type: true } } },
+        },
       },
     });
 

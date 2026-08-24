@@ -76,7 +76,9 @@ import {
 } from "@/shared/errors/errors";
 import * as deliveryModesService from "@/modules/delivery-modes/services/delivery-modes.service";
 import {
+  CreateDeliveryModeBodySchema,
   DeliveryModeTypeSchema,
+  UpdateDeliveryModeBodySchema,
   mapDeliveryModeConsumerView,
 } from "@/modules/delivery-modes/dto/delivery-modes.dto";
 
@@ -97,7 +99,14 @@ function makeDeliveryMode(overrides: Record<string, unknown> = {}) {
     type: "SHIPPING_FLAT_RATE" as DeliveryModeType,
     cost: new Decimal("5.00"),
     coverageZone: "Madrid",
+    carrierCompany: "Correos",
+    notes: null,
     pickupLocation: null,
+    pickupLocationName: null,
+    pickupStreet: null,
+    pickupMunicipality: null,
+    pickupPostalCode: null,
+    pickupOpeningHours: null,
     isActive: true,
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
@@ -157,6 +166,62 @@ describe("deliveryModesService.create", () => {
     expect(result.cost).toEqual(new Decimal("0.00"));
     expect(result.type).toBe("SHIPPING_FLAT_RATE");
   });
+
+  it("creates PERSONAL_DELIVERY with coverage, cost, and shared notes", async () => {
+    const created = makeDeliveryMode({
+      type: "PERSONAL_DELIVERY" as DeliveryModeType,
+      carrierCompany: null,
+      notes: "Call before delivery",
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.deliveryMode as any).create.mockResolvedValueOnce(created);
+
+    await deliveryModesService.create("prod_001", {
+      type: "PERSONAL_DELIVERY",
+      cost: 3,
+      coverageZone: "Madrid city",
+      notes: "Call before delivery",
+      carrierCompany: "Must be cleared",
+    });
+
+    expect(mockedPrisma.deliveryMode.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        type: "PERSONAL_DELIVERY",
+        cost: 3,
+        coverageZone: "Madrid city",
+        notes: "Call before delivery",
+        carrierCompany: null,
+        pickupLocation: null,
+      }),
+    });
+  });
+
+  it("creates structured PICKUP and derives a compatibility pickupLocation", async () => {
+    const created = makeDeliveryMode({ type: "PICKUP" as DeliveryModeType });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockedPrisma.deliveryMode as any).create.mockResolvedValueOnce(created);
+
+    await deliveryModesService.create("prod_001", {
+      type: "PICKUP",
+      cost: 0,
+      pickupLocationName: "Central Market",
+      pickupStreet: "Calle Mayor 1",
+      pickupMunicipality: "Madrid",
+      pickupPostalCode: "28001",
+      pickupOpeningHours: "Mon-Fri 09:00-18:00",
+      notes: "Ask at reception",
+    });
+
+    expect(mockedPrisma.deliveryMode.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        pickupLocation: "Central Market, Calle Mayor 1, 28001 Madrid",
+        pickupLocationName: "Central Market",
+        pickupStreet: "Calle Mayor 1",
+        coverageZone: null,
+        carrierCompany: null,
+      }),
+    });
+  });
 });
 
 // ===========================================================================
@@ -166,7 +231,11 @@ describe("deliveryModesService.create", () => {
 describe("deliveryModesService.findAll", () => {
   it("returns all delivery modes owned by producer", async () => {
     const dm1 = makeDeliveryMode();
-    const dm2 = makeDeliveryMode({ id: "dm_002", type: "PICKUP" as DeliveryModeType, pickupLocation: "Calle Mayor 1" });
+    const dm2 = makeDeliveryMode({
+      id: "dm_002",
+      type: "PICKUP" as DeliveryModeType,
+      pickupLocation: "Calle Mayor 1",
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.deliveryMode as any).findMany.mockResolvedValueOnce([dm1, dm2]);
 
@@ -208,9 +277,9 @@ describe("deliveryModesService.findById", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.deliveryMode as any).findFirst.mockResolvedValueOnce(null);
 
-    await expect(
-      deliveryModesService.findById("prod_attacker", "dm_001"),
-    ).rejects.toThrow(DeliveryModeNotFoundError);
+    await expect(deliveryModesService.findById("prod_attacker", "dm_001")).rejects.toThrow(
+      DeliveryModeNotFoundError,
+    );
   });
 });
 
@@ -268,7 +337,11 @@ describe("deliveryModesService.update", () => {
       async (fn: (tx: typeof prisma) => Promise<unknown>) => {
         const fakeTx = {
           deliveryMode: {
-            findFirst: vi.fn().mockResolvedValue(makeDeliveryMode({ type: "SHIPPING_FLAT_RATE", pickupLocation: null })),
+            findFirst: vi
+              .fn()
+              .mockResolvedValue(
+                makeDeliveryMode({ type: "SHIPPING_FLAT_RATE", pickupLocation: null }),
+              ),
             update: vi.fn(),
           },
         };
@@ -283,7 +356,10 @@ describe("deliveryModesService.update", () => {
 
   // Triangulation: update succeeds when patching to PICKUP with a valid pickupLocation.
   it("succeeds when patching type=PICKUP with a valid pickupLocation", async () => {
-    const updated = makeDeliveryMode({ type: "PICKUP" as import("@prisma/client").DeliveryModeType, pickupLocation: "Calle Mayor 1, Madrid" });
+    const updated = makeDeliveryMode({
+      type: "PICKUP" as import("@prisma/client").DeliveryModeType,
+      pickupLocation: "Calle Mayor 1, Madrid",
+    });
 
     mockedPrisma.$transaction.mockImplementationOnce(
       async (fn: (tx: typeof prisma) => Promise<unknown>) => {
@@ -304,6 +380,201 @@ describe("deliveryModesService.update", () => {
 
     expect(result.type).toBe("PICKUP");
     expect(result.pickupLocation).toBe("Calle Mayor 1, Madrid");
+  });
+
+  it("preserves coverageZone when partially updating an existing PICKUP", async () => {
+    const updateSpy = vi.fn().mockResolvedValue(
+      makeDeliveryMode({
+        type: "PICKUP" as DeliveryModeType,
+        coverageZone: "Legacy pickup zone",
+        pickupLocation: "Calle Mayor 1, Madrid",
+      }),
+    );
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) =>
+        fn({
+          deliveryMode: {
+            findFirst: vi.fn().mockResolvedValue(
+              makeDeliveryMode({
+                type: "PICKUP" as DeliveryModeType,
+                coverageZone: "Legacy pickup zone",
+                pickupLocation: "Calle Mayor 1, Madrid",
+              }),
+            ),
+            update: updateSpy,
+          },
+        } as unknown as typeof prisma),
+    );
+
+    await deliveryModesService.update("prod_001", "dm_001", { notes: "Updated notes" });
+
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "dm_001" },
+      data: expect.objectContaining({ coverageZone: "Legacy pickup zone" }),
+    });
+  });
+
+  it("clears nullable configuration fields explicitly patched to null", async () => {
+    const updateSpy = vi.fn().mockResolvedValue(makeDeliveryMode({ notes: null }));
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) =>
+        fn({
+          deliveryMode: {
+            findFirst: vi.fn().mockResolvedValue(makeDeliveryMode({ notes: "Old notes" })),
+            update: updateSpy,
+          },
+        } as unknown as typeof prisma),
+    );
+
+    await deliveryModesService.update("prod_001", "dm_001", { notes: null });
+
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "dm_001" },
+      data: expect.objectContaining({ notes: null, coverageZone: "Madrid" }),
+    });
+  });
+
+  it("preserves every omitted configuration field on a same-type PATCH", async () => {
+    const existing = makeDeliveryMode({
+      notes: "Old notes",
+      pickupLocation: "Legacy stale value",
+      pickupStreet: "Structured stale value",
+    });
+    const updateSpy = vi.fn().mockResolvedValue(existing);
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) =>
+        fn({
+          deliveryMode: {
+            findFirst: vi.fn().mockResolvedValue(existing),
+            update: updateSpy,
+          },
+        } as unknown as typeof prisma),
+    );
+
+    await deliveryModesService.update("prod_001", "dm_001", { notes: "New notes" });
+
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "dm_001" },
+      data: expect.objectContaining({
+        notes: "New notes",
+        pickupLocation: "Legacy stale value",
+        pickupStreet: "Structured stale value",
+      }),
+    });
+  });
+
+  it("uses an explicitly patched legacy pickupLocation over persisted structured fields", async () => {
+    const updateSpy = vi.fn().mockResolvedValue(
+      makeDeliveryMode({
+        type: "PICKUP" as DeliveryModeType,
+        pickupLocation: "New legacy point",
+      }),
+    );
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) =>
+        fn({
+          deliveryMode: {
+            findFirst: vi.fn().mockResolvedValue(
+              makeDeliveryMode({
+                type: "PICKUP" as DeliveryModeType,
+                pickupLocation: "Old generated point",
+                pickupLocationName: "Old market",
+                pickupStreet: "Old street 1",
+                pickupMunicipality: "Madrid",
+                pickupPostalCode: "28001",
+              }),
+            ),
+            update: updateSpy,
+          },
+        } as unknown as typeof prisma),
+    );
+
+    await deliveryModesService.update("prod_001", "dm_001", {
+      pickupLocation: "New legacy point",
+    });
+
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "dm_001" },
+      data: expect.objectContaining({
+        pickupLocation: "New legacy point",
+        pickupStreet: "Old street 1",
+      }),
+    });
+  });
+
+  it("derives pickupLocation from explicitly patched structured fields over a legacy value", async () => {
+    const updateSpy = vi
+      .fn()
+      .mockResolvedValue(
+        makeDeliveryMode({ type: "PICKUP" as DeliveryModeType, pickupStreet: "New street 2" }),
+      );
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) =>
+        fn({
+          deliveryMode: {
+            findFirst: vi.fn().mockResolvedValue(
+              makeDeliveryMode({
+                type: "PICKUP" as DeliveryModeType,
+                pickupLocation: "Old pickup",
+                pickupLocationName: "Market",
+                pickupStreet: "Old street 1",
+                pickupMunicipality: "Madrid",
+                pickupPostalCode: "28001",
+              }),
+            ),
+            update: updateSpy,
+          },
+        } as unknown as typeof prisma),
+    );
+
+    await deliveryModesService.update("prod_001", "dm_001", {
+      pickupLocation: "Legacy loses",
+      pickupStreet: "New street 2",
+    });
+
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "dm_001" },
+      data: expect.objectContaining({
+        pickupLocation: "Market, New street 2, 28001 Madrid",
+        pickupStreet: "New street 2",
+      }),
+    });
+  });
+
+  it("clears pickup and carrier fields when changing to PERSONAL_DELIVERY", async () => {
+    const updateSpy = vi
+      .fn()
+      .mockResolvedValue(makeDeliveryMode({ type: "PERSONAL_DELIVERY" as DeliveryModeType }));
+    mockedPrisma.$transaction.mockImplementationOnce(
+      async (fn: (tx: typeof prisma) => Promise<unknown>) =>
+        fn({
+          deliveryMode: {
+            findFirst: vi.fn().mockResolvedValue(
+              makeDeliveryMode({
+                type: "PICKUP" as DeliveryModeType,
+                pickupLocation: "Old pickup",
+                pickupStreet: "Old street",
+              }),
+            ),
+            update: updateSpy,
+          },
+        } as unknown as typeof prisma),
+    );
+
+    await deliveryModesService.update("prod_001", "dm_001", {
+      type: "PERSONAL_DELIVERY",
+      coverageZone: "Local area",
+    });
+
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "dm_001" },
+      data: expect.objectContaining({
+        type: "PERSONAL_DELIVERY",
+        carrierCompany: null,
+        pickupLocation: null,
+        pickupStreet: null,
+      }),
+    });
   });
 });
 
@@ -326,9 +597,9 @@ describe("deliveryModesService.hardDelete", () => {
       },
     );
 
-    await expect(
-      deliveryModesService.hardDelete("prod_attacker", "dm_001"),
-    ).rejects.toThrow(DeliveryModeNotFoundError);
+    await expect(deliveryModesService.hardDelete("prod_attacker", "dm_001")).rejects.toThrow(
+      DeliveryModeNotFoundError,
+    );
   });
 
   it("throws ProducerHasActiveOrdersError when active SubOrders reference the delivery mode", async () => {
@@ -347,9 +618,9 @@ describe("deliveryModesService.hardDelete", () => {
       },
     );
 
-    await expect(
-      deliveryModesService.hardDelete("prod_001", "dm_001"),
-    ).rejects.toThrow(ProducerHasActiveOrdersError);
+    await expect(deliveryModesService.hardDelete("prod_001", "dm_001")).rejects.toThrow(
+      ProducerHasActiveOrdersError,
+    );
   });
 
   it("hard-deletes the delivery mode when no active SubOrders reference it", async () => {
@@ -390,7 +661,7 @@ describe("deliveryModesService.hardDelete", () => {
  *   THEN the change MUST be treated as scope creep and rejected.
  *
  * This test enforces the runtime boundary of DeliveryModeTypeSchema:
- *   - The schema MUST accept exactly ["PICKUP", "SHIPPING_FLAT_RATE"].
+ *   - The schema MUST accept the three configured delivery mode types.
  *   - Any value outside that set (e.g. "COURIER") MUST fail Zod parsing.
  *   - If someone widens the schema (adds "COURIER"), THIS TEST BREAKS — scope creep detected.
  *
@@ -417,6 +688,10 @@ describe("DeliveryModeTypeSchema — enum boundary (enum widening rejected in re
     }
   });
 
+  it("accepts PERSONAL_DELIVERY as a valid DeliveryModeType", () => {
+    expect(DeliveryModeTypeSchema.safeParse("PERSONAL_DELIVERY").success).toBe(true);
+  });
+
   it("rejects COURIER — enum widening is scope creep and MUST fail validation", () => {
     // If DeliveryModeTypeSchema is ever widened to include "COURIER", this test fails.
     // That failure is the signal that a new SDD cycle is required per spec.
@@ -424,7 +699,7 @@ describe("DeliveryModeTypeSchema — enum boundary (enum widening rejected in re
     expect(result.success).toBe(false);
   });
 
-  it("rejects unknown enum literals — only PICKUP and SHIPPING_FLAT_RATE are allowed in Cycle 2", () => {
+  it("rejects unknown enum literals", () => {
     const unknowns = ["COURIER", "EXPRESS", "DRONE", "pickup", "shipping_flat_rate", ""];
     for (const unknown of unknowns) {
       const result = DeliveryModeTypeSchema.safeParse(unknown);
@@ -433,12 +708,72 @@ describe("DeliveryModeTypeSchema — enum boundary (enum widening rejected in re
   });
 });
 
+describe("delivery mode DTO validation", () => {
+  it("accepts all supported producer configuration fields on create and update", () => {
+    const fields = {
+      carrierCompany: "Correos",
+      notes: "Shared notes",
+      pickupLocationName: "Market desk",
+      pickupStreet: "Calle Mayor 1",
+      pickupMunicipality: "Madrid",
+      pickupPostalCode: "28001",
+      pickupOpeningHours: "Mon-Fri 09:00-18:00",
+    };
+    expect(
+      CreateDeliveryModeBodySchema.safeParse({ type: "PICKUP", cost: 0, ...fields }).success,
+    ).toBe(true);
+    expect(UpdateDeliveryModeBodySchema.safeParse(fields).success).toBe(true);
+  });
+
+  it("rejects non-Spanish pickup postal code formats and unknown fields", () => {
+    expect(UpdateDeliveryModeBodySchema.safeParse({ pickupPostalCode: "2800A" }).success).toBe(
+      false,
+    );
+    expect(UpdateDeliveryModeBodySchema.safeParse({ unexpected: true }).success).toBe(false);
+  });
+
+  it("accepts explicit null for nullable PATCH fields", () => {
+    expect(
+      UpdateDeliveryModeBodySchema.safeParse({
+        coverageZone: null,
+        carrierCompany: null,
+        notes: null,
+        pickupLocation: null,
+        pickupLocationName: null,
+        pickupStreet: null,
+        pickupMunicipality: null,
+        pickupPostalCode: null,
+        pickupOpeningHours: null,
+      }).success,
+    ).toBe(true);
+  });
+
+  it.each([
+    [Number.POSITIVE_INFINITY, "infinite"],
+    [100_000_000, "above Decimal(10,2)"],
+    [1.001, "more than two decimal places"],
+    [-0.01, "negative"],
+  ])("rejects %s cost as %s", (cost) => {
+    expect(
+      CreateDeliveryModeBodySchema.safeParse({ type: "SHIPPING_FLAT_RATE", cost }).success,
+    ).toBe(false);
+    expect(UpdateDeliveryModeBodySchema.safeParse({ cost }).success).toBe(false);
+  });
+
+  it.each([0, 0.01, 99_999_999.99])("accepts cost boundary %s", (cost) => {
+    expect(
+      CreateDeliveryModeBodySchema.safeParse({ type: "SHIPPING_FLAT_RATE", cost }).success,
+    ).toBe(true);
+    expect(UpdateDeliveryModeBodySchema.safeParse({ cost }).success).toBe(true);
+  });
+});
+
 // ===========================================================================
 // Checkout delivery modes — BE1-R2..R4 (WU2 RED)
 // ===========================================================================
 
 describe("checkout delivery mode consumer view", () => {
-  it("maps shipping and pickup modes to the exact four-field consumer DTO", () => {
+  it("maps all modes to the exact four-field consumer DTO", () => {
     const shipping = mapDeliveryModeConsumerView(makeDeliveryMode({ cost: new Decimal("5.50") }));
     const pickup = mapDeliveryModeConsumerView(
       makeDeliveryMode({
@@ -446,12 +781,31 @@ describe("checkout delivery mode consumer view", () => {
         type: "PICKUP" as DeliveryModeType,
         cost: new Decimal("0.00"),
         pickupLocation: "Private location",
+        pickupLocationName: "Central Market",
+      }),
+    );
+    const personal = mapDeliveryModeConsumerView(
+      makeDeliveryMode({
+        id: "dm_personal",
+        type: "PERSONAL_DELIVERY" as DeliveryModeType,
+        cost: new Decimal("2.50"),
       }),
     );
 
     expect(shipping).toEqual({ id: "dm_001", name: "Shipping", type: "shipping", price: "5.50" });
     expect(Object.keys(shipping)).toEqual(["id", "name", "type", "price"]);
-    expect(pickup).toEqual({ id: "dm_pickup", name: "Pickup", type: "pickup", price: "0.00" });
+    expect(pickup).toEqual({
+      id: "dm_pickup",
+      name: "Central Market",
+      type: "pickup",
+      price: "0.00",
+    });
+    expect(personal).toEqual({
+      id: "dm_personal",
+      name: "Personal delivery",
+      type: "shipping",
+      price: "2.50",
+    });
   });
 });
 
@@ -460,11 +814,7 @@ describe("deliveryModesService.findActiveForCartProducers", () => {
     mockedGetCartForCheckout.mockResolvedValueOnce({
       cartId: "cart_001",
       userId: "user_001",
-      items: [
-        { producerId: "prod_a" },
-        { producerId: "prod_b" },
-        { producerId: "prod_a" },
-      ],
+      items: [{ producerId: "prod_a" }, { producerId: "prod_b" }, { producerId: "prod_a" }],
     } as Awaited<ReturnType<typeof getCartForCheckout>>);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockedPrisma.deliveryMode as any).findMany.mockResolvedValueOnce([
@@ -478,7 +828,10 @@ describe("deliveryModesService.findActiveForCartProducers", () => {
       orderBy: { createdAt: "asc" },
     });
     expect(result).toEqual([
-      { producerId: "prod_a", modes: [{ id: "dm_001", name: "Shipping", type: "shipping", price: "3.00" }] },
+      {
+        producerId: "prod_a",
+        modes: [{ id: "dm_001", name: "Shipping", type: "shipping", price: "3.00" }],
+      },
       { producerId: "prod_b", modes: [] },
     ]);
   });

@@ -157,7 +157,10 @@ function makeCartItem(overrides: Partial<CartItemForCheckout> = {}): CartItemFor
   };
 }
 
-function makeCartView(items: CartItemForCheckout[], overrides: Partial<CartForCheckout> = {}): CartForCheckout {
+function makeCartView(
+  items: CartItemForCheckout[],
+  overrides: Partial<CartForCheckout> = {},
+): CartForCheckout {
   return {
     cartId: "cart_001",
     userId: "user_001",
@@ -257,7 +260,10 @@ describe("payments.dto — serializeDeliverySelectionsForMetadata (D1 guard)", (
 
 describe("payments.dto — deserializeDeliverySelectionsFromMetadata (WU3 D1 round-trip)", () => {
   it("[PD-META-ROUNDTRIP] parses the compact JSON produced by serializeDeliverySelectionsForMetadata back into the original array", () => {
-    const selections = [makeSelection(), makeSelection({ producerId: "producer_B", deliveryModeId: "mode_B" })];
+    const selections = [
+      makeSelection(),
+      makeSelection({ producerId: "producer_B", deliveryModeId: "mode_B" }),
+    ];
     const compact = serializeDeliverySelectionsForMetadata(selections);
     expect(deserializeDeliverySelectionsFromMetadata(compact)).toEqual(selections);
   });
@@ -372,9 +378,7 @@ describe("payments.service.createPaymentIntent", () => {
 
   it("[CPI-SEL-INACTIVE] resolved DeliveryMode.isActive = false -> ValidationFailedError", async () => {
     mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView([makeCartItem()]));
-    mockedDeliveryMode.findMany.mockResolvedValueOnce([
-      makeDeliveryModeRow({ isActive: false }),
-    ]);
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryModeRow({ isActive: false })]);
 
     await expect(
       paymentsService.createPaymentIntent("user_001", [makeSelection()]),
@@ -384,7 +388,9 @@ describe("payments.service.createPaymentIntent", () => {
 
   it("[CPI-STOCK] quantity > live Product.stock -> InsufficientStockError, no Stripe call", async () => {
     mockedGetCartForCheckout.mockResolvedValueOnce(
-      makeCartView([makeCartItem({ quantity: 999, product: { ...makeCartItem().product, stock: 3 } })]),
+      makeCartView([
+        makeCartItem({ quantity: 999, product: { ...makeCartItem().product, stock: 3 } }),
+      ]),
     );
     mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryModeRow()]);
 
@@ -414,14 +420,14 @@ describe("payments.service.createPaymentIntent", () => {
         makeCartItem({ cartItemId: "item_002", quantity: 3, unitPriceSnapshot: "5.00" }),
       ]),
     );
-    mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryModeRow({ cost: new Prisma.Decimal("2.00") })]);
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([
+      makeDeliveryModeRow({ cost: new Prisma.Decimal("2.00") }),
+    ]);
     mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_123", client_secret: "secret_123" });
 
     await paymentsService.createPaymentIntent("user_001", [makeSelection()]);
 
-    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(
-      expect.objectContaining({ amount: 27 }),
-    );
+    expect(mockedCreatePaymentIntent).toHaveBeenCalledWith(expect.objectContaining({ amount: 27 }));
   });
 
   it("[CPI-CLIENT-AMOUNT-IGNORED] createPaymentIntent signature has no client-amount parameter", async () => {
@@ -438,7 +444,9 @@ describe("payments.service.createPaymentIntent", () => {
   });
 
   it("[CPI-IDEMPOTENCY-SAME] identical cart content across repeat calls -> same idempotencyKey", async () => {
-    mockedGetCartForCheckout.mockResolvedValue(makeCartView([makeCartItem()], { cartId: "cart_XYZ" }));
+    mockedGetCartForCheckout.mockResolvedValue(
+      makeCartView([makeCartItem()], { cartId: "cart_XYZ" }),
+    );
     mockedDeliveryMode.findMany.mockResolvedValue([makeDeliveryModeRow()]);
     mockedCreatePaymentIntent.mockResolvedValue({ id: "pi_123", client_secret: "secret_123" });
 
@@ -491,7 +499,10 @@ describe("payments.service.createPaymentIntent", () => {
 
     expect(result).toEqual({ clientSecret: "secret_999" });
     expect(mockedPendingCheckout.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: expect.objectContaining({ userId: "user_001" }), data: { providerRef: "pi_999" } }),
+      expect.objectContaining({
+        where: expect.objectContaining({ userId: "user_001" }),
+        data: { providerRef: "pi_999" },
+      }),
     );
   });
 });
@@ -535,11 +546,48 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
     expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
   });
 
+  it("requires an owned destination address for PERSONAL_DELIVERY", async () => {
+    mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView([makeCartItem()]));
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([
+      makeDeliveryModeRow({ type: "PERSONAL_DELIVERY" }),
+    ]);
+
+    await expect(
+      paymentsService.createPaymentIntent("user_001", [makeSelection()]),
+    ).rejects.toBeInstanceOf(ValidationFailedError);
+    expect(mockedCreatePaymentIntent).not.toHaveBeenCalled();
+  });
+
+  it("snapshots an owned address for PERSONAL_DELIVERY", async () => {
+    mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView([makeCartItem()]));
+    mockedDeliveryMode.findMany.mockResolvedValueOnce([
+      makeDeliveryModeRow({ type: "PERSONAL_DELIVERY" }),
+    ]);
+    mockedAddress.findFirst.mockResolvedValueOnce(makeAddressRow());
+    mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
+    mockedCreatePaymentIntent.mockResolvedValueOnce({
+      id: "pi_personal",
+      client_secret: "secret_personal",
+    });
+
+    await paymentsService.createPaymentIntent("user_001", [makeSelection()], "addr_A");
+
+    expect(mockedAddress.findFirst).toHaveBeenCalledWith({
+      where: { id: "addr_A", userId: "user_001", deletedAt: null },
+    });
+    expect(mockedPendingCheckout.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ addressLine1: "Calle Envio 1" }),
+    });
+  });
+
   it("[CPI-ADDR-PICKUP-IGNORED] pickup-only selection with a supplied addressId -> ignored, no address lookup, no snapshot content written", async () => {
     mockedGetCartForCheckout.mockResolvedValueOnce(makeCartView([makeCartItem()]));
     mockedDeliveryMode.findMany.mockResolvedValueOnce([makeDeliveryModeRow({ type: "PICKUP" })]);
     mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
-    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_pickup", client_secret: "secret_pickup" });
+    mockedCreatePaymentIntent.mockResolvedValueOnce({
+      id: "pi_pickup",
+      client_secret: "secret_pickup",
+    });
 
     const result = await paymentsService.createPaymentIntent(
       "user_001",
@@ -586,12 +634,26 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
       makeDeliveryModeRow({ type: "SHIPPING_FLAT_RATE" }),
     ]);
     mockedAddress.findFirst.mockResolvedValueOnce(
-      makeAddressRow({ line1: "Avenida Real 42", line2: "Piso 3", city: "Alicante", postalCode: "03001", province: "Alicante", country: "ES" }),
+      makeAddressRow({
+        line1: "Avenida Real 42",
+        line2: "Piso 3",
+        city: "Alicante",
+        postalCode: "03001",
+        province: "Alicante",
+        country: "ES",
+      }),
     );
     mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
-    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_shipping", client_secret: "secret_shipping" });
+    mockedCreatePaymentIntent.mockResolvedValueOnce({
+      id: "pi_shipping",
+      client_secret: "secret_shipping",
+    });
 
-    const result = await paymentsService.createPaymentIntent("user_001", [makeSelection()], "addr_owned");
+    const result = await paymentsService.createPaymentIntent(
+      "user_001",
+      [makeSelection()],
+      "addr_owned",
+    );
 
     expect(result).toEqual({ clientSecret: "secret_shipping" });
     expect(mockedPendingCheckout.create).toHaveBeenCalledWith({
@@ -613,17 +675,29 @@ describe("payments.service.createPaymentIntent — BE-3 addressId", () => {
   // now part of the fingerprint payload — a different owned address MUST
   // yield a different idempotencyKey.
   it("[CPI-ADDR-FINGERPRINT-DIFF] same cart/cartId/deliverySelections but a different owned addressId -> different idempotencyKey", async () => {
-    mockedGetCartForCheckout.mockResolvedValue(makeCartView([makeCartItem()], { cartId: "cart_XYZ" }));
-    mockedDeliveryMode.findMany.mockResolvedValue([makeDeliveryModeRow({ type: "SHIPPING_FLAT_RATE" })]);
+    mockedGetCartForCheckout.mockResolvedValue(
+      makeCartView([makeCartItem()], { cartId: "cart_XYZ" }),
+    );
+    mockedDeliveryMode.findMany.mockResolvedValue([
+      makeDeliveryModeRow({ type: "SHIPPING_FLAT_RATE" }),
+    ]);
     mockedAddress.findFirst.mockResolvedValueOnce(makeAddressRow({ id: "addr_A" }));
     mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
-    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_addr_A", client_secret: "secret_addr_A" });
+    mockedCreatePaymentIntent.mockResolvedValueOnce({
+      id: "pi_addr_A",
+      client_secret: "secret_addr_A",
+    });
 
     await paymentsService.createPaymentIntent("user_001", [makeSelection()], "addr_A");
 
-    mockedAddress.findFirst.mockResolvedValueOnce(makeAddressRow({ id: "addr_B", line1: "Otra Calle 9", city: "Sevilla" }));
+    mockedAddress.findFirst.mockResolvedValueOnce(
+      makeAddressRow({ id: "addr_B", line1: "Otra Calle 9", city: "Sevilla" }),
+    );
     mockedPendingCheckout.updateMany.mockResolvedValueOnce({ count: 0 });
-    mockedCreatePaymentIntent.mockResolvedValueOnce({ id: "pi_addr_B", client_secret: "secret_addr_B" });
+    mockedCreatePaymentIntent.mockResolvedValueOnce({
+      id: "pi_addr_B",
+      client_secret: "secret_addr_B",
+    });
 
     await paymentsService.createPaymentIntent("user_001", [makeSelection()], "addr_B");
 

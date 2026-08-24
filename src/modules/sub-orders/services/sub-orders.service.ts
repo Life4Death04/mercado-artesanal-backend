@@ -17,11 +17,14 @@
  *   - findById: findFirst({ where: { id, producerId } }) with orderLines include
  *     — cross-producer returns NotFoundError (404, no-leak).
  *   - transition: runs inside $transaction:
- *       1. findFirst guard (404-no-leak on cross-producer)
- *       2. if current.status === target → early return (idempotent no-op, Decision #3)
- *       3. validate transition against state machine table
- *       4. if invalid → InvalidOrderTransitionError (409)
- *       5. if valid → subOrder.update({ status: target })
+ *       1. findFirst guard (404-no-leak on cross-producer) — includes deliveryMode.type
+ *       2. trackingNumber gate (order-fulfillment MODIFIED) — BEFORE the no-op
+ *          early-return (design Decision #3); throws ValidationFailedError (422)
+ *       3. if current.status === target → early return (idempotent no-op)
+ *       4. validate transition against state machine table
+ *       5. if invalid → InvalidOrderTransitionError (409)
+ *       6. if valid → subOrder.update({ status: target, trackingNumber? })
+ *          (trackingNumber only ever persisted on entry into `sent`)
  *
  * State machine (from design.md):
  *   pending   → preparing | cancelled
@@ -30,20 +33,61 @@
  *   delivered → (terminal)
  *   cancelled → (terminal)
  *
+ * trackingNumber gate (order-fulfillment MODIFIED — "Tracking number on shipment"):
+ *   trackingNumber is only legal on the PATCH that transitions a SubOrder INTO
+ *   `sent` from a non-`sent` status. Given that:
+ *     (a) trackingNumber present && NOT entering sent (target !== "sent", OR
+ *         current.status is already "sent" — covers the "sent → sent" no-op)
+ *         → ValidationFailedError (422)
+ *     (b) trackingNumber present && delivery mode does not require tracking
+ *         → ValidationFailedError (422)
+ *     (c) trackingNumber present && current.trackingNumber !== null (immutable)
+ *         → ValidationFailedError (422)
+ *     (d) trackingNumber absent && entering sent && type=SHIPPING_FLAT_RATE
+ *         → ValidationFailedError (422) — mandatory for shipping
+ *
  * Design references:
  *   design §"State machine (SubOrder)"
+ *   design Architecture Decision #1: tracking rules enforced in the service, not the DTO
  *   design Architecture Decision #3: idempotent PATCH — early return before update
+ *   design Architecture Decision #3 (extended): tracking gate runs before the no-op
  *   spec order-fulfillment §"Producer read of own SubOrders"
  *   spec order-fulfillment §"State machine"
  *   spec order-fulfillment §"Idempotent transitions"
- *   spec order-fulfillment §"Tracking number deferred" — trackingNumber stays null
+ *   spec order-fulfillment §"Tracking number on shipment" (MODIFIED)
  */
-import type { SubOrder, SubOrderStatus } from "@prisma/client";
+import type { SubOrder } from "@prisma/client";
 
-import { InvalidOrderTransitionError, NotFoundError } from "@/shared/errors/errors";
+import { requiresTrackingNumber } from "@/modules/delivery-modes/delivery-mode.policy";
+import * as notificationsService from "@/modules/notifications/services/notifications.service";
+import type { PendingEmail } from "@/modules/notifications/services/notifications.service";
+import {
+  InvalidOrderTransitionError,
+  NotFoundError,
+  ValidationFailedError,
+} from "@/shared/errors/errors";
 import { prisma } from "@/shared/utils/prisma";
 
-import type { ListSubOrdersQuery, PatchSubOrderBody, SubOrderStatusValue } from "../dto/sub-orders.dto";
+import type {
+  ListSubOrdersQuery,
+  PatchSubOrderBody,
+  SubOrderStatusValue,
+} from "../dto/sub-orders.dto";
+
+/**
+ * `transition()`'s return contract (Cycle 5 notifications design "Emission
+ * wiring", Phase 5). `subOrder` is the SAME frozen `SubOrder` row this
+ * function always returned; `pendingEmails` is the fire-after-commit
+ * dispatch intent for every Notification written during THIS call (empty on
+ * the step-3 idempotent no-op path — a same-status PATCH emits nothing, so
+ * it has nothing to dispatch). The CALLER (`sub-orders.controller.ts`) is
+ * responsible for invoking `dispatchEmails` from `@/shared/email/email-provider`
+ * AFTER this transaction commits (fire-after-commit, best-effort).
+ */
+export interface TransitionSubOrderResult {
+  subOrder: SubOrder;
+  pendingEmails: PendingEmail[];
+}
 
 // ---------------------------------------------------------------------------
 // State machine definition
@@ -112,10 +156,11 @@ export async function findAll(
   return prisma.subOrder.findMany({
     where: {
       producerId,
-      ...(query?.status !== undefined && { status: query.status as SubOrderStatus }),
+      ...(query?.status !== undefined && { status: query.status }),
     },
     include: {
       orderLines: true,
+      deliveryMode: { select: { type: true } },
     },
     orderBy: { createdAt: "desc" },
     skip,
@@ -146,14 +191,14 @@ export async function findById(
 ): Promise<SubOrder & { orderLines: unknown[] }> {
   const subOrder = await prisma.subOrder.findFirst({
     where: { id, producerId },
-    include: { orderLines: true },
+    include: { orderLines: true, deliveryMode: { select: { type: true } } },
   });
 
   if (!subOrder) {
     throw new NotFoundError("SubOrder not found");
   }
 
-  return subOrder as SubOrder & { orderLines: unknown[] };
+  return subOrder;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,45 +209,134 @@ export async function findById(
  * Transition a SubOrder's status via the producer state machine.
  *
  * Runs inside `$transaction` to prevent TOCTOU between the read and write:
- *   1. findFirst({ where: { id, producerId } }) — 404-no-leak on cross-producer.
- *   2. Idempotent no-op: if current.status === target, return current WITHOUT
+ *   1. findFirst({ where: { id, producerId } }) — 404-no-leak on cross-producer;
+ *      includes `deliveryMode.type` for the trackingNumber gate.
+ *   2. trackingNumber gate (order-fulfillment MODIFIED) — runs BEFORE the
+ *      idempotent no-op early-return. Throws ValidationFailedError (422) on
+ *      any rule violation. See module-level doc for the (a)-(d) rule order.
+ *   3. Idempotent no-op: if current.status === target, return current WITHOUT
  *      calling update (Decision #3 — updatedAt must not change on retries).
- *   3. Validate transition against ALLOWED_TRANSITIONS table.
+ *   4. Validate transition against ALLOWED_TRANSITIONS table.
  *      If invalid → throw InvalidOrderTransitionError (409).
- *   4. If valid → tx.subOrder.update({ status: target }).
+ *   5. If valid → tx.subOrder.update({ status: target, trackingNumber? }).
+ *      trackingNumber is only included in the update payload when entering
+ *      `sent` (the gate guarantees it cannot reach here otherwise).
  *
  * Spec: order-fulfillment §"State machine"
  * Spec scenario: "Valid transition succeeds"
  * Spec scenario: "Invalid transition rejected"
  * Spec: order-fulfillment §"Idempotent transitions"
  * Spec scenario: "Idempotent no-op does not touch the row"
- * Design Architecture Decision #3 — idempotent PATCH: early return before update.
+ * Spec: order-fulfillment §"Tracking number on shipment" (MODIFIED)
+ * Design Architecture Decision #1 — tracking rules enforced in the service.
+ * Design Architecture Decision #3 — idempotent PATCH: early return before update;
+ *   extended so the tracking gate runs before that early return too.
+ *
+ * Cycle 5 notifications (design "Emission wiring", Phase 5) — emitted AFTER
+ * the step-5 update only, never on the step-3 no-op early-return (free-rides
+ * that existing guard, zero new idempotency logic, mirrors the payments/orders
+ * seam): SUBORDER_STATUS_CHANGED always, plus TRACKING_ASSIGNED when this
+ * PATCH also set a trackingNumber (`input.trackingNumber !== undefined`,
+ * which the step-2 gate already guarantees only ever happens on the PATCH
+ * entering `sent`). Both go to the order's owning Consumer (`order.userId`)
+ * with base copy — no audience override, this seam has a single recipient
+ * role (maintainer decision sdd/notifications/copy-audience-decision).
+ * Returns `{ subOrder, pendingEmails }`; the CALLER dispatches
+ * `pendingEmails` via the shared `dispatchEmails` AFTER this transaction
+ * commits.
+ *
+ * Spec: notifications §"Sub-order status change and tracking notify the consumer"
+ * Spec: notifications §"Replayed event does not duplicate" (no-op path)
  */
 export async function transition(
   producerId: string,
   id: string,
   input: PatchSubOrderBody,
-): Promise<SubOrder> {
+): Promise<TransitionSubOrderResult> {
   return prisma.$transaction(async (tx) => {
-    // Step 1: ownership guard — 404-no-leak
+    // Step 1: ownership guard — 404-no-leak; include deliveryMode.type for the
+    // gate and order.userId (Cycle 5 notifications) for the emission recipient.
     const current = await tx.subOrder.findFirst({
       where: { id, producerId },
+      include: {
+        deliveryMode: { select: { type: true } },
+        order: { select: { userId: true } },
+      },
     });
 
     if (!current) {
       throw new NotFoundError("SubOrder not found");
     }
 
-    const target = input.status as SubOrderStatusValue;
+    const target = input.status;
+    const isEnteringSent = target === "sent" && current.status !== "sent";
+    const trackingRequired = requiresTrackingNumber(current.deliveryMode.type);
 
-    // Step 2: idempotent no-op — if already in target state, return current row unchanged.
-    // Decision #3: no UPDATE is issued; updatedAt is untouched.
-    // Spec: "The service MUST NOT issue any UPDATE to the row; updatedAt MUST remain unchanged."
-    if (current.status === target) {
-      return current;
+    // Step 2: trackingNumber gate — MUST run before the no-op early-return.
+    // Spec: order-fulfillment §"Tracking number on shipment" (MODIFIED)
+    if (input.trackingNumber !== undefined) {
+      // (a) trackingNumber is only accepted on the PATCH that transitions a
+      //     SubOrder INTO "sent"; rejects any other target AND a same-status
+      //     "sent → sent" no-op (spec scenario "Same-status no-op cannot set
+      //     trackingNumber").
+      if (!isEnteringSent) {
+        throw new ValidationFailedError(
+          [
+            {
+              path: "trackingNumber",
+              message: "trackingNumber is only accepted when transitioning to 'sent'",
+            },
+          ],
+          "trackingNumber is only accepted when transitioning to 'sent'",
+        );
+      }
+      // (b) Only carrier shipping sub-orders accept a trackingNumber.
+      if (!trackingRequired) {
+        throw new ValidationFailedError(
+          [
+            {
+              path: "trackingNumber",
+              message: `${current.deliveryMode.type} sub-orders cannot have a trackingNumber`,
+            },
+          ],
+          `${current.deliveryMode.type} sub-orders cannot have a trackingNumber`,
+        );
+      }
+      // (c) Immutability — a non-null trackingNumber cannot be overwritten.
+      if (current.trackingNumber !== null) {
+        throw new ValidationFailedError(
+          [
+            {
+              path: "trackingNumber",
+              message: "trackingNumber is already set and cannot be overwritten",
+            },
+          ],
+          "trackingNumber is already set and cannot be overwritten",
+        );
+      }
+    } else if (isEnteringSent && trackingRequired) {
+      // (d) Carrier shipping sub-orders MUST provide a trackingNumber to enter "sent".
+      throw new ValidationFailedError(
+        [
+          {
+            path: "trackingNumber",
+            message: "trackingNumber is required for shipping sub-orders entering 'sent'",
+          },
+        ],
+        "trackingNumber is required for shipping sub-orders entering 'sent'",
+      );
     }
 
-    // Step 3: validate transition
+    // Step 3: idempotent no-op — if already in target state, return current row unchanged.
+    // Decision #3: no UPDATE is issued; updatedAt is untouched. (Cycle 5 notifications:
+    // a no-op emits NO notification — pendingEmails stays empty, free-riding this
+    // existing early-return exactly like the payments/orders seam's step-0 replay guard.)
+    // Spec: "The service MUST NOT issue any UPDATE to the row; updatedAt MUST remain unchanged."
+    if (current.status === target) {
+      return { subOrder: current, pendingEmails: [] };
+    }
+
+    // Step 4: validate transition
     const allowedTargets = ALLOWED_TRANSITIONS[current.status] ?? [];
     if (!allowedTargets.includes(target)) {
       throw new InvalidOrderTransitionError(
@@ -210,10 +344,52 @@ export async function transition(
       );
     }
 
-    // Step 4: valid transition — update the row
-    return tx.subOrder.update({
+    // Step 5: valid transition — update the row.
+    // trackingNumber is only ever defined here when isEnteringSent was true (gate guarantees it).
+    const updated = await tx.subOrder.update({
       where: { id },
-      data: { status: target as SubOrderStatus },
+      data: {
+        status: target,
+        ...(input.trackingNumber !== undefined && { trackingNumber: input.trackingNumber }),
+      },
     });
+
+    // Step 5a (Cycle 5 notifications, design "Emission wiring"): emit AFTER
+    // the write above — a throw in any EARLIER step never reaches here, so
+    // no notification is ever created for a transition that didn't happen.
+    // `Order.userId` is intentionally a BARE column with no Prisma relation
+    // to `User` (money-webhook exception, prisma pitfall #1 — same
+    // deviation documented for the payments/orders seam), so the recipient
+    // email cannot be nested-included on the step-1 `order` select; one
+    // extra in-tx `user.findUnique` resolves it instead.
+    const owner = await tx.user.findUnique({
+      where: { id: current.order.userId },
+      select: { email: true },
+    });
+    // `order.userId` is FK-guaranteed, so this is a "cannot happen" guard — but
+    // resolve it as a controlled NotFoundError rather than a raw non-null
+    // assertion, so a missing row never becomes an uncaught TypeError mid-tx.
+    if (!owner) {
+      throw new NotFoundError("Order owner not found");
+    }
+    const pendingEmails: PendingEmail[] = [];
+    pendingEmails.push(
+      await notificationsService.createNotification(tx, {
+        userId: current.order.userId,
+        type: "SUBORDER_STATUS_CHANGED",
+        toEmail: owner.email,
+      }),
+    );
+    if (input.trackingNumber !== undefined) {
+      pendingEmails.push(
+        await notificationsService.createNotification(tx, {
+          userId: current.order.userId,
+          type: "TRACKING_ASSIGNED",
+          toEmail: owner.email,
+        }),
+      );
+    }
+
+    return { subOrder: updated, pendingEmails };
   });
 }

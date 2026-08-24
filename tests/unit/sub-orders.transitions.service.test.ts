@@ -8,9 +8,10 @@
  *   - idempotent no-op does NOT call update (SQL no-update assertion)
  *   - terminal state transitions are rejected
  *
- * Note: trackingNumber rejection is covered at the DTO level (integration test [SO-T4]).
- * The service itself never sees the trackingNumber field because the controller's
- * validateBody(PatchSubOrderBodySchema) rejects it before calling service.transition().
+ * trackingNumber gate (order-fulfillment MODIFIED — "Tracking number on shipment"):
+ * the service enforces the tracking rules itself (design Decision #1) using the
+ * `deliveryMode.type` loaded alongside the ownership `findFirst`. The gate runs
+ * BEFORE the idempotent same-status no-op early-return (design Decision #3).
  *
  * Scenarios covered (specs: order-fulfillment):
  *
@@ -35,12 +36,35 @@
  *   - throws NotFoundError when SubOrder not owned by producer (cross-producer)
  *   - throws NotFoundError when SubOrder id does not exist
  *
+ * transition — trackingNumber gate:
+ *   - PICKUP sub-order + trackingNumber → ValidationFailedError (422)
+ *   - shipping sub-order entering "sent" without trackingNumber → ValidationFailedError (422)
+ *   - trackingNumber present on a non-"sent" target → ValidationFailedError (422)
+ *   - already-set trackingNumber cannot be overwritten → ValidationFailedError (422)
+ *   - same-status "sent → sent" no-op with trackingNumber → ValidationFailedError (422),
+ *     gate runs BEFORE the no-op early-return (update MUST NOT be called)
+ *   - valid shipping sub-order entering "sent" persists trackingNumber in the update payload
+ *
+ * transition — notification emission (Cycle 5 notifications, Phase 5):
+ *   - a valid transition emits SUBORDER_STATUS_CHANGED to order.userId
+ *   - entering "sent" with a trackingNumber ALSO emits TRACKING_ASSIGNED (both, in order)
+ *   - the idempotent no-op (Phase 5's "no-op-no-dup") creates NO notification
+ *
  * Spec references:
  *   order-fulfillment §"State machine"
  *   order-fulfillment scenario "Valid transition succeeds"
  *   order-fulfillment scenario "Invalid transition rejected"
  *   order-fulfillment §"Idempotent transitions"
  *   order-fulfillment scenario "Idempotent no-op does not touch the row"
+ *   order-fulfillment §"Tracking number on shipment" (MODIFIED)
+ *   order-fulfillment scenario "Shipping sub-order transitions to sent with a valid trackingNumber"
+ *   order-fulfillment scenario "Shipping sub-order to sent without trackingNumber rejected"
+ *   order-fulfillment scenario "PICKUP sub-order rejects trackingNumber"
+ *   order-fulfillment scenario "Already-set trackingNumber cannot be overwritten"
+ *   order-fulfillment scenario "trackingNumber rejected on a non-sent transition"
+ *   order-fulfillment scenario "Same-status no-op cannot set trackingNumber"
+ *   sdd/notifications/spec §"Sub-order status change and tracking notify the consumer"
+ *   sdd/notifications/spec §"Replayed event does not duplicate" (no-op path)
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -60,20 +84,43 @@ vi.mock("@/shared/utils/prisma", () => {
   };
 });
 
+// ---------------------------------------------------------------------------
+// Mock notifications service (Cycle 5 notifications Phase 5) — the fake `tx`
+// built by `mockTransaction()` below has no `tx.notification` delegate, so
+// the REAL `createNotification` (which calls `tx.notification.create`)
+// would crash against it. This file proves the state-machine + emission
+// CALL-SITE logic (which type, to which userId, in what order); the actual
+// write is proven separately by `notifications.service.ts`'s own suite and
+// the end-to-end HTTP path in `tests/integration/sub-orders.transitions.test.ts`.
+// ---------------------------------------------------------------------------
+vi.mock("@/modules/notifications/services/notifications.service", () => ({
+  createNotification: vi.fn(),
+}));
+
 import type { SubOrderStatus } from "@prisma/client";
 import { Decimal } from "@prisma/client/runtime/library";
 import { prisma } from "@/shared/utils/prisma";
-import { InvalidOrderTransitionError, NotFoundError } from "@/shared/errors/errors";
+import * as notificationsService from "@/modules/notifications/services/notifications.service";
+import {
+  InvalidOrderTransitionError,
+  NotFoundError,
+  ValidationFailedError,
+} from "@/shared/errors/errors";
 import * as subOrdersService from "@/modules/sub-orders/services/sub-orders.service";
 
 // ---------------------------------------------------------------------------
 // Typed mock accessors
 // ---------------------------------------------------------------------------
 const mockedPrisma = vi.mocked(prisma);
+const mockedCreateNotification = vi.mocked(notificationsService.createNotification);
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
+
+/** Owning Consumer's userId, shared across fixtures below (Cycle 5 notifications recipient). */
+const OWNER_USER_ID = "user_001";
+const OWNER_EMAIL = "owner@example.com";
 
 function makeSubOrder(overrides: Record<string, unknown> = {}) {
   return {
@@ -84,6 +131,12 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
     status: "pending" as SubOrderStatus,
     shippingCostSnapshot: new Decimal("5.00"),
     trackingNumber: null,
+    deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+    // Cycle 5 notifications (design "Emission wiring", Phase 5): the step-1
+    // findFirst now includes `order: { select: { userId: true } } }` — the
+    // emission recipient. `Order.userId` is a bare column (no Prisma `user`
+    // relation), so this fixture mirrors ONLY the field the service reads.
+    order: { userId: OWNER_USER_ID },
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
@@ -92,7 +145,8 @@ function makeSubOrder(overrides: Record<string, unknown> = {}) {
 
 /**
  * Wire prisma.$transaction for a transition: findFirst returns `current`,
- * update returns `updated` (or current if not provided).
+ * update returns `updated` (or current if not provided). `tx.user.findUnique`
+ * resolves the Cycle 5 notifications recipient email.
  * Returns the mockUpdate spy so callers can assert it was or wasn't called.
  */
 function mockTransaction(
@@ -107,6 +161,9 @@ function mockTransaction(
           findFirst: vi.fn().mockResolvedValue(current),
           update: mockUpdate,
         },
+        user: {
+          findUnique: vi.fn().mockResolvedValue({ email: OWNER_EMAIL }),
+        },
       };
       return fn(fakeTx as unknown as typeof prisma);
     },
@@ -116,6 +173,13 @@ function mockTransaction(
 
 beforeEach(() => {
   vi.resetAllMocks();
+  // Cycle 5 notifications: re-establish the default resolved value lost by
+  // resetAllMocks() above (module-factory mocks are reset to a bare vi.fn()).
+  mockedCreateNotification.mockResolvedValue({
+    to: OWNER_EMAIL,
+    subject: "mock subject",
+    body: "mock body",
+  });
 });
 
 // ===========================================================================
@@ -131,7 +195,7 @@ describe("subOrdersService.transition — valid transitions", () => {
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "preparing" });
 
-    expect(result.status).toBe("preparing");
+    expect(result.subOrder.status).toBe("preparing");
     expect(mockUpdate).toHaveBeenCalledOnce();
     expect(mockUpdate).toHaveBeenCalledWith({
       where: { id: "so_001" },
@@ -139,14 +203,40 @@ describe("subOrdersService.transition — valid transitions", () => {
     });
   });
 
-  it("transitions preparing → sent", async () => {
-    const current = makeSubOrder({ status: "preparing" as SubOrderStatus });
-    const updated = makeSubOrder({ status: "sent" as SubOrderStatus });
+  it("transitions preparing → sent (PICKUP — no trackingNumber required)", async () => {
+    // PICKUP sub-orders never require trackingNumber (order-fulfillment MODIFIED).
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
     mockTransaction(current, updated);
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "sent" });
 
-    expect(result.status).toBe("sent");
+    expect(result.subOrder.status).toBe("sent");
+  });
+
+  it("transitions PERSONAL_DELIVERY preparing → sent without trackingNumber", async () => {
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PERSONAL_DELIVERY" },
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "PERSONAL_DELIVERY" },
+    });
+    const mockUpdate = mockTransaction(current, updated);
+
+    await subOrdersService.transition("prod_001", "so_001", { status: "sent" });
+
+    expect(mockUpdate).toHaveBeenCalledWith({
+      where: { id: "so_001" },
+      data: { status: "sent" },
+    });
   });
 
   it("transitions sent → delivered", async () => {
@@ -156,7 +246,7 @@ describe("subOrdersService.transition — valid transitions", () => {
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "delivered" });
 
-    expect(result.status).toBe("delivered");
+    expect(result.subOrder.status).toBe("delivered");
   });
 
   it("transitions pending → cancelled", async () => {
@@ -166,7 +256,7 @@ describe("subOrdersService.transition — valid transitions", () => {
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "cancelled" });
 
-    expect(result.status).toBe("cancelled");
+    expect(result.subOrder.status).toBe("cancelled");
   });
 
   it("transitions preparing → cancelled", async () => {
@@ -176,7 +266,7 @@ describe("subOrdersService.transition — valid transitions", () => {
 
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "cancelled" });
 
-    expect(result.status).toBe("cancelled");
+    expect(result.subOrder.status).toBe("cancelled");
   });
 });
 
@@ -197,10 +287,25 @@ describe("subOrdersService.transition — idempotent no-op", () => {
     const result = await subOrdersService.transition("prod_001", "so_001", { status: "preparing" });
 
     // Returns the current row unchanged
-    expect(result.status).toBe("preparing");
-    expect(result.updatedAt).toEqual(t0);
+    expect(result.subOrder.status).toBe("preparing");
+    expect(result.subOrder.updatedAt).toEqual(t0);
     // SQL no-update assertion: update MUST NOT have been called
     expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("[N-EMIT-NOOP-NO-DUP] creates NO notification and returns empty pendingEmails on a no-op transition", async () => {
+    // Cycle 5 notifications (design "Emission wiring", Phase 5) — a same-status
+    // PATCH must not duplicate a notification. Placement AFTER the step-3
+    // early-return guarantees this: the no-op path returns before step 5a
+    // (emission) is ever reached.
+    // Spec: sdd/notifications/spec §"Replayed event does not duplicate"
+    const current = makeSubOrder({ status: "preparing" as SubOrderStatus });
+    mockTransaction(current);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", { status: "preparing" });
+
+    expect(mockedCreateNotification).not.toHaveBeenCalled();
+    expect(result.pendingEmails).toEqual([]);
   });
 });
 
@@ -270,5 +375,214 @@ describe("subOrdersService.transition — 404 no-leak", () => {
     await expect(
       subOrdersService.transition("prod_001", "nonexistent_id", { status: "preparing" }),
     ).rejects.toThrow(NotFoundError);
+  });
+});
+
+// ===========================================================================
+// transition — trackingNumber gate (order-fulfillment MODIFIED)
+// ===========================================================================
+
+describe("subOrdersService.transition — trackingNumber gate", () => {
+  it("throws ValidationFailedError when PICKUP sub-order carries a trackingNumber", async () => {
+    // Spec scenario: "PICKUP sub-order rejects trackingNumber"
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", { status: "sent", trackingNumber: "TN1" }),
+    ).rejects.toThrow(ValidationFailedError);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws ValidationFailedError when PERSONAL_DELIVERY carries a trackingNumber", async () => {
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PERSONAL_DELIVERY" },
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", {
+        status: "sent",
+        trackingNumber: "TN1",
+      }),
+    ).rejects.toThrow(ValidationFailedError);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws ValidationFailedError when a shipping sub-order enters 'sent' without trackingNumber", async () => {
+    // Spec scenario: "Shipping sub-order to sent without trackingNumber rejected"
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", { status: "sent" }),
+    ).rejects.toThrow(ValidationFailedError);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws ValidationFailedError when trackingNumber is present on a non-'sent' target", async () => {
+    // Spec scenario: "trackingNumber rejected on a non-sent transition"
+    const current = makeSubOrder({
+      status: "pending" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", {
+        status: "preparing",
+        trackingNumber: "TN1",
+      }),
+    ).rejects.toThrow(ValidationFailedError);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws ValidationFailedError when an already-set trackingNumber is overwritten", async () => {
+    // Spec scenario: "Already-set trackingNumber cannot be overwritten"
+    const current = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: "TN1",
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", { status: "sent", trackingNumber: "TN2" }),
+    ).rejects.toThrow(ValidationFailedError);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws ValidationFailedError on a same-status 'sent → sent' no-op carrying trackingNumber (gate runs before no-op)", async () => {
+    // Spec scenario: "Same-status no-op cannot set trackingNumber"
+    const current = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: null,
+    });
+    const mockUpdate = mockTransaction(current);
+
+    await expect(
+      subOrdersService.transition("prod_001", "so_001", { status: "sent", trackingNumber: "TN1" }),
+    ).rejects.toThrow(ValidationFailedError);
+    // Gate runs BEFORE the idempotent no-op early-return AND before update.
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("persists trackingNumber when a shipping sub-order validly enters 'sent'", async () => {
+    // Spec scenario: "Shipping sub-order transitions to sent with a valid trackingNumber"
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: null,
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: "TN1",
+    });
+    const mockUpdate = mockTransaction(current, updated);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", {
+      status: "sent",
+      trackingNumber: "TN1",
+    });
+
+    expect(result.subOrder.status).toBe("sent");
+    expect(result.subOrder.trackingNumber).toBe("TN1");
+    expect(mockUpdate).toHaveBeenCalledOnce();
+    expect(mockUpdate).toHaveBeenCalledWith({
+      where: { id: "so_001" },
+      data: { status: "sent", trackingNumber: "TN1" },
+    });
+  });
+});
+
+// ===========================================================================
+// transition — notification emission (Cycle 5 notifications, Phase 5)
+// ===========================================================================
+
+describe("subOrdersService.transition — notification emission", () => {
+  it("[N-EMIT-SUBORDER-STATUS] emits SUBORDER_STATUS_CHANGED to order.userId on a valid transition", async () => {
+    // Spec: sdd/notifications/spec §"Sub-order status change and tracking notify the consumer"
+    const current = makeSubOrder({ status: "pending" as SubOrderStatus });
+    const updated = makeSubOrder({ status: "preparing" as SubOrderStatus });
+    mockTransaction(current, updated);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", { status: "preparing" });
+
+    expect(mockedCreateNotification).toHaveBeenCalledOnce();
+    expect(mockedCreateNotification).toHaveBeenCalledWith(expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "SUBORDER_STATUS_CHANGED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(result.pendingEmails).toHaveLength(1);
+  });
+
+  it("[N-EMIT-TRACKING-ASSIGNED] emits SUBORDER_STATUS_CHANGED THEN TRACKING_ASSIGNED when entering 'sent' with a trackingNumber", async () => {
+    // Spec: sdd/notifications/spec §"Sub-order status change and tracking notify the consumer"
+    // Triangulation vs. the previous test: a SECOND notification is emitted
+    // only when trackingNumber is actually set — proves the conditional
+    // branch runs real logic, not a hardcoded single-call Fake It.
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: null,
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "SHIPPING_FLAT_RATE" },
+      trackingNumber: "TN1",
+    });
+    mockTransaction(current, updated);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", {
+      status: "sent",
+      trackingNumber: "TN1",
+    });
+
+    expect(mockedCreateNotification).toHaveBeenCalledTimes(2);
+    expect(mockedCreateNotification).toHaveBeenNthCalledWith(1, expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "SUBORDER_STATUS_CHANGED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(mockedCreateNotification).toHaveBeenNthCalledWith(2, expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "TRACKING_ASSIGNED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(result.pendingEmails).toHaveLength(2);
+  });
+
+  it("does NOT emit TRACKING_ASSIGNED when entering 'sent' without a trackingNumber (PICKUP)", async () => {
+    // Triangulation: proves TRACKING_ASSIGNED is conditional on
+    // input.trackingNumber, not on isEnteringSent alone.
+    const current = makeSubOrder({
+      status: "preparing" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
+    const updated = makeSubOrder({
+      status: "sent" as SubOrderStatus,
+      deliveryMode: { type: "PICKUP" },
+    });
+    mockTransaction(current, updated);
+
+    const result = await subOrdersService.transition("prod_001", "so_001", { status: "sent" });
+
+    expect(mockedCreateNotification).toHaveBeenCalledOnce();
+    expect(mockedCreateNotification).toHaveBeenCalledWith(expect.anything(), {
+      userId: OWNER_USER_ID,
+      type: "SUBORDER_STATUS_CHANGED",
+      toEmail: OWNER_EMAIL,
+    });
+    expect(result.pendingEmails).toHaveLength(1);
   });
 });

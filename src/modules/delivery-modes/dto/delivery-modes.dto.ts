@@ -5,13 +5,12 @@
  * (rejects unknown keys with VALIDATION_FAILED 422 via global errorMap).
  *
  * Design note on PICKUP validation:
- *   PICKUP type requires pickupLocation. This is enforced at the SERVICE layer
+ *   PICKUP requires either legacy pickupLocation or structured pickupStreet. This is enforced at the SERVICE layer
  *   (not here) so the error code is VALIDATION_FAILED (422) thrown by
  *   ValidationFailedError — consistent with how product-images handles its
  *   business-rule validations.
  *
- *   The DTO accepts both PICKUP and SHIPPING_FLAT_RATE types at the schema level;
- *   the PICKUP+no-pickupLocation guard runs in delivery-modes.service.create().
+ *   Type-specific invariants run in the delivery-modes service against effective values.
  *
  * Spec references:
  *   delivery-modes §"Producer-scoped CRUD", §"PICKUP without pickupLocation rejected"
@@ -33,14 +32,30 @@ import { strictObject } from "@/shared/validation/zod";
  * Uses `z.enum([...])` with the literal values from the Prisma `DeliveryModeType` enum
  * (`prisma/schema.prisma`). No re-encoding, no lowercase transforms, no aliasing.
  *
- * Wire contract (Cycle 3 forward): `PICKUP` and `SHIPPING_FLAT_RATE` MUST remain
- * stable on the wire — Cycle 3 checkout snapshots `DeliveryMode.type` into SubOrder.
- * Any new variant (e.g. `COURIER`) MUST go through a new SDD cycle and amend this schema.
+ * Wire contract: enum literals MUST remain stable on the wire.
  *
  * Spec: delivery-modes §"Enum literal stability", §"Forward contract for Cycle 3"
  * Design: §"Delivery-modes delete guard" (enum stability context)
  */
-export const DeliveryModeTypeSchema = z.enum(["PICKUP", "SHIPPING_FLAT_RATE"]);
+export const DeliveryModeTypeSchema = z.enum(["PERSONAL_DELIVERY", "PICKUP", "SHIPPING_FLAT_RATE"]);
+
+const coverageZoneSchema = z.string().min(1).max(255);
+const carrierCompanySchema = z.string().min(1).max(120);
+const notesSchema = z.string().min(1).max(1000);
+const pickupLocationSchema = z.string().min(1).max(500);
+const pickupLocationNameSchema = z.string().min(1).max(120);
+const pickupStreetSchema = z.string().min(1).max(255);
+const pickupMunicipalitySchema = z.string().min(1).max(120);
+const pickupPostalCodeSchema = z
+  .string()
+  .regex(/^\d{5}$/, "pickupPostalCode must contain exactly 5 digits");
+const pickupOpeningHoursSchema = z.string().min(1).max(500);
+const deliveryModeCostSchema = z
+  .number()
+  .finite("cost must be finite")
+  .min(0, "cost must be >= 0")
+  .max(99_999_999.99, "cost exceeds Decimal(10,2)")
+  .multipleOf(0.01, "cost must have at most 2 decimal places");
 
 // ---------------------------------------------------------------------------
 // Create request body
@@ -50,7 +65,7 @@ export const DeliveryModeTypeSchema = z.enum(["PICKUP", "SHIPPING_FLAT_RATE"]);
  * Body for POST /producers/me/delivery-modes.
  *
  * Spec: delivery-modes §"Producer-scoped CRUD" — create.
- *   - type: DeliveryModeType (PICKUP | SHIPPING_FLAT_RATE)
+ *   - type: DeliveryModeType
  *   - cost: number (monetary; converted to Decimal in service)
  *   - coverageZone: optional string
  *   - pickupLocation: optional string (required when type=PICKUP — enforced in service)
@@ -59,9 +74,16 @@ export const DeliveryModeTypeSchema = z.enum(["PICKUP", "SHIPPING_FLAT_RATE"]);
  */
 export const CreateDeliveryModeBodySchema = strictObject({
   type: DeliveryModeTypeSchema,
-  cost: z.number().min(0, "cost must be >= 0"),
-  coverageZone: z.string().optional(),
-  pickupLocation: z.string().optional(),
+  cost: deliveryModeCostSchema,
+  coverageZone: coverageZoneSchema.optional(),
+  carrierCompany: carrierCompanySchema.optional(),
+  notes: notesSchema.optional(),
+  pickupLocation: pickupLocationSchema.optional(),
+  pickupLocationName: pickupLocationNameSchema.optional(),
+  pickupStreet: pickupStreetSchema.optional(),
+  pickupMunicipality: pickupMunicipalitySchema.optional(),
+  pickupPostalCode: pickupPostalCodeSchema.optional(),
+  pickupOpeningHours: pickupOpeningHoursSchema.optional(),
 });
 
 export type CreateDeliveryModeBody = z.infer<typeof CreateDeliveryModeBodySchema>;
@@ -80,9 +102,16 @@ export type CreateDeliveryModeBody = z.infer<typeof CreateDeliveryModeBodySchema
  */
 export const UpdateDeliveryModeBodySchema = strictObject({
   type: DeliveryModeTypeSchema.optional(),
-  cost: z.number().min(0, "cost must be >= 0").optional(),
-  coverageZone: z.string().optional(),
-  pickupLocation: z.string().optional(),
+  cost: deliveryModeCostSchema.optional(),
+  coverageZone: coverageZoneSchema.nullable().optional(),
+  carrierCompany: carrierCompanySchema.nullable().optional(),
+  notes: notesSchema.nullable().optional(),
+  pickupLocation: pickupLocationSchema.nullable().optional(),
+  pickupLocationName: pickupLocationNameSchema.nullable().optional(),
+  pickupStreet: pickupStreetSchema.nullable().optional(),
+  pickupMunicipality: pickupMunicipalitySchema.nullable().optional(),
+  pickupPostalCode: pickupPostalCodeSchema.nullable().optional(),
+  pickupOpeningHours: pickupOpeningHoursSchema.nullable().optional(),
   isActive: z.boolean().optional(),
 });
 
@@ -101,14 +130,20 @@ export interface DeliveryModeConsumerView {
 
 /** Maps the persisted delivery configuration to the minimal checkout DTO. */
 export function mapDeliveryModeConsumerView(
-  mode: Pick<DeliveryMode, "id" | "type" | "cost">,
+  mode: Pick<DeliveryMode, "id" | "type" | "cost" | "pickupLocationName">,
 ): DeliveryModeConsumerView {
-  const isShipping = mode.type === "SHIPPING_FLAT_RATE";
+  const isPickup = mode.type === "PICKUP";
+  const name =
+    mode.type === "PERSONAL_DELIVERY"
+      ? "Personal delivery"
+      : mode.type === "SHIPPING_FLAT_RATE"
+        ? "Shipping"
+        : (mode.pickupLocationName ?? "Pickup");
 
   return {
     id: mode.id,
-    name: isShipping ? "Shipping" : "Pickup",
-    type: isShipping ? "shipping" : "pickup",
+    name,
+    type: isPickup ? "pickup" : "shipping",
     price: mode.cost.toFixed(2),
   };
 }

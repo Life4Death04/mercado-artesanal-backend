@@ -256,6 +256,25 @@ describe("GET /api/v1/producers/me/sub-orders/:id — get own SubOrder with line
     expect(res.body.orderLines).toHaveLength(1);
   });
 
+  it("[SO-R6] returns 200 with deliveryMode.type so the producer can gate tracking UI", async () => {
+    // Spec: order-fulfillment §"Consumer sub-order read exposes tracking and
+    // delivery mode" (ADDED) — "Producer sub-order reads MUST also expose
+    // deliveryMode.type".
+    const sub = "auth0|producer001";
+    const user = makeProducerUser({ auth0Sub: sub });
+    const so = makeSubOrder({ deliveryMode: { type: "SHIPPING_FLAT_RATE" } });
+
+    mockLoadUser(user);
+    mockedSubOrder.findFirst.mockResolvedValueOnce(so);
+
+    const res = await request
+      .get("/api/v1/producers/me/sub-orders/so_001")
+      .set("X-Test-Auth", authHeader({ sub }));
+
+    expect(res.status).toBe(200);
+    expect(res.body.deliveryMode).toEqual({ type: "SHIPPING_FLAT_RATE" });
+  });
+
   it("[SO-R5] returns 404 NOT_FOUND when SubOrder belongs to another producer (cross-producer no-leak)", async () => {
     // Spec: order-fulfillment scenario "Cross-producer read returns 404"
     // P1 calls GET /producers/me/sub-orders/S9.id where S9 is owned by P2 → 404, no 403.
