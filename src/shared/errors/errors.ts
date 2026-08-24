@@ -410,3 +410,49 @@ export class UserHasActiveOrdersError extends AppError {
     super(detail, cause);
   }
 }
+
+// ===========================================================================
+// admin-database-backups additions — backup/restore error contract
+// ===========================================================================
+
+// 404 — Backup ID does not exist, is tombstoned, or is corrupt/incomplete.
+export class BackupNotFoundError extends AppError {
+  readonly code = "BACKUP_NOT_FOUND" as const;
+  readonly status = 404;
+  readonly title = "Backup not found";
+}
+
+// 404 — Operation ID does not exist.
+export class BackupOperationNotFoundError extends AppError {
+  readonly code = "BACKUP_OPERATION_NOT_FOUND" as const;
+  readonly status = 404;
+  readonly title = "Backup operation not found";
+}
+
+// 409 — Backup fails checksum/list/major recheck before restore preparation.
+export class BackupNotRestorableError extends AppError {
+  readonly code = "BACKUP_NOT_RESTORABLE" as const;
+  readonly status = 409;
+  readonly title = "Backup not restorable";
+}
+
+// 409 — Global operation lease is already held by another mutation.
+export class BackupOperationConflictError extends AppError {
+  readonly code = "BACKUP_OPERATION_CONFLICT" as const;
+  readonly status = 409;
+  readonly title = "Backup operation conflict";
+}
+
+// 503 — Client 16 tooling missing, wrong major, or not executable.
+export class BackupRuntimeUnavailableError extends AppError {
+  readonly code = "BACKUP_RUNTIME_UNAVAILABLE" as const;
+  readonly status = 503;
+  readonly title = "Backup runtime unavailable";
+}
+
+// 500 — Runner/tool step failed after acceptance; detail MUST stay redacted.
+export class BackupOperationFailedError extends AppError {
+  readonly code = "BACKUP_OPERATION_FAILED" as const;
+  readonly status = 500;
+  readonly title = "Backup operation failed";
+}

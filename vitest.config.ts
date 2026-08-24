@@ -50,6 +50,13 @@ export default defineConfig({
       // never selects the SES provider — @aws-sdk/client-ses is globally
       // mocked in tests/setup.ts regardless, but this keeps intent explicit.
       EMAIL_PROVIDER: "console",
+      // Required after admin-database-backups Phase 1 (env.ts fail-fast on
+      // missing/relative). Real Client 16 binaries are never invoked by unit
+      // tests in this PR — routes stay disabled until Phase 4.
+      BACKUP_ARTIFACT_DIR: "/tmp/mercado-test-backups",
+      PG_DUMP_PATH: "/usr/lib/postgresql/16/bin/pg_dump",
+      PG_RESTORE_PATH: "/usr/lib/postgresql/16/bin/pg_restore",
+      BACKUP_OPERATION_TIMEOUT_MS: "300000",
     },
     coverage: {
       provider: "v8",

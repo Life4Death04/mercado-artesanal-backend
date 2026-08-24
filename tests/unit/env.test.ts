@@ -37,6 +37,13 @@ const BASE_VALID = {
   STRIPE_SECRET_KEY: "sk_test_dummy_for_env_test",
   // Required after Cycle 5 payments WU2 (STRIPE_WEBHOOK_SECRET added to env.ts).
   STRIPE_WEBHOOK_SECRET: "whsec_dummy_for_env_test",
+  // Required after admin-database-backups Phase 1 (env.ts fail-fast on
+  // missing/relative). See dedicated "backup config" scenarios below for the
+  // fail-fast coverage of these four values.
+  BACKUP_ARTIFACT_DIR: "/var/backups/mercado",
+  PG_DUMP_PATH: "/usr/lib/postgresql/16/bin/pg_dump",
+  PG_RESTORE_PATH: "/usr/lib/postgresql/16/bin/pg_restore",
+  BACKUP_OPERATION_TIMEOUT_MS: "300000",
 };
 
 // ---------------------------------------------------------------------------
@@ -198,5 +205,38 @@ describe("S3_PUBLIC_BASE_URL: warn log on non-prod http://", () => {
       ),
     );
     expect(callsWithS3Mention).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 10 — admin-database-backups config: fail-fast on missing/relative
+// Spec/design: admin-database-backups "boot fails closed" (BACKUP_ARTIFACT_DIR,
+// PG_DUMP_PATH, PG_RESTORE_PATH, BACKUP_OPERATION_TIMEOUT_MS).
+// ---------------------------------------------------------------------------
+const BACKUP_VALID = {
+  ...BASE_VALID,
+  S3_PUBLIC_BASE_URL: "https://cdn.example.com",
+};
+
+describe("backup config: valid absolute paths and positive timeout", () => {
+  it("does NOT throw when all four backup vars are valid", () => {
+    expect(() => parseEnv(BACKUP_VALID)).not.toThrow();
+  });
+});
+
+describe.each([
+  ["BACKUP_ARTIFACT_DIR", undefined],
+  ["BACKUP_ARTIFACT_DIR", "relative/backups"],
+  ["PG_DUMP_PATH", undefined],
+  ["PG_DUMP_PATH", "relative/pg_dump"],
+  ["PG_RESTORE_PATH", undefined],
+  ["PG_RESTORE_PATH", "relative/pg_restore"],
+  ["BACKUP_OPERATION_TIMEOUT_MS", undefined],
+  ["BACKUP_OPERATION_TIMEOUT_MS", "not-a-number"],
+  ["BACKUP_OPERATION_TIMEOUT_MS", "-1"],
+] as const)("backup config: %s = %p fails boot", (key, value) => {
+  it("throws ZodError", () => {
+    const input: Record<string, string | undefined> = { ...BACKUP_VALID, [key]: value };
+    expect(() => parseEnv(input)).toThrow();
   });
 });
