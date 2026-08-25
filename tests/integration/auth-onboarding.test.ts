@@ -235,6 +235,27 @@ describe("POST /api/v1/auth/sync — first sync creates PENDING user", () => {
     });
   });
 
+  it("canonicalizes mixed-case Auth0 email claims before repository creation", async () => {
+    const sub = "auth0|mixed-case-email";
+    const email = "New.Admin@Example.COM";
+    const createdUser = makeUser({ auth0Sub: sub, email: email.toLowerCase() });
+
+    mockLoadUser(null);
+    mockedUserRepo.findByAuth0SubAny.mockResolvedValueOnce(null);
+    mockedUserRepo.create.mockResolvedValueOnce(createdUser);
+
+    const res = await request
+      .post("/api/v1/auth/sync")
+      .set("X-Test-Auth", authHeader({ sub, email, email_verified: true }));
+
+    expect(res.status).toBe(200);
+    expect(mockedUserRepo.create).toHaveBeenCalledWith({
+      auth0Sub: sub,
+      email: "new.admin@example.com",
+      emailVerified: true,
+    });
+  });
+
   it("returns 401 when no Authorization header is provided", async () => {
     const res = await request.post("/api/v1/auth/sync");
     expect(res.status).toBe(401);
@@ -329,7 +350,10 @@ describe("POST /api/v1/auth/sync — tombstoned subject (admin-user-management)"
   // the sync handler (and findByAuth0SubAny) is never reached.
   it("deactivated (not deleted) subject also receives the lifecycle denial and remains deactivated", async () => {
     const sub = "auth0|deactivated001";
-    const deactivatedUser = makeUser({ auth0Sub: sub, deactivatedAt: new Date("2026-01-01T00:00:00Z") });
+    const deactivatedUser = makeUser({
+      auth0Sub: sub,
+      deactivatedAt: new Date("2026-01-01T00:00:00Z"),
+    });
 
     mockLoadUser(deactivatedUser);
 

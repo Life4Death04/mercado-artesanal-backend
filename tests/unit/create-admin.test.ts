@@ -59,9 +59,9 @@ describe("create-admin CLI — [CA1] missing --email exits 1", () => {
     const deps = makeStubDeps();
 
     // Provide --auth0-sub but omit --email (the only required flag missing)
-    await expect(
-      runCreateAdmin(["--auth0-sub", "auth0|abc"], deps),
-    ).rejects.toThrow("process.exit(1)");
+    await expect(runCreateAdmin(["--auth0-sub", "auth0|abc"], deps)).rejects.toThrow(
+      "process.exit(1)",
+    );
 
     expect(deps.exit).toHaveBeenCalledWith(1);
 
@@ -89,10 +89,7 @@ describe("create-admin CLI — [CA2] second bootstrap refused exits 2", () => {
     });
 
     await expect(
-      runCreateAdmin(
-        ["--email", "new@example.com", "--auth0-sub", "auth0|new"],
-        deps,
-      ),
+      runCreateAdmin(["--email", "new@example.com", "--auth0-sub", "auth0|new"], deps),
     ).rejects.toThrow("process.exit(2)");
 
     expect(deps.exit).toHaveBeenCalledWith(2);
@@ -105,5 +102,22 @@ describe("create-admin CLI — [CA2] second bootstrap refused exits 2", () => {
 
     // No new user MUST be created
     expect(deps.createUser).not.toHaveBeenCalled();
+  });
+});
+
+describe("create-admin CLI — canonical email", () => {
+  it("lowercases email before creating the bootstrap user", async () => {
+    const deps = makeStubDeps();
+
+    await expect(
+      runCreateAdmin(
+        ["--email", "First.Admin@Example.COM", "--auth0-sub", "auth0|first-admin"],
+        deps,
+      ),
+    ).rejects.toThrow("process.exit(0)");
+
+    expect(deps.createUser).toHaveBeenCalledWith(
+      expect.objectContaining({ email: "first.admin@example.com" }),
+    );
   });
 });

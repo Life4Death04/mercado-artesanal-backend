@@ -26,6 +26,7 @@ import { parseArgs } from "node:util";
 
 import { z } from "zod";
 
+import { normalizeEmail } from "@/shared/utils/normalize-email";
 import { prisma } from "@/shared/utils/prisma";
 
 // ---------------------------------------------------------------------------
@@ -63,10 +64,7 @@ export interface CreateAdminDeps {
 // Core logic — injectable for testing
 // ---------------------------------------------------------------------------
 
-export async function runCreateAdmin(
-  argv: string[],
-  deps: CreateAdminDeps,
-): Promise<void> {
+export async function runCreateAdmin(argv: string[], deps: CreateAdminDeps): Promise<void> {
   // Step 1: Parse and validate CLI arguments.
   // Zod runs BEFORE the prisma singleton is accessed (spec ordering).
   let rawValues: Record<string, string | boolean | undefined>;
@@ -115,7 +113,7 @@ export async function runCreateAdmin(
 
   // Step 3: Create the admin user.
   const user = await deps.createUser({
-    email: args.email,
+    email: normalizeEmail(args.email),
     auth0Sub: args["auth0-sub"],
     firstName: args["first-name"],
     lastName: args["last-name"],
