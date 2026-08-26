@@ -5,7 +5,7 @@ import { normalizeEmail } from "@/shared/utils/normalize-email";
 
 export type AdminInvitationProvider = Pick<
   Auth0AdminClient,
-  "createAdminIdentity" | "findOwnedIdentity" | "deleteOwnedIdentity"
+  "createAdminIdentity" | "findOwnedIdentity" | "deleteOwnedIdentity" | "requestPasswordSetupEmail"
 >;
 export interface AcceptAdminInvitationInput {
   requestKey: string;
@@ -63,6 +63,7 @@ export class AdminInvitationService {
     if (operation.status === "COMPENSATING") return this.compensate(operation);
     if (operation.step === "CREATE_IDENTITY") return this.createIdentity(operation);
     if (operation.step === "CREATE_LOCAL_USER") return this.createLocalUser(operation);
+    if (operation.step === "SEND_INVITATION") return this.sendInvitation(operation);
     return operation;
   }
 
@@ -142,6 +143,33 @@ export class AdminInvitationService {
     }
   }
 
+  private async sendInvitation(operation: AdminInvitation): Promise<AdminInvitation> {
+    if (!operation.auth0Sub || !operation.invitedUserId)
+      return this.finish(operation, "FAILED", "DELIVERY_CHECKPOINT_MISSING");
+    const admin = await this.db.user.findUnique({ where: { id: operation.invitedUserId } });
+    if (
+      !admin ||
+      admin.auth0Sub !== operation.auth0Sub ||
+      admin.email !== operation.email ||
+      admin.role !== "ADMIN"
+    )
+      return this.finish(operation, "FAILED", "DELIVERY_CHECKPOINT_MISSING");
+    try {
+      await this.provider.requestPasswordSetupEmail(operation.email);
+      return this.finish(operation, "SUCCEEDED", null);
+    } catch (error) {
+      if (error instanceof Auth0AdminError && error.kind === "ambiguous")
+        return this.retry(operation, "DELIVERY_AMBIGUOUS");
+      return this.finish(
+        operation,
+        "FAILED",
+        error instanceof Auth0AdminError && error.kind === "conflict"
+          ? "DELIVERY_CONFLICT"
+          : "DELIVERY_REJECTED",
+      );
+    }
+  }
+
   private async compensate(operation: AdminInvitation): Promise<AdminInvitation> {
     if (!operation.auth0Sub) return this.finish(operation, "FAILED", "IDENTITY_MISSING");
     try {
@@ -178,13 +206,22 @@ export class AdminInvitationService {
 
   private finish(
     operation: AdminInvitation,
-    status: "FAILED" | "COMPENSATED",
+    status: "SUCCEEDED" | "FAILED" | "COMPENSATED",
     lastError: string | null,
     attemptCount = operation.attemptCount,
   ) {
+    const completedAt = new Date();
     return this.db.adminInvitation.update({
       where: { id: operation.id },
-      data: { status, lastError, attemptCount, completedAt: new Date() },
+      data: {
+        status,
+        step: status === "SUCCEEDED" ? "COMPLETE" : operation.step,
+        lastError,
+        attemptCount,
+        completedAt,
+        nextAttemptAt: completedAt,
+        leaseExpiresAt: null,
+      },
     });
   }
 }
