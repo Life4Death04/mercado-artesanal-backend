@@ -14,6 +14,7 @@
  *     released cleanly before the process exits.
  */
 import "dotenv/config";
+import { prepareAdminInvitationRecovery } from "@/modules/admin/services/admin-invitation-recovery.service";
 import { prepareDatabaseBackups } from "@/modules/admin/services/database-backups.service";
 import { env } from "@/shared/utils/env";
 import { logger } from "@/shared/utils/logger";
@@ -23,6 +24,7 @@ import { createApp } from "./app";
 
 async function start(): Promise<void> {
   await prepareDatabaseBackups();
+  prepareAdminInvitationRecovery();
   const app = createApp();
   const server = app.listen(env.PORT, () => {
     logger.info({ port: env.PORT, env: env.NODE_ENV }, "Server listening");
