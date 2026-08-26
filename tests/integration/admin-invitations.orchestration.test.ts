@@ -16,6 +16,8 @@ class Provider implements AdminInvitationProvider {
   calls: string[] = [];
   identity: AdminIdentity = { userId: "auth0|invited", email: "invited@test.local" };
   createError?: unknown;
+  sendErrors: unknown[] = [];
+  beforeSend?: () => Promise<void>;
   owned: AdminIdentity | null = null;
   deleteResult = true;
   async createAdminIdentity(): Promise<AdminIdentity> {
@@ -30,6 +32,12 @@ class Provider implements AdminInvitationProvider {
   async deleteOwnedIdentity(): Promise<boolean> {
     this.calls.push("delete");
     return this.deleteResult;
+  }
+  async requestPasswordSetupEmail(): Promise<void> {
+    this.calls.push("send");
+    await this.beforeSend?.();
+    const error = this.sendErrors.shift();
+    if (error) throw error;
   }
 }
 
@@ -62,7 +70,18 @@ beforeEach(async () => {
 });
 afterAll(async () => db.$disconnect());
 
-describe("admin invitation durable saga 3a", () => {
+async function provision(service: AdminInvitationService, requestKey: string, email: string) {
+  const operation = await service.accept(input(requestKey, email));
+  await service.advance(operation.id);
+  await service.advance(operation.id);
+  return operation;
+}
+
+async function makeDue(id: string) {
+  await db.adminInvitation.update({ where: { id }, data: { nextAttemptAt: new Date(0) } });
+}
+
+describe("admin invitation durable saga", () => {
   it("canonicalizes and idempotently persists the complete request", async (ctx) => {
     if (!reachable) return ctx.skip();
     const service = new AdminInvitationService(db, new Provider());
@@ -82,25 +101,142 @@ describe("admin invitation durable saga 3a", () => {
     );
   });
 
-  it("checkpoints after local ADMIN authorization without requesting the email", async (ctx) => {
+  it("sends only after the local ADMIN checkpoint commits, then completes", async (ctx) => {
     if (!reachable) return ctx.skip();
     const provider = new Provider();
     const service = new AdminInvitationService(db, provider);
-    const operation = await service.accept(input("request-2", provider.identity.email));
-    await service.advance(operation.id);
-    await service.advance(operation.id);
-    expect(
-      await db.user.findUnique({ where: { auth0Sub: provider.identity.userId } }),
-    ).toMatchObject({ role: "ADMIN" });
+    const operation = await provision(service, "request-2", provider.identity.email);
+    provider.beforeSend = async () => {
+      expect(
+        await db.user.findUnique({ where: { auth0Sub: provider.identity.userId } }),
+      ).toMatchObject({ role: "ADMIN" });
+      expect(
+        await db.adminInvitation.findUniqueOrThrow({ where: { id: operation.id } }),
+      ).toMatchObject({
+        status: "PENDING",
+        step: "SEND_INVITATION",
+        invitedUserId: expect.any(String),
+      });
+    };
     await service.advance(operation.id);
     expect(
       await db.adminInvitation.findUniqueOrThrow({ where: { id: operation.id } }),
     ).toMatchObject({
-      status: "PENDING",
-      step: "SEND_INVITATION",
+      status: "SUCCEEDED",
+      step: "COMPLETE",
       invitedUserId: expect.any(String),
+      completedAt: expect.any(Date),
+      lastError: null,
+      leaseExpiresAt: null,
     });
-    expect(provider.calls).toEqual(["create"]);
+    expect(provider.calls).toEqual(["create", "send"]);
+  });
+
+  it("retries an ambiguous send after 1s and permits a later duplicate send", async (ctx) => {
+    if (!reachable) return ctx.skip();
+    const provider = new Provider();
+    provider.sendErrors.push(new Auth0AdminError("ambiguous", "raw provider response"));
+    const service = new AdminInvitationService(db, provider);
+    const operation = await provision(service, "request-send-retry", provider.identity.email);
+    const before = Date.now();
+    const retry = await service.advance(operation.id);
+    expect(retry).toMatchObject({
+      status: "PENDING",
+      attemptCount: 1,
+      lastError: "DELIVERY_AMBIGUOUS",
+    });
+    expect(retry.nextAttemptAt.getTime()).toBeGreaterThanOrEqual(before + 900);
+    await makeDue(operation.id);
+    const completed = await service.advance(operation.id);
+    expect(completed).toMatchObject({
+      status: "SUCCEEDED",
+      step: "COMPLETE",
+      attemptCount: 1,
+      lastError: null,
+    });
+    expect(provider.calls).toEqual(["create", "send", "send"]);
+  });
+
+  it("fails after four ambiguous sends without removing local authorization", async (ctx) => {
+    if (!reachable) return ctx.skip();
+    const provider = new Provider();
+    provider.sendErrors = Array.from(
+      { length: 4 },
+      () => new Auth0AdminError("ambiguous", "https://provider.invalid secret body"),
+    );
+    const service = new AdminInvitationService(db, provider);
+    const operation = await provision(service, "request-send-exhausted", provider.identity.email);
+    const backoff = [1_000, 5_000, 30_000];
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      if (attempt) await makeDue(operation.id);
+      const before = Date.now();
+      const result = await service.advance(operation.id);
+      if (attempt < backoff.length)
+        expect(result.nextAttemptAt.getTime()).toBeGreaterThanOrEqual(
+          before + backoff[attempt]! - 100,
+        );
+    }
+    const failed = await db.adminInvitation.findUniqueOrThrow({ where: { id: operation.id } });
+    expect(failed).toMatchObject({
+      status: "FAILED",
+      attemptCount: 4,
+      lastError: "DELIVERY_AMBIGUOUS",
+      completedAt: expect.any(Date),
+      leaseExpiresAt: null,
+    });
+    expect(failed.lastError).not.toMatch(/provider|secret|body|https/i);
+    expect(
+      await db.user.findUnique({ where: { auth0Sub: provider.identity.userId } }),
+    ).toMatchObject({
+      role: "ADMIN",
+    });
+  });
+
+  for (const kind of ["rejected", "conflict"] as const) {
+    it(`makes a deterministic ${kind} terminal, safe, and inert while preserving ADMIN`, async (ctx) => {
+      if (!reachable) return ctx.skip();
+      const provider = new Provider();
+      provider.sendErrors.push(new Auth0AdminError(kind, "credential token response URL"));
+      const service = new AdminInvitationService(db, provider);
+      const operation = await provision(service, `request-send-${kind}`, provider.identity.email);
+      await db.adminInvitation.update({
+        where: { id: operation.id },
+        data: { leaseExpiresAt: new Date(Date.now() + 60_000) },
+      });
+      const failed = await service.advance(operation.id);
+      expect(failed).toMatchObject({
+        status: "FAILED",
+        attemptCount: 0,
+        lastError: kind === "conflict" ? "DELIVERY_CONFLICT" : "DELIVERY_REJECTED",
+        completedAt: expect.any(Date),
+        leaseExpiresAt: null,
+      });
+      const calls = [...provider.calls];
+      await service.advance(operation.id);
+      expect(provider.calls).toEqual(calls);
+      expect(failed.lastError).not.toMatch(/credential|token|response|URL/i);
+      expect(
+        await db.user.findUnique({ where: { auth0Sub: provider.identity.userId } }),
+      ).toMatchObject({
+        role: "ADMIN",
+      });
+    });
+  }
+
+  it("rejects an incomplete delivery checkpoint without a provider effect", async (ctx) => {
+    if (!reachable) return ctx.skip();
+    const provider = new Provider();
+    const service = new AdminInvitationService(db, provider);
+    const operation = await service.accept(
+      input("request-send-incomplete", provider.identity.email),
+    );
+    await db.adminInvitation.update({
+      where: { id: operation.id },
+      data: { step: "SEND_INVITATION" },
+    });
+    const failed = await service.advance(operation.id);
+    expect(failed).toMatchObject({ status: "FAILED", lastError: "DELIVERY_CHECKPOINT_MISSING" });
+    expect(provider.calls).toEqual([]);
   });
 
   it("reconciles an ambiguous create only to the operation-owned identity", async (ctx) => {
