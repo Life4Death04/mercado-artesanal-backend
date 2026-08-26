@@ -4,6 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   AdminInvitationService,
   InvitationInputConflictError,
+  runAdminInvitationWorkerOnce,
   type AdminInvitationProvider,
 } from "@/modules/admin/services/admin-invitations.service";
 import { Auth0AdminError, type AdminIdentity } from "@/shared/auth0/admin-client";
@@ -20,8 +21,10 @@ class Provider implements AdminInvitationProvider {
   beforeSend?: () => Promise<void>;
   owned: AdminIdentity | null = null;
   deleteResult = true;
+  beforeCreate?: () => Promise<void>;
   async createAdminIdentity(): Promise<AdminIdentity> {
     this.calls.push("create");
+    await this.beforeCreate?.();
     if (this.createError) throw this.createError;
     return this.identity;
   }
@@ -285,5 +288,135 @@ describe("admin invitation durable saga", () => {
     expect((await db.adminInvitation.findUniqueOrThrow({ where: { id: owned.id } })).status).toBe(
       "COMPENSATED",
     );
+  });
+
+  it("atomically gives concurrent workers one due operation", async (ctx) => {
+    if (!reachable) return ctx.skip();
+    const provider = new Provider();
+    const operation = await new AdminInvitationService(db, provider).accept(
+      input("worker-concurrent", provider.identity.email),
+    );
+    const now = new Date("2026-01-01T00:00:00Z");
+    await db.adminInvitation.update({ where: { id: operation.id }, data: { nextAttemptAt: now } });
+    const work = () => runAdminInvitationWorkerOnce(db, provider, () => now);
+    await Promise.all([work(), work()]);
+    expect(provider.calls).toEqual(["create"]);
+  });
+
+  it("does not steal a live lease and returns false without due work", async (ctx) => {
+    if (!reachable) return ctx.skip();
+    const provider = new Provider();
+    const operation = await new AdminInvitationService(db, provider).accept(
+      input("worker-live-lease", provider.identity.email),
+    );
+    const now = new Date("2026-01-01T00:00:00Z");
+    await db.adminInvitation.update({
+      where: { id: operation.id },
+      data: {
+        status: "PROCESSING",
+        nextAttemptAt: now,
+        leaseExpiresAt: new Date(now.getTime() + 1),
+      },
+    });
+    expect(await runAdminInvitationWorkerOnce(db, provider, () => now)).toBe(false);
+    expect(provider.calls).toEqual([]);
+  });
+
+  it("resumes the persisted step of an expired PROCESSING lease", async (ctx) => {
+    if (!reachable) return ctx.skip();
+    const provider = new Provider();
+    const service = new AdminInvitationService(db, provider);
+    const operation = await provision(service, "worker-expired", provider.identity.email);
+    provider.calls = [];
+    const now = new Date("2026-01-01T00:00:00Z");
+    await db.adminInvitation.update({
+      where: { id: operation.id },
+      data: {
+        status: "PROCESSING",
+        nextAttemptAt: new Date(now.getTime() + 60_000),
+        leaseExpiresAt: new Date(now.getTime() - 1),
+      },
+    });
+    expect(await runAdminInvitationWorkerOnce(db, provider, () => now)).toBe(true);
+    expect(provider.calls).toEqual(["send"]);
+    expect(
+      await db.adminInvitation.findUniqueOrThrow({ where: { id: operation.id } }),
+    ).toMatchObject({
+      status: "SUCCEEDED",
+      step: "COMPLETE",
+      attemptCount: 1,
+    });
+  });
+
+  it("resumes due PENDING and expired COMPENSATING work", async (ctx) => {
+    if (!reachable) return ctx.skip();
+    const provider = new Provider();
+    const service = new AdminInvitationService(db, provider);
+    const pending = await service.accept(input("worker-pending", provider.identity.email));
+    const compensation = await service.accept(input("worker-compensating", "other@test.local"));
+    const now = new Date("2026-01-01T00:00:00Z");
+    await db.adminInvitation.update({
+      where: { id: pending.id },
+      data: { nextAttemptAt: new Date(now.getTime() - 2) },
+    });
+    await db.adminInvitation.update({
+      where: { id: compensation.id },
+      data: {
+        status: "COMPENSATING",
+        auth0Sub: "auth0|worker-compensating",
+        nextAttemptAt: new Date(now.getTime() + 60_000),
+        leaseExpiresAt: new Date(now.getTime() - 1),
+      },
+    });
+    expect(await runAdminInvitationWorkerOnce(db, provider, () => now)).toBe(true);
+    await db.adminInvitation.update({
+      where: { id: pending.id },
+      data: { nextAttemptAt: new Date(now.getTime() + 1) },
+    });
+    expect(await runAdminInvitationWorkerOnce(db, provider, () => now)).toBe(true);
+    expect(provider.calls).toEqual(["create", "delete"]);
+    expect(
+      (await db.adminInvitation.findUniqueOrThrow({ where: { id: compensation.id } })).status,
+    ).toBe("COMPENSATED");
+  });
+
+  it("fences a stale provider result after a later claim", async (ctx) => {
+    if (!reachable) return ctx.skip();
+    const provider = new Provider();
+    const operation = await new AdminInvitationService(db, provider).accept(
+      input("worker-fencing", provider.identity.email),
+    );
+    const firstNow = new Date("2026-01-01T00:00:00Z");
+    await db.adminInvitation.update({
+      where: { id: operation.id },
+      data: { nextAttemptAt: firstNow },
+    });
+    let release!: () => void;
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => (started = resolve));
+    const releasePromise = new Promise<void>((resolve) => (release = resolve));
+    provider.beforeCreate = async () => {
+      if (provider.calls.length === 1) {
+        started();
+        await releasePromise;
+      }
+    };
+    const stale = runAdminInvitationWorkerOnce(db, provider, () => firstNow, 1_000);
+    await startedPromise;
+    await runAdminInvitationWorkerOnce(
+      db,
+      provider,
+      () => new Date(firstNow.getTime() + 1_001),
+      1_000,
+    );
+    const afterNewClaim = await db.adminInvitation.findUniqueOrThrow({
+      where: { id: operation.id },
+    });
+    release();
+    await stale;
+    expect(await db.adminInvitation.findUniqueOrThrow({ where: { id: operation.id } })).toEqual(
+      afterNewClaim,
+    );
+    expect(afterNewClaim).toMatchObject({ step: "CREATE_LOCAL_USER", attemptCount: 0 });
   });
 });
