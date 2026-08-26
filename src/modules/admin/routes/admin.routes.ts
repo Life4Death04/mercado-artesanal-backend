@@ -17,6 +17,8 @@
  *   PATCH  /api/v1/admin/users/:id/activate                   — idempotent DEACTIVATED->ACTIVE (ADMIN)
  *   PATCH  /api/v1/admin/users/:id/deactivate                 — idempotent ACTIVE->DEACTIVATED (ADMIN)
  *   DELETE /api/v1/admin/users/:id                            — irreversible tombstone deletion (ADMIN)
+ *   POST   /api/v1/admin/admins                               — accept administrator invitation (ADMIN)
+ *   GET    /api/v1/admin/admin-invitation-operations/:id      — poll invitation operation (ADMIN)
  *
  * Auth chain (per design — Data Flow):
  *   authenticate → loadUser → requireRole('ADMIN') → onboardingGate
@@ -42,6 +44,7 @@ import { onboardingGate } from "@/shared/middleware/onboardingGate";
 import { requireRole } from "@/shared/middleware/requireRole";
 
 import * as adminIncidentsController from "../../incidents/controllers/admin-incidents.controller";
+import * as adminInvitationsController from "../controllers/admin-invitations.controller";
 import * as adminUsersController from "../controllers/admin-users.controller";
 import * as adminController from "../controllers/admin.controller";
 import * as databaseBackupsController from "../controllers/database-backups.controller";
@@ -98,6 +101,10 @@ adminRouter.patch("/admin/users/:id/activate", adminUsersController.activateUser
 adminRouter.patch("/admin/users/:id/deactivate", adminUsersController.deactivateUser);
 
 adminRouter.delete("/admin/users/:id", adminUsersController.deleteUser);
+
+// Administrator invitation creation and operation polling
+adminRouter.post("/admin/admins", adminInvitationsController.createAdmin);
+adminRouter.get("/admin/admin-invitation-operations/:id", adminInvitationsController.getOperation);
 
 // Database backup creation and operation polling
 adminRouter.post("/admin/database-backups", databaseBackupsController.createBackup);

@@ -63,7 +63,10 @@ export type ErrorCode =
   | "BACKUP_NOT_RESTORABLE"
   | "BACKUP_OPERATION_CONFLICT"
   | "BACKUP_RUNTIME_UNAVAILABLE"
-  | "BACKUP_OPERATION_FAILED";
+  | "BACKUP_OPERATION_FAILED"
+  // admin-invitations additions — invitation operation error contract
+  | "ADMIN_INVITATION_OPERATION_NOT_FOUND"
+  | "ADMIN_INVITATION_REQUEST_CONFLICT";
 
 export interface ProblemDetails {
   type: string;

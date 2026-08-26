@@ -62,12 +62,12 @@ On success the script prints `Admin created: id=<cuid>` and exits with code `0`.
 
 **Exit codes:**
 
-| Code | Meaning                                                                  |
-| ---- | ------------------------------------------------------------------------ |
-| `0`  | Admin created successfully.                                              |
-| `1`  | Argument validation failed — check `--email` and `--auth0-sub`.         |
-| `2`  | An active admin already exists — complete Step 1 first.                  |
-| `3`  | Unexpected error (DB connection failure, write conflict, etc.).           |
+| Code | Meaning                                                         |
+| ---- | --------------------------------------------------------------- |
+| `0`  | Admin created successfully.                                     |
+| `1`  | Argument validation failed — check `--email` and `--auth0-sub`. |
+| `2`  | An active admin already exists — complete Step 1 first.         |
+| `3`  | Unexpected error (DB connection failure, write conflict, etc.). |
 
 ---
 
@@ -96,7 +96,7 @@ The new admin's `email_verified` will be `false` until they log in via Auth0 for
 
 - The `create-admin` CLI script refuses to run if an active admin already exists (`exit 2`). There is **no flag** to bypass this guard. You must complete Step 1 before running Step 2.
 - This operation **must** be logged in an out-of-band audit trail (security log, change ticket, etc.).
-- Cycle 2 will introduce `POST /admin/admins` for admin creation via the HTTP API (admin-only). This procedure remains available for disaster recovery regardless of later cycles.
+- Use the protected invitation API described in [`docs/admin-invitations.md`](admin-invitations.md) for routine administrator creation. This CLI procedure is break-glass recovery only.
 
 ---
 
