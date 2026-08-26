@@ -31,6 +31,11 @@ export default defineConfig({
       DATABASE_URL: "postgresql://postgres:postgres@localhost:5433/mercado_test",
       AUTH0_DOMAIN: "test.eu.auth0.com",
       AUTH0_AUDIENCE: "https://api.test.example",
+      AUTH0_M2M_CLIENT_ID: "test-m2m-client",
+      AUTH0_M2M_CLIENT_SECRET: "test-m2m-secret",
+      AUTH0_APPLICATION_CLIENT_ID: "test-application-client",
+      AUTH0_DATABASE_CONNECTION: "Username-Password-Authentication",
+      AUTH0_REQUEST_TIMEOUT_MS: "5000",
       LOG_LEVEL: "error",
       CORS_ORIGIN: "*",
       // Required after expose-product-images-in-producer-list Slice 1.

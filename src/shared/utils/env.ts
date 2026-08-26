@@ -5,8 +5,19 @@ const EnvSchema = z
     NODE_ENV: z.enum(["development", "production", "test"]),
     PORT: z.coerce.number().int().positive().default(3000),
     DATABASE_URL: z.string().url(),
-    AUTH0_DOMAIN: z.string().min(1),
+    AUTH0_DOMAIN: z
+      .string()
+      .min(1)
+      .regex(
+        /^(?!.*:\/\/)(?!.*\/)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i,
+        "must be a hostname without scheme or path",
+      ),
     AUTH0_AUDIENCE: z.string().min(1),
+    AUTH0_M2M_CLIENT_ID: z.string().min(1),
+    AUTH0_M2M_CLIENT_SECRET: z.string().min(1),
+    AUTH0_APPLICATION_CLIENT_ID: z.string().min(1),
+    AUTH0_DATABASE_CONNECTION: z.string().min(1),
+    AUTH0_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000),
     LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
     CORS_ORIGIN: z.string().default("*"),
     S3_PUBLIC_BASE_URL: z.string().url().min(1),

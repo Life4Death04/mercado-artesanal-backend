@@ -18,9 +18,10 @@
  *   7. NODE_ENV=production + https:// URL → pass
  *   8. NODE_ENV=development + https:// URL → pass
  */
+import { ZodError } from "zod";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { parseEnv } from "@/shared/utils/env";
+import { env, parseEnv } from "@/shared/utils/env";
 
 // ---------------------------------------------------------------------------
 // Minimal valid base input — all required fields that already existed.
@@ -31,6 +32,11 @@ const BASE_VALID = {
   DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/mercado",
   AUTH0_DOMAIN: "test.eu.auth0.com",
   AUTH0_AUDIENCE: "https://api.test.example",
+  AUTH0_M2M_CLIENT_ID: "test-m2m-client",
+  AUTH0_M2M_CLIENT_SECRET: "test-m2m-secret",
+  AUTH0_APPLICATION_CLIENT_ID: "test-app-client",
+  AUTH0_DATABASE_CONNECTION: "Username-Password-Authentication",
+  AUTH0_REQUEST_TIMEOUT_MS: "5000",
   LOG_LEVEL: "error" as const,
   CORS_ORIGIN: "*",
   // Required after Cycle 5 payments WU1 (STRIPE_SECRET_KEY added to env.ts).
@@ -45,6 +51,20 @@ const BASE_VALID = {
   PG_RESTORE_PATH: "/usr/lib/postgresql/16/bin/pg_restore",
   BACKUP_OPERATION_TIMEOUT_MS: "300000",
 };
+
+describe("module env singleton", () => {
+  it("imports successfully with the complete Vitest environment", () => {
+    expect(Object.keys(env)).toEqual(
+      expect.arrayContaining([
+        "AUTH0_M2M_CLIENT_ID",
+        "AUTH0_M2M_CLIENT_SECRET",
+        "AUTH0_APPLICATION_CLIENT_ID",
+        "AUTH0_DATABASE_CONNECTION",
+        "AUTH0_REQUEST_TIMEOUT_MS",
+      ]),
+    );
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Scenario 1 — Missing S3_PUBLIC_BASE_URL prevents boot
@@ -182,9 +202,7 @@ describe("S3_PUBLIC_BASE_URL: warn log on non-prod http://", () => {
 
     parseEnv(input);
 
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("S3_PUBLIC_BASE_URL"),
-    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("S3_PUBLIC_BASE_URL"));
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("http://"));
   });
 
@@ -200,9 +218,7 @@ describe("S3_PUBLIC_BASE_URL: warn log on non-prod http://", () => {
 
     // Warn must not have been called for this config (no downgrade, no noise)
     const callsWithS3Mention = warnSpy.mock.calls.filter((args) =>
-      args.some(
-        (a) => typeof a === "string" && a.includes("S3_PUBLIC_BASE_URL"),
-      ),
+      args.some((a) => typeof a === "string" && a.includes("S3_PUBLIC_BASE_URL")),
     );
     expect(callsWithS3Mention).toHaveLength(0);
   });
@@ -238,5 +254,26 @@ describe.each([
   it("throws ZodError", () => {
     const input: Record<string, string | undefined> = { ...BACKUP_VALID, [key]: value };
     expect(() => parseEnv(input)).toThrow();
+  });
+});
+
+describe("Auth0 admin config", () => {
+  it("rejects unsafe values", () => {
+    expect(() => parseEnv({ ...BACKUP_VALID, AUTH0_DOMAIN: "https://tenant.auth0.com" })).toThrow();
+    expect(() => parseEnv({ ...BACKUP_VALID, AUTH0_M2M_CLIENT_SECRET: "" })).toThrow();
+  });
+
+  it("does not render the configured M2M client secret in validation errors", () => {
+    const configuredSecret = BACKUP_VALID.AUTH0_M2M_CLIENT_SECRET;
+    let error: unknown;
+
+    try {
+      parseEnv({ ...BACKUP_VALID, AUTH0_REQUEST_TIMEOUT_MS: "30001" });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(ZodError);
+    expect(String(error)).not.toContain(configuredSecret);
   });
 });
