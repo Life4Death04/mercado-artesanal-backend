@@ -82,6 +82,8 @@ model AdminInvitation {
   id             String                @id @default(cuid())
   requestKey     String                @unique @map("request_key")
   email          String
+  firstName      String?               @map("first_name")
+  lastName       String?               @map("last_name")
   status         AdminInvitationStatus @default(PENDING)
   step           AdminInvitationStep   @default(CREATE_IDENTITY)
   createdById    String                @map("created_by_id")
