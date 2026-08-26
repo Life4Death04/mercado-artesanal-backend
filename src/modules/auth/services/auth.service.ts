@@ -34,6 +34,7 @@ import type { User } from "@prisma/client";
 import { isAccountActive } from "@/shared/account-lifecycle";
 import { AccountInactiveError, ValidationFailedError } from "@/shared/errors/errors";
 import * as userRepo from "@/shared/repositories/user.repository";
+import { normalizeEmail } from "@/shared/utils/normalize-email";
 
 export interface AuthClaims {
   sub: string;
@@ -71,7 +72,7 @@ export async function syncFromClaims(claims: AuthClaims): Promise<User> {
 
   return userRepo.create({
     auth0Sub: claims.sub,
-    email: claims.email,
+    email: normalizeEmail(claims.email),
     emailVerified: claims.emailVerified,
   });
 }

@@ -23,6 +23,7 @@
 import type { Prisma, User } from "@prisma/client";
 
 import { ACTIVE_USER_WHERE } from "@/shared/account-lifecycle";
+import { normalizeEmail } from "@/shared/utils/normalize-email";
 import { prisma } from "@/shared/utils/prisma";
 
 // Minimal type accepted wherever a Prisma transaction client is expected.
@@ -141,7 +142,7 @@ export async function create(
   return client.user.create({
     data: {
       auth0Sub: data.auth0Sub,
-      email: data.email,
+      email: normalizeEmail(data.email),
       emailVerified: data.emailVerified,
       role: "PENDING_ROLE",
       firstName: null,

@@ -23,6 +23,22 @@ enum Role {
   ADMIN
 }
 
+enum AdminInvitationStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  COMPENSATING
+  COMPENSATED
+}
+
+enum AdminInvitationStep {
+  CREATE_IDENTITY
+  CREATE_LOCAL_USER
+  SEND_INVITATION
+  COMPLETE
+}
+
 model User {
   id            String    @id @default(cuid())
   auth0Sub      String    @unique @map("auth0_sub")
@@ -42,15 +58,17 @@ model User {
   // deriveAccountState, the single authority for this precedence.
   deactivatedAt DateTime? @map("deactivated_at")
 
-  producer          Producer?
-  addresses         Address[]
-  cart              Cart?
-  notifications     Notification[]
+  producer           Producer?
+  addresses          Address[]
+  cart               Cart?
+  notifications      Notification[]
   // admin-incidents WU1 — named back-relations for the two distinct User
   // roles an Incident references: the consumer who filed it and the ADMIN
   // who resolved it (see model Incident below for the named @relation pair).
-  incidentsReported Incident[]     @relation("IncidentReporter")
-  incidentsResolved Incident[]     @relation("IncidentResolver")
+  incidentsReported  Incident[]        @relation("IncidentReporter")
+  incidentsResolved  Incident[]        @relation("IncidentResolver")
+  invitationsCreated AdminInvitation[] @relation("AdminInvitationCreator")
+  invitationReceived AdminInvitation?  @relation("AdminInvitationUser")
 
   @@index([auth0Sub])
   // admin-user-management WU2 — ADMIN discovery listing, page size 8,
@@ -58,6 +76,32 @@ model User {
   // (CONSUMER, PRODUCER) via the leading `role` column.
   @@index([role, createdAt(sort: Desc), id(sort: Desc)])
   @@map("users")
+}
+
+model AdminInvitation {
+  id             String                @id @default(cuid())
+  requestKey     String                @unique @map("request_key")
+  email          String
+  status         AdminInvitationStatus @default(PENDING)
+  step           AdminInvitationStep   @default(CREATE_IDENTITY)
+  createdById    String                @map("created_by_id")
+  invitedUserId  String?               @unique @map("invited_user_id")
+  auth0Sub       String?               @unique @map("auth0_sub")
+  attemptCount   Int                   @default(0) @map("attempt_count")
+  nextAttemptAt  DateTime              @default(now()) @map("next_attempt_at")
+  leaseExpiresAt DateTime?             @map("lease_expires_at")
+  lastError      String?               @map("last_error") @db.Text
+  completedAt    DateTime?             @map("completed_at")
+  createdAt      DateTime              @default(now()) @map("created_at")
+  updatedAt      DateTime              @updatedAt @map("updated_at")
+
+  createdBy   User  @relation("AdminInvitationCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  invitedUser User? @relation("AdminInvitationUser", fields: [invitedUserId], references: [id], onDelete: SetNull)
+
+  @@index([status, nextAttemptAt])
+  @@index([status, leaseExpiresAt])
+  @@index([createdById, createdAt(sort: Desc), id(sort: Desc)])
+  @@map("admin_invitations")
 }
 
 model Producer {
