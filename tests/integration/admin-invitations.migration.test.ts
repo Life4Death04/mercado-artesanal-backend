@@ -11,6 +11,13 @@ const CLEAN_DB = `mercado_test_invitation_clean_${RUN_ID}`;
 const TARGET_MIGRATION = "20260825000000_admin_invitations";
 const migrationPath = path.join(process.cwd(), "prisma", "migrations", TARGET_MIGRATION);
 const hiddenMigrationPath = path.join(process.cwd(), `.hidden-${TARGET_MIGRATION}`);
+const profileMigrationPath = path.join(
+  process.cwd(),
+  "prisma",
+  "migrations",
+  "20260826000000_admin_invitation_profile",
+);
+const hiddenProfileMigrationPath = path.join(process.cwd(), ".hidden-admin-invitation-profile");
 const migrationSql = readFileSync(path.join(migrationPath, "migration.sql"), "utf8");
 const admin = new PrismaClient({
   datasources: { db: { url: "postgresql://postgres:postgres@localhost:5433/mercado_test" } },
@@ -37,19 +44,24 @@ beforeAll(async () => {
     return;
   }
 
-  if (!existsSync(migrationPath)) throw new Error(`Missing migration: ${migrationPath}`);
+  if (!existsSync(migrationPath) || !existsSync(profileMigrationPath))
+    throw new Error("Missing invitation migration");
   renameSync(migrationPath, hiddenMigrationPath);
+  renameSync(profileMigrationPath, hiddenProfileMigrationPath);
   try {
     for (const name of [DUPLICATE_DB, CLEAN_DB]) {
       await admin.$executeRawUnsafe(`CREATE DATABASE "${name}"`);
       deploy(dbUrl(name));
     }
   } finally {
+    renameSync(hiddenProfileMigrationPath, profileMigrationPath);
     renameSync(hiddenMigrationPath, migrationPath);
   }
 });
 
 afterAll(async () => {
+  if (existsSync(hiddenProfileMigrationPath))
+    renameSync(hiddenProfileMigrationPath, profileMigrationPath);
   if (existsSync(hiddenMigrationPath)) renameSync(hiddenMigrationPath, migrationPath);
   for (const name of [DUPLICATE_DB, CLEAN_DB]) {
     try {
