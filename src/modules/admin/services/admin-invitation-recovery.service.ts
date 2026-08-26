@@ -1,4 +1,7 @@
-import { runAdminInvitationWorkerOnce } from "@/modules/admin/services/admin-invitations.service";
+import {
+  AdminInvitationService,
+  runAdminInvitationWorkerOnce,
+} from "@/modules/admin/services/admin-invitations.service";
 import { Auth0AdminClient, type Auth0AdminConfig } from "@/shared/auth0/admin-client";
 import { env, type Env } from "@/shared/utils/env";
 import { logger } from "@/shared/utils/logger";
@@ -70,6 +73,7 @@ export function createAdminInvitationRecovery(dependencies: RecoveryDependencies
 }
 
 const auth0AdminClient = new Auth0AdminClient(buildAdminInvitationAuth0Config(env));
+export const adminInvitationService = new AdminInvitationService(prisma, auth0AdminClient);
 const prepareRecovery = createAdminInvitationRecovery({
   runOnce: () =>
     runAdminInvitationWorkerOnce(

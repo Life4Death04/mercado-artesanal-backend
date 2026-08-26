@@ -456,3 +456,17 @@ export class BackupOperationFailedError extends AppError {
   readonly status = 500;
   readonly title = "Backup operation failed";
 }
+
+// 404 — Administrator invitation operation ID does not exist.
+export class AdminInvitationOperationNotFoundError extends AppError {
+  readonly code = "ADMIN_INVITATION_OPERATION_NOT_FOUND" as const;
+  readonly status = 404;
+  readonly title = "Admin invitation operation not found";
+}
+
+// 409 — A request key was replayed with different actor or invitation input.
+export class AdminInvitationRequestConflictError extends AppError {
+  readonly code = "ADMIN_INVITATION_REQUEST_CONFLICT" as const;
+  readonly status = 409;
+  readonly title = "Admin invitation request conflict";
+}

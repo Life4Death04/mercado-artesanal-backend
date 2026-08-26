@@ -1,6 +1,7 @@
 import { Prisma, type AdminInvitation, type PrismaClient } from "@prisma/client";
 
 import { Auth0AdminError, type Auth0AdminClient } from "@/shared/auth0/admin-client";
+import { AdminInvitationOperationNotFoundError } from "@/shared/errors/errors";
 import { normalizeEmail } from "@/shared/utils/normalize-email";
 
 export type AdminInvitationProvider = Pick<
@@ -16,6 +17,32 @@ export interface AcceptAdminInvitationInput {
 }
 export class InvitationInputConflictError extends Error {
   readonly code = "INVITATION_REQUEST_CONFLICT";
+}
+
+export interface AdminInvitationOperationView {
+  id: string;
+  email: string;
+  firstName: string | null;
+  lastName: string | null;
+  status: AdminInvitation["status"];
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+  links: { self: string };
+}
+
+function toOperationView(operation: AdminInvitation): AdminInvitationOperationView {
+  return {
+    id: operation.id,
+    email: operation.email,
+    firstName: operation.firstName,
+    lastName: operation.lastName,
+    status: operation.status,
+    createdAt: operation.createdAt.toISOString(),
+    updatedAt: operation.updatedAt.toISOString(),
+    completedAt: operation.completedAt?.toISOString() ?? null,
+    links: { self: `/api/v1/admin/admin-invitation-operations/${operation.id}` },
+  };
 }
 
 const BACKOFF_MS = [1_000, 5_000, 30_000] as const;
@@ -93,6 +120,17 @@ export class AdminInvitationService {
         return existing;
       throw new InvitationInputConflictError();
     }
+  }
+
+  async acceptOperation(input: AcceptAdminInvitationInput): Promise<AdminInvitationOperationView> {
+    return toOperationView(await this.accept(input));
+  }
+
+  async getOperation(id: string): Promise<AdminInvitationOperationView> {
+    const operation = await this.db.adminInvitation.findUnique({ where: { id } });
+    if (!operation)
+      throw new AdminInvitationOperationNotFoundError("Admin invitation operation not found");
+    return toOperationView(operation);
   }
 
   async advance(id: string, fence?: Date): Promise<AdminInvitation> {
