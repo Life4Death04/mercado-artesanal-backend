@@ -58,6 +58,7 @@ export default defineConfig({
       PG_DUMP_PATH: "/usr/lib/postgresql/16/bin/pg_dump",
       PG_RESTORE_PATH: "/usr/lib/postgresql/16/bin/pg_restore",
       BACKUP_OPERATION_TIMEOUT_MS: "300000",
+      BACKUP_DATABASE_HOST_ALLOWLIST: "",
     },
     coverage: {
       provider: "v8",

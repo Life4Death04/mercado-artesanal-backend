@@ -157,6 +157,15 @@ describe("parsePostgresUrl: RED coverage", () => {
     );
   });
 
+  it("accepts a Compose service hostname only when explicitly allow-listed", () => {
+    const url = "postgres://u:p@postgres:5432/mercado";
+    expect(() => parsePostgresUrl(url)).toThrow(BackupRuntimeUnavailableError);
+    expect(parsePostgresUrl(url, ["postgres"])).toMatchObject({
+      host: "postgres",
+      database: "mercado",
+    });
+  });
+
   it("accepts 127.0.0.1 (IPv4 loopback)", () => {
     const parsed = parsePostgresUrl("postgres://u:p@127.0.0.1:5433/mercado_test");
     expect(parsed).toMatchObject({ host: "127.0.0.1", port: 5433, database: "mercado_test" });

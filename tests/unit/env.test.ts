@@ -45,6 +45,7 @@ const BASE_VALID = {
   PG_DUMP_PATH: "/usr/lib/postgresql/16/bin/pg_dump",
   PG_RESTORE_PATH: "/usr/lib/postgresql/16/bin/pg_restore",
   BACKUP_OPERATION_TIMEOUT_MS: "300000",
+  BACKUP_DATABASE_HOST_ALLOWLIST: "",
 };
 
 describe("network boundary config", () => {
@@ -272,6 +273,20 @@ describe("backup config: valid absolute paths and positive timeout", () => {
   it("does NOT throw when all four backup vars are valid", () => {
     expect(() => parseEnv(BACKUP_VALID)).not.toThrow();
   });
+});
+
+describe("backup database host allow-list", () => {
+  it("accepts an explicit Compose service hostname", () => {
+    const result = parseEnv({ ...BACKUP_VALID, BACKUP_DATABASE_HOST_ALLOWLIST: "postgres" });
+    expect(result.BACKUP_DATABASE_HOST_ALLOWLIST).toEqual(["postgres"]);
+  });
+
+  it.each(["https://postgres", "postgres/path", "postgres,", "*"])(
+    "rejects malformed host entry %s",
+    (BACKUP_DATABASE_HOST_ALLOWLIST) => {
+      expect(() => parseEnv({ ...BACKUP_VALID, BACKUP_DATABASE_HOST_ALLOWLIST })).toThrow();
+    },
+  );
 });
 
 describe.each([

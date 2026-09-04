@@ -475,7 +475,7 @@ async function executeCreatePipeline(
   signal.throwIfAborted();
   await transitionStage(root, state, "RUNNING", "DUMPING");
 
-  const connection = parsePostgresUrl(env.DATABASE_URL);
+  const connection = parsePostgresUrl(env.DATABASE_URL, env.BACKUP_DATABASE_HOST_ALLOWLIST);
   await assertTrustedExecutable(env.PG_DUMP_PATH, "pg_dump");
 
   state.tempDumpPath = join(root, ".tmp", `${randomUUID()}.dump.tmp`);

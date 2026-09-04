@@ -102,6 +102,15 @@ describe("buildMaintenanceDatabaseUrl: loopback coverage", () => {
       BackupRuntimeUnavailableError,
     );
   });
+
+  it("accepts an explicitly allow-listed Compose service hostname", () => {
+    const url = buildMaintenanceDatabaseUrl(
+      "postgres://u:p@postgres:5432/mercado",
+      ["postgres"],
+    );
+    expect(new URL(url).hostname).toBe("postgres");
+    expect(new URL(url).pathname).toBe("/postgres");
+  });
 });
 
 // ---------------------------------------------------------------------------

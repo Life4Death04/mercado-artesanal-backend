@@ -41,6 +41,16 @@ function isValidProxy(value: string): boolean {
   return bits > 0 && bits <= (version === 4 ? 32 : 128);
 }
 
+function isValidDatabaseHost(value: string): boolean {
+  const host = value.replace(/^\[|\]$/g, "");
+  return (
+    isIP(host) !== 0 ||
+    /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/i.test(
+      host,
+    )
+  );
+}
+
 const EnvSchema = z
   .object({
     NODE_ENV: z.enum(["development", "production", "test"]),
@@ -103,6 +113,14 @@ const EnvSchema = z
     // Deadline (ms) for a single dump/restore child-process step before the
     // runner aborts it and marks the operation FAILED (design "Data Flow").
     BACKUP_OPERATION_TIMEOUT_MS: z.coerce.number().int().positive(),
+    BACKUP_DATABASE_HOST_ALLOWLIST: z
+      .string()
+      .default("")
+      .transform((value, ctx) => (value === "" ? [] : commaSeparatedValues(value, ctx)))
+      .refine((hosts) => hosts.every(isValidDatabaseHost), {
+        message: "must contain only exact hostnames or IP addresses",
+      })
+      .transform((hosts) => hosts.map((host) => host.replace(/^\[|\]$/g, "").toLowerCase())),
   })
   .superRefine((v, ctx) => {
     // Positive check: fail-closed when NODE_ENV === "production" and URL is not HTTPS.
