@@ -1,0 +1,123 @@
+name: mercado-artesanal-production
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-app-security: &app-security
+  user: "1000:1000"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  init: true
+
+services:
+  postgres:
+    image: postgres:16.10-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    stop_grace_period: 1m
+    logging: *bounded-logging
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migration
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - database
+    restart: "no"
+    stop_grace_period: 30s
+    logging: *bounded-logging
+    <<: *app-security
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
+      AUTH0_DOMAIN: ${AUTH0_DOMAIN:?Set AUTH0_DOMAIN}
+      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE:?Set AUTH0_AUDIENCE}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CORS_ORIGIN: ${CORS_ORIGIN:?Set CORS_ORIGIN to the HTTPS frontend origin}
+      TRUST_PROXY: ${APP_EGRESS_GATEWAY:-172.30.20.1}
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:?Set S3_PUBLIC_BASE_URL}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:?Set STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:?Set STRIPE_WEBHOOK_SECRET}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-console}
+      BACKUP_ARTIFACT_DIR: /var/lib/mercado-artesanal/backups
+      PG_DUMP_PATH: /usr/lib/postgresql/16/bin/pg_dump
+      PG_RESTORE_PATH: /usr/lib/postgresql/16/bin/pg_restore
+      BACKUP_OPERATION_TIMEOUT_MS: ${BACKUP_OPERATION_TIMEOUT_MS:?Set BACKUP_OPERATION_TIMEOUT_MS}
+      BACKUP_DATABASE_HOST_ALLOWLIST: postgres
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${BACKEND_BIND_ADDRESS:-127.0.0.1}:${BACKEND_HOST_PORT:-3100}:3000"
+    volumes:
+      - backup_artifacts:/var/lib/mercado-artesanal/backups
+    networks:
+      egress:
+        gw_priority: 1
+      database: {}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const http=require('node:http');const req=http.get('http://127.0.0.1:3000/health/ready',res=>{res.resume();process.exit(res.statusCode===200?0:1)});req.setTimeout(2000,()=>{req.destroy();process.exit(1)});req.on('error',()=>process.exit(1));
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 45s
+    logging: *bounded-logging
+    <<: *app-security
+
+volumes:
+  postgres_data:
+  backup_artifacts:
+
+networks:
+  database:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${DATABASE_SUBNET:-172.30.10.0/24}
+          gateway: ${DATABASE_GATEWAY:-172.30.10.1}
+  egress:
+    ipam:
+      config:
+        - subnet: ${APP_EGRESS_SUBNET:-172.30.20.0/24}
+          gateway: ${APP_EGRESS_GATEWAY:-172.30.20.1}
