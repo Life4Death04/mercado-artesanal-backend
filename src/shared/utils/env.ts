@@ -1,4 +1,45 @@
+import { isIP } from "node:net";
+
 import { z } from "zod";
+
+function commaSeparatedValues(value: string, ctx: z.RefinementCtx): string[] {
+  const values = value.split(",").map((entry) => entry.trim());
+  if (values.some((entry) => entry.length === 0)) {
+    ctx.addIssue({ code: "custom", message: "must be a comma-separated list without empty entries" });
+    return z.NEVER;
+  }
+  return [...new Set(values)];
+}
+
+function isValidOrigin(value: string): boolean {
+  if (value === "*") return true;
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      url.username === "" &&
+      url.password === "" &&
+      url.pathname === "/" &&
+      url.search === "" &&
+      url.hash === "" &&
+      value.replace(/\/$/, "") === url.origin
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isValidProxy(value: string): boolean {
+  if (value === "loopback") return true;
+  const [address, prefix, extra] = value.split("/");
+  if (address === undefined) return false;
+  const version = isIP(address);
+  if (extra !== undefined || version === 0) return false;
+  if (prefix === undefined) return true;
+  if (!/^\d+$/.test(prefix)) return false;
+  const bits = Number(prefix);
+  return bits > 0 && bits <= (version === 4 ? 32 : 128);
+}
 
 const EnvSchema = z
   .object({
@@ -8,7 +49,23 @@ const EnvSchema = z
     AUTH0_DOMAIN: z.string().min(1),
     AUTH0_AUDIENCE: z.string().min(1),
     LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
-    CORS_ORIGIN: z.string().default("*"),
+    CORS_ORIGIN: z
+      .string()
+      .default("*")
+      .transform(commaSeparatedValues)
+      .refine((origins) => origins.every(isValidOrigin), {
+        message: "must contain only valid HTTP(S) origins without paths",
+      })
+      .refine((origins) => origins.length === 1 || !origins.includes("*"), {
+        message: "wildcard origin cannot be combined with other origins",
+      }),
+    TRUST_PROXY: z
+      .string()
+      .default("loopback")
+      .transform(commaSeparatedValues)
+      .refine((proxies) => proxies.every(isValidProxy), {
+        message: "must contain only loopback, exact IP addresses, or CIDR ranges",
+      }),
     S3_PUBLIC_BASE_URL: z.string().url().min(1),
     // Cycle 5 — payments slice (consumer-purchase-flow 3/3). Server-side Stripe
     // secret key used exclusively by src/modules/payments/services/stripe.client.ts
@@ -57,6 +114,18 @@ const EnvSchema = z
         path: ["S3_PUBLIC_BASE_URL"],
         message: "HTTPS required when NODE_ENV === 'production'",
       });
+    }
+    if (v.NODE_ENV === "production") {
+      for (const origin of v.CORS_ORIGIN) {
+        if (origin === "*" || !origin.startsWith("https://")) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["CORS_ORIGIN"],
+            message: "production origins must use explicit HTTPS URLs",
+          });
+          break;
+        }
+      }
     }
   });
 

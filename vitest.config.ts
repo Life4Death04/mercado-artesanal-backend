@@ -32,7 +32,8 @@ export default defineConfig({
       AUTH0_DOMAIN: "test.eu.auth0.com",
       AUTH0_AUDIENCE: "https://api.test.example",
       LOG_LEVEL: "error",
-      CORS_ORIGIN: "*",
+      CORS_ORIGIN: "http://frontend.test,https://admin.test",
+      TRUST_PROXY: "loopback",
       // Required after expose-product-images-in-producer-list Slice 1.
       // Tests use https:// so the singleton boots cleanly in NODE_ENV=test.
       S3_PUBLIC_BASE_URL: "https://test-cdn.example.com",

@@ -67,6 +67,10 @@ export interface CreateAppOptions {
 export function createApp({ logger = defaultLogger }: CreateAppOptions = {}): Express {
   const app = express();
 
+  // Trust only the explicitly configured Nginx source addresses. This makes
+  // req.ip (and express-rate-limit) use X-Forwarded-For only from that boundary.
+  app.set("trust proxy", env.TRUST_PROXY);
+
   // 1. Security headers
   app.use(helmet());
 
