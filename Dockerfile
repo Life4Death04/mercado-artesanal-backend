@@ -63,6 +63,8 @@ COPY --from=production-dependencies /app/node_modules ./node_modules
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=build /app/dist ./dist
 COPY package.json package-lock.json ./
+COPY --chown=node:node prisma/schema.prisma ./prisma/schema.prisma
+COPY --chown=node:node prisma/migrations ./prisma/migrations
 
 RUN install -d -o node -g node -m 0700 /var/lib/mercado-artesanal/backups \
     && chown -R node:node /app
