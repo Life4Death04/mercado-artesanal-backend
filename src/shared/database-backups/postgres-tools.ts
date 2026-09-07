@@ -10,7 +10,7 @@
  * call — `spawn(shell:false)` with a relative/bare command resolves through
  * PATH, which absolute-only input makes structurally unreachable. Every
  * fixed-vector wrapper below only ever passes internally-constructed paths
- * and a validated loopback connection as argv; `shell:false` means any
+ * and a validated allow-listed connection as argv; `shell:false` means any
  * metacharacter those values contain reaches `execve()` literally, never a
  * shell.
  *
@@ -141,7 +141,7 @@ async function probeMajorVersion(execPath: string, label: string): Promise<numbe
 }
 
 // ---------------------------------------------------------------------------
-// Loopback-only connection URL parsing — shared by dump/restore env
+// Allow-listed connection URL parsing — shared by dump/restore env
 // construction here and by target-database.ts's maintenance URL builder.
 // ---------------------------------------------------------------------------
 
@@ -155,8 +155,11 @@ export interface LoopbackConnection {
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
-/** Parses and requires a loopback-only PostgreSQL connection URL. */
-export function parsePostgresUrl(rawUrl: string): LoopbackConnection {
+/** Parses a PostgreSQL URL, allowing loopback plus explicitly supplied hosts. */
+export function parsePostgresUrl(
+  rawUrl: string,
+  additionalAllowedHosts: readonly string[] = [],
+): LoopbackConnection {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -170,8 +173,9 @@ export function parsePostgresUrl(rawUrl: string): LoopbackConnection {
 
   // IPv6 hostnames come back bracketed (e.g. "[::1]") from the WHATWG URL parser.
   const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (!LOOPBACK_HOSTS.has(hostname)) {
-    throw new BackupRuntimeUnavailableError("PostgreSQL connection host must be loopback-only");
+  const allowedHosts = new Set([...LOOPBACK_HOSTS, ...additionalAllowedHosts.map((host) => host.toLowerCase())]);
+  if (!allowedHosts.has(hostname)) {
+    throw new BackupRuntimeUnavailableError("PostgreSQL connection host is not allow-listed");
   }
 
   const database = decodeURIComponent(parsed.pathname.replace(/^\//, ""));

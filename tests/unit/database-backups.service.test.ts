@@ -26,23 +26,30 @@
  *   "Global operation serialization".
  * Design: "Data Flow", "Storage and Safety".
  */
+import { createHash } from "crypto";
 import { existsSync, writeFileSync } from "fs";
-import { mkdtemp, rm, stat } from "fs/promises";
+import { mkdtemp, readFile, rm, stat } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { create, getOperation } from "@/modules/admin/services/database-backups.service";
 import {
+  create,
+  getOperation,
+  prepareDatabaseBackups,
+} from "@/modules/admin/services/database-backups.service";
+import {
+  archivePath,
   ensureArtifactStore,
+  manifestPath,
   operationPath,
   publishArchive,
   publishManifest,
   resolveArtifactRoot,
   writeTempFile,
 } from "@/shared/database-backups/artifact-store";
-import type { BackupManifestV1 } from "@/shared/database-backups/contracts";
+import type { BackupManifestV1, BackupOperationReceipt } from "@/shared/database-backups/contracts";
 import { acquireLease } from "@/shared/database-backups/operation-lease";
 import { assertTrustedExecutable, dumpDatabase } from "@/shared/database-backups/postgres-tools";
 import {
@@ -109,6 +116,29 @@ interface ReceiptSnapshot {
   readonly failureReason: string | null;
 }
 
+function writeReceipt(receipt: BackupOperationReceipt): void {
+  writeFileSync(operationPath(root, receipt.operationId), JSON.stringify(receipt));
+}
+
+function interruptedReceipt(
+  overrides: Partial<BackupOperationReceipt> = {},
+): BackupOperationReceipt {
+  return {
+    operationId: "operation-interrupted",
+    type: "CREATE",
+    backupId: "backup-interrupted",
+    status: "RUNNING",
+    stage: "HASHING",
+    ownerPid: 999999,
+    bootId: "previous-boot",
+    createdAt: "2026-08-18T08:00:00.000Z",
+    updatedAt: "2026-08-18T08:01:00.000Z",
+    failureReason: null,
+    result: null,
+    ...overrides,
+  };
+}
+
 /** Decodes every receipt body ever passed to `writeTempFile`, in call order. */
 function receiptSnapshots(): ReceiptSnapshot[] {
   return vi.mocked(writeTempFile).mock.calls.map(([, data]) => {
@@ -151,6 +181,124 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.clearAllMocks();
   await rm(root, { recursive: true, force: true });
+});
+
+describe("prepareDatabaseBackups(): restart reconciliation", () => {
+  it("marks an interrupted CREATE as SUCCEEDED when its manifest and archive are complete", async () => {
+    const receipt = interruptedReceipt({ stage: "PUBLISHING" });
+    const archive = Buffer.from("complete-backup");
+    const checksumSha256 = createHash("sha256").update(archive).digest("hex");
+    writeReceipt(receipt);
+    writeFileSync(archivePath(root, receipt.backupId), archive);
+    writeFileSync(
+      manifestPath(root, receipt.backupId),
+      JSON.stringify({
+        version: 1,
+        id: receipt.backupId,
+        label: "nightly",
+        actorId: "actor-1",
+        createdAt: receipt.createdAt,
+        sourceFingerprint: "localhost/mercado_test",
+        toolVersion: "16",
+        checksumSha256,
+        bytes: archive.byteLength,
+        status: "AVAILABLE",
+        components: [{ kind: "postgres" }],
+      } satisfies BackupManifestV1),
+    );
+
+    await prepareDatabaseBackups();
+
+    await expect(getOperation(receipt.operationId)).resolves.toMatchObject({
+      status: "SUCCEEDED",
+      stage: "PUBLISHING",
+      failureReason: null,
+      result: { checksumSha256, bytes: archive.byteLength },
+    });
+  });
+
+  it("marks an interrupted CREATE as FAILED when the published archive fails checksum validation", async () => {
+    const receipt = interruptedReceipt({ stage: "PUBLISHING" });
+    const archive = Buffer.from("corrupted-backup");
+    writeReceipt(receipt);
+    writeFileSync(archivePath(root, receipt.backupId), archive);
+    writeFileSync(
+      manifestPath(root, receipt.backupId),
+      JSON.stringify({
+        version: 1,
+        id: receipt.backupId,
+        label: null,
+        actorId: "actor-1",
+        createdAt: receipt.createdAt,
+        sourceFingerprint: "localhost/mercado_test",
+        toolVersion: "16",
+        checksumSha256: "a".repeat(64),
+        bytes: archive.byteLength,
+        status: "AVAILABLE",
+        components: [{ kind: "postgres" }],
+      } satisfies BackupManifestV1),
+    );
+
+    await prepareDatabaseBackups();
+
+    await expect(getOperation(receipt.operationId)).resolves.toMatchObject({
+      status: "FAILED",
+      failureReason: "Backup operation was interrupted by an application restart",
+    });
+  });
+
+  it("marks interrupted operations FAILED with a fixed reason and removes stale temp files", async () => {
+    const createReceipt = interruptedReceipt();
+    const futureReceipt = interruptedReceipt({
+      operationId: "operation-restore",
+      backupId: "backup-restore",
+      type: "RESTORE_PREPARATION",
+      status: "ACCEPTED",
+      stage: null,
+    });
+    writeReceipt(createReceipt);
+    writeReceipt(futureReceipt);
+    const staleTemp = join(root, ".tmp", "orphan.dump.tmp");
+    writeFileSync(staleTemp, "partial-dump");
+
+    await prepareDatabaseBackups();
+
+    for (const receipt of [createReceipt, futureReceipt]) {
+      await expect(getOperation(receipt.operationId)).resolves.toMatchObject({
+        status: "FAILED",
+        failureReason: "Backup operation was interrupted by an application restart",
+      });
+    }
+    expect(existsSync(staleTemp)).toBe(false);
+  });
+
+  it("leaves terminal and malformed receipts unchanged", async () => {
+    const terminal = interruptedReceipt({ status: "FAILED", failureReason: "Original failure" });
+    writeReceipt(terminal);
+    const original = JSON.stringify(terminal);
+    writeFileSync(operationPath(root, "malformed-receipt"), "{/secret/path");
+
+    await prepareDatabaseBackups();
+
+    expect(await readFile(operationPath(root, terminal.operationId), "utf8")).toBe(original);
+    expect(await readFile(operationPath(root, "malformed-receipt"), "utf8")).toBe("{/secret/path");
+  });
+
+  it("does not reconcile or clean temp state while a live process holds the lease", async () => {
+    const receipt = interruptedReceipt();
+    writeReceipt(receipt);
+    const liveTemp = join(root, ".tmp", "live.dump.tmp");
+    writeFileSync(liveTemp, "live-dump");
+    const held = await acquireLease(root, "live-operation");
+
+    await expect(prepareDatabaseBackups()).rejects.toBeInstanceOf(BackupOperationConflictError);
+
+    expect(await readFile(operationPath(root, receipt.operationId), "utf8")).toBe(
+      JSON.stringify(receipt),
+    );
+    expect(existsSync(liveTemp)).toBe(true);
+    await held.release();
+  });
 });
 
 // ---------------------------------------------------------------------------

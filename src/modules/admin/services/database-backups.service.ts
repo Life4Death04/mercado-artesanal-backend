@@ -5,9 +5,9 @@
  * All exports are NAMED FUNCTIONS (not a class, not a default export),
  * matching the rest of the codebase (e.g. `images.service.ts`).
  *
- * Scope: backup creation acceptance, its async runner, startup readiness,
- * and safe operation receipt polling. Delete, restore, listing, and broad
- * startup reconciliation are intentionally not implemented here.
+ * Scope: backup creation acceptance, its async runner, restart reconciliation,
+ * startup readiness, and safe operation receipt polling. Delete, restore, and
+ * listing are intentionally not implemented here.
  *
  * Data flow (design "Data Flow"):
  *   `validate → acquire lease → persist ACCEPTED receipt → return`
@@ -48,15 +48,18 @@
  *   "Atomic, private, redacted artifacts", "Global operation serialization".
  * Design: "Data Flow", "Storage and Safety", "Interfaces / Contracts".
  */
-import { randomUUID } from "crypto";
-import { chmod, mkdir, readFile, rename, rm } from "fs/promises";
+import { createHash, randomUUID } from "crypto";
+import { createReadStream } from "fs";
+import { chmod, mkdir, readdir, readFile, rename, rm, stat } from "fs/promises";
 import { join } from "path";
 
 import { z } from "zod";
 
 import {
+  archivePath,
   ensureArtifactStore,
   generateArtifactId,
+  manifestPath,
   operationPath,
   publishArchive,
   publishManifest,
@@ -71,7 +74,11 @@ import {
   type BackupOperationStatus,
   type OperationView,
 } from "@/shared/database-backups/contracts";
-import { acquireLease, type LeaseHandle } from "@/shared/database-backups/operation-lease";
+import {
+  acquireLease,
+  reclaimDeadLease,
+  type LeaseHandle,
+} from "@/shared/database-backups/operation-lease";
 import {
   assertTrustedExecutable,
   dumpDatabase,
@@ -128,6 +135,24 @@ const BackupOperationReceiptSchema = z
   })
   .strict();
 
+const BackupManifestSchema = z
+  .object({
+    version: z.literal(BACKUP_MANIFEST_VERSION),
+    id: z.string(),
+    label: z.string().nullable(),
+    actorId: z.string(),
+    createdAt: z.string().datetime(),
+    sourceFingerprint: z.string(),
+    toolVersion: z.string(),
+    checksumSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    bytes: z.number().int().nonnegative(),
+    status: z.literal("AVAILABLE"),
+    components: z.tuple([z.object({ kind: z.literal("postgres") }).strict()]),
+  })
+  .strict();
+
+const RESTART_FAILURE_REASON = "Backup operation was interrupted by an application restart";
+
 /**
  * Validates and normalizes the optional label: trims whitespace, treats an
  * empty/whitespace-only string as "no label" (`null`), and rejects labels
@@ -171,6 +196,131 @@ export async function prepareDatabaseBackups(): Promise<void> {
   const root = await resolveArtifactRoot(env.BACKUP_ARTIFACT_DIR);
   await ensureArtifactStore(root);
   await assertTrustedExecutable(env.PG_DUMP_PATH, "pg_dump");
+  await reconcileBackupOperations(root);
+}
+
+async function reconcileBackupOperations(root: string): Promise<void> {
+  await reclaimDeadLease(root);
+  const lease = await acquireLease(root, `startup-${generateArtifactId()}`);
+
+  try {
+    const operationFiles = (await readdir(join(root, "operations")))
+      .filter((name) => name.endsWith(".json"))
+      .sort();
+
+    for (const fileName of operationFiles) {
+      const operationId = fileName.slice(0, -".json".length);
+      if (!OPERATION_ID_PATTERN.test(operationId)) {
+        continue;
+      }
+
+      const receipt = await readReceiptForReconciliation(root, operationId);
+      if (!receipt || receipt.status === "SUCCEEDED" || receipt.status === "FAILED") {
+        continue;
+      }
+
+      const completedManifest =
+        receipt.type === "CREATE" ? await readCompletedManifest(root, receipt.backupId) : null;
+      const now = new Date().toISOString();
+      const reconciled: BackupOperationReceipt = completedManifest
+        ? {
+            ...receipt,
+            status: "SUCCEEDED",
+            stage: "PUBLISHING",
+            updatedAt: now,
+            failureReason: null,
+            result: {
+              checksumSha256: completedManifest.checksumSha256,
+              bytes: completedManifest.bytes,
+            },
+          }
+        : {
+            ...receipt,
+            status: "FAILED",
+            updatedAt: now,
+            failureReason: RESTART_FAILURE_REASON,
+          };
+      await persistReceipt(root, reconciled);
+    }
+
+    for (const entry of await readdir(join(root, ".tmp"))) {
+      await rm(join(root, ".tmp", entry), { recursive: true, force: true });
+    }
+  } finally {
+    await lease.release();
+  }
+}
+
+async function readReceiptForReconciliation(
+  root: string,
+  operationId: string,
+): Promise<BackupOperationReceipt | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(operationPath(root, operationId), "utf8"));
+  } catch {
+    return null;
+  }
+
+  const receipt = BackupOperationReceiptSchema.safeParse(parsed);
+  if (!receipt.success || receipt.data.operationId !== operationId) {
+    return null;
+  }
+  return receipt.data;
+}
+
+async function readCompletedManifest(
+  root: string,
+  backupId: string,
+): Promise<BackupManifestV1 | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(manifestPath(root, backupId), "utf8"));
+  } catch (err) {
+    if (
+      err instanceof SyntaxError ||
+      (err instanceof Error && "code" in err && err.code === "ENOENT")
+    ) {
+      return null;
+    }
+    throw err;
+  }
+
+  const manifest = BackupManifestSchema.safeParse(parsed);
+  if (!manifest.success || manifest.data.id !== backupId) {
+    return null;
+  }
+
+  try {
+    const [checksumSha256, archiveStats] = await Promise.all([
+      sha256File(archivePath(root, backupId)),
+      stat(archivePath(root, backupId)),
+    ]);
+    if (
+      checksumSha256 !== manifest.data.checksumSha256 ||
+      archiveStats.size !== manifest.data.bytes
+    ) {
+      return null;
+    }
+  } catch (err) {
+    if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+
+  return manifest.data;
+}
+
+async function sha256File(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", resolve);
+    stream.on("error", reject);
+  });
+  return hash.digest("hex");
 }
 
 export async function getOperation(operationId: string): Promise<OperationView> {
@@ -308,8 +458,7 @@ async function runCreateRunner(
     clearTimeout(timeoutHandle);
     if (state.tempDumpPath) {
       await rm(state.tempDumpPath, { force: true }).catch(() => {
-        /* best-effort — startup reconciliation (task 3.7) quarantines any
-           surviving orphan; this is a same-request cleanup convenience */
+        /* best-effort — startup reconciliation removes any surviving orphan */
       });
     }
     await lease.release();
@@ -326,7 +475,7 @@ async function executeCreatePipeline(
   signal.throwIfAborted();
   await transitionStage(root, state, "RUNNING", "DUMPING");
 
-  const connection = parsePostgresUrl(env.DATABASE_URL);
+  const connection = parsePostgresUrl(env.DATABASE_URL, env.BACKUP_DATABASE_HOST_ALLOWLIST);
   await assertTrustedExecutable(env.PG_DUMP_PATH, "pg_dump");
 
   state.tempDumpPath = join(root, ".tmp", `${randomUUID()}.dump.tmp`);

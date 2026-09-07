@@ -1,0 +1,53 @@
+# Secrets and local environment
+.env
+.env.*
+
+# Version control and automation metadata
+.git
+.gitignore
+.gitattributes
+.github
+
+# Local dependencies and generated output
+node_modules
+dist
+coverage
+*.tsbuildinfo
+
+# Logs and runtime artifacts
+*.log
+logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.dump
+*.sql.gz
+*.tar
+*.tgz
+backups
+
+# Editors, operating systems, and tool caches
+.DS_Store
+.idea
+.vscode
+*.swp
+*.swo
+.cache
+.eslintcache
+.npm
+.turbo
+.opencode
+.claude
+.agents
+
+# Tests, documentation, and internal planning artifacts are not image inputs
+tests
+docs
+*.md
+openspec
+.openspec
+.sdd
+specs
+deploy
+compose*.yml
+docker-compose*.yml

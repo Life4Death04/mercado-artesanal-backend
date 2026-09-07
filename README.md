@@ -78,7 +78,18 @@ Copy `.env.example` to `.env` and fill in the values.
 | `AUTH0_DOMAIN`   | ✅       | Auth0 tenant domain (e.g. `your-tenant.eu.auth0.com`)   |
 | `AUTH0_AUDIENCE` | ✅       | Auth0 API audience (e.g. `https://api.mercado.example`) |
 | `LOG_LEVEL`      | —        | Pino log level (default: `info`)                        |
-| `CORS_ORIGIN`    | —        | CORS allowed origin (default: `*`)                      |
+| `CORS_ORIGIN`    | —        | Comma-separated exact frontend origins; production requires explicit HTTPS |
+| `TRUST_PROXY`    | —        | Trusted proxy IPs/CIDRs or `loopback` (default: `loopback`) |
+| `BACKUP_DATABASE_HOST_ALLOWLIST` | — | Extra exact PostgreSQL hostnames/IPs allowed for backup operations |
+
+### Reverse proxy and frontend assumptions
+
+- Nginx is the only externally reachable HTTP entry point; the application port must not be exposed to untrusted clients.
+- Set `TRUST_PROXY` to the exact source IP or narrow CIDR from which Nginx connects. Keep the default `loopback` only when Nginx connects through host loopback. This is required for client-IP rate limiting to use `X-Forwarded-For` safely.
+- Nginx must replace or append the standard `X-Forwarded-For` chain and forward `X-Forwarded-Proto`. Do not preserve client-supplied forwarding headers at an untrusted boundary.
+- Set `CORS_ORIGIN` to every browser frontend origin, separated by commas. Origins include scheme and optional port, but no path. Production rejects `*` and plain HTTP.
+- If `DATABASE_URL` uses a service hostname such as `postgres`, add that exact hostname to `BACKUP_DATABASE_HOST_ALLOWLIST`. Omitting the variable keeps backup/restore connections loopback-only.
+- Nginx health checks can use `/health`; readiness checks that require database connectivity can use `/health/ready`.
 
 ---
 

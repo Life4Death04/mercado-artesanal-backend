@@ -20,11 +20,12 @@ import { logger } from "@/shared/utils/logger";
 import { prisma } from "@/shared/utils/prisma";
 
 import { createApp } from "./app";
+import { listenForRequests } from "./server-listener";
 
 async function start(): Promise<void> {
   await prepareDatabaseBackups();
   const app = createApp();
-  const server = app.listen(env.PORT, () => {
+  const server = listenForRequests(app, env.PORT, () => {
     logger.info({ port: env.PORT, env: env.NODE_ENV }, "Server listening");
   });
 

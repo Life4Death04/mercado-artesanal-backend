@@ -33,6 +33,7 @@ const BASE_VALID = {
   AUTH0_AUDIENCE: "https://api.test.example",
   LOG_LEVEL: "error" as const,
   CORS_ORIGIN: "*",
+  TRUST_PROXY: "loopback",
   // Required after Cycle 5 payments WU1 (STRIPE_SECRET_KEY added to env.ts).
   STRIPE_SECRET_KEY: "sk_test_dummy_for_env_test",
   // Required after Cycle 5 payments WU2 (STRIPE_WEBHOOK_SECRET added to env.ts).
@@ -44,7 +45,56 @@ const BASE_VALID = {
   PG_DUMP_PATH: "/usr/lib/postgresql/16/bin/pg_dump",
   PG_RESTORE_PATH: "/usr/lib/postgresql/16/bin/pg_restore",
   BACKUP_OPERATION_TIMEOUT_MS: "300000",
+  BACKUP_DATABASE_HOST_ALLOWLIST: "",
 };
+
+describe("network boundary config", () => {
+  it("parses multiple explicit CORS origins and trusted proxy ranges", () => {
+    const result = parseEnv({
+      ...BASE_VALID,
+      S3_PUBLIC_BASE_URL: "https://cdn.example.com",
+      CORS_ORIGIN: "http://localhost:5173, https://admin.example.com",
+      TRUST_PROXY: "loopback,172.20.0.5,10.20.0.0/16",
+    });
+
+    expect(result.CORS_ORIGIN).toEqual([
+      "http://localhost:5173",
+      "https://admin.example.com",
+    ]);
+    expect(result.TRUST_PROXY).toEqual(["loopback", "172.20.0.5", "10.20.0.0/16"]);
+  });
+
+  it.each(["https://frontend.example.com/path", "frontend.example.com", "*,https://frontend.example.com"])(
+    "rejects invalid CORS allow-list value %s",
+    (CORS_ORIGIN) => {
+      expect(() =>
+        parseEnv({ ...BASE_VALID, S3_PUBLIC_BASE_URL: "https://cdn.example.com", CORS_ORIGIN }),
+      ).toThrow();
+    },
+  );
+
+  it("rejects wildcard and HTTP origins in production", () => {
+    for (const CORS_ORIGIN of ["*", "http://frontend.example.com"]) {
+      expect(() =>
+        parseEnv({
+          ...BASE_VALID,
+          NODE_ENV: "production",
+          S3_PUBLIC_BASE_URL: "https://cdn.example.com",
+          CORS_ORIGIN,
+        }),
+      ).toThrow();
+    }
+  });
+
+  it.each(["true", "1", "nginx", "0.0.0.0/0", "10.0.0.0/33"])(
+    "rejects unsafe or malformed proxy trust value %s",
+    (TRUST_PROXY) => {
+      expect(() =>
+        parseEnv({ ...BASE_VALID, S3_PUBLIC_BASE_URL: "https://cdn.example.com", TRUST_PROXY }),
+      ).toThrow();
+    },
+  );
+});
 
 // ---------------------------------------------------------------------------
 // Scenario 1 — Missing S3_PUBLIC_BASE_URL prevents boot
@@ -134,6 +184,7 @@ describe("S3_PUBLIC_BASE_URL: https:// in production", () => {
       ...BASE_VALID,
       NODE_ENV: "production" as const,
       S3_PUBLIC_BASE_URL: "https://cdn.example.com",
+      CORS_ORIGIN: "https://frontend.example.com",
     };
     const result = parseEnv(input);
     expect(result.S3_PUBLIC_BASE_URL).toBe("https://cdn.example.com");
@@ -222,6 +273,20 @@ describe("backup config: valid absolute paths and positive timeout", () => {
   it("does NOT throw when all four backup vars are valid", () => {
     expect(() => parseEnv(BACKUP_VALID)).not.toThrow();
   });
+});
+
+describe("backup database host allow-list", () => {
+  it("accepts an explicit Compose service hostname", () => {
+    const result = parseEnv({ ...BACKUP_VALID, BACKUP_DATABASE_HOST_ALLOWLIST: "postgres" });
+    expect(result.BACKUP_DATABASE_HOST_ALLOWLIST).toEqual(["postgres"]);
+  });
+
+  it.each(["https://postgres", "postgres/path", "postgres,", "*"])(
+    "rejects malformed host entry %s",
+    (BACKUP_DATABASE_HOST_ALLOWLIST) => {
+      expect(() => parseEnv({ ...BACKUP_VALID, BACKUP_DATABASE_HOST_ALLOWLIST })).toThrow();
+    },
+  );
 });
 
 describe.each([
