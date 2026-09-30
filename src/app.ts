@@ -67,8 +67,11 @@ export interface CreateAppOptions {
 export function createApp({ logger = defaultLogger }: CreateAppOptions = {}): Express {
   const app = express();
 
-  // Trust only the explicitly configured Nginx source addresses. This makes
-  // req.ip (and express-rate-limit) use X-Forwarded-For only from that boundary.
+  // Trust only the explicitly configured proxy boundary: either an identity
+  // allow-list (Nginx's exact source addresses/CIDR) or a numeric hop count
+  // (single-hop PaaS edges such as Railway, where the app has no other public
+  // path). This makes req.ip (and express-rate-limit) use X-Forwarded-For
+  // only from that trusted boundary.
   app.set("trust proxy", env.TRUST_PROXY);
 
   // 1. Security headers
