@@ -36,6 +36,7 @@
  */
 import { Router } from "express";
 
+import { demoPolicyGuard } from "@/shared/demo-policy";
 import { authenticate } from "@/shared/middleware/authenticate";
 import { loadUser } from "@/shared/middleware/loadUser";
 import { onboardingGate } from "@/shared/middleware/onboardingGate";
@@ -49,7 +50,7 @@ import * as databaseBackupsController from "../controllers/database-backups.cont
 export const adminRouter: Router = Router();
 
 // Admin-scoped guard — applied to every /admin/* route on this router.
-const adminGuard = [authenticate, loadUser, requireRole("ADMIN"), onboardingGate];
+const adminGuard = [authenticate, loadUser, demoPolicyGuard, requireRole("ADMIN"), onboardingGate];
 
 adminRouter.use("/admin", ...adminGuard);
 

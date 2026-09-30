@@ -21,6 +21,7 @@
  */
 import { Router } from "express";
 
+import { demoPolicyGuard } from "@/shared/demo-policy";
 import { authenticate } from "@/shared/middleware/authenticate";
 import { loadUser } from "@/shared/middleware/loadUser";
 import { onboardingGate } from "@/shared/middleware/onboardingGate";
@@ -30,7 +31,7 @@ import * as addressesController from "../controllers/addresses.controller";
 
 export const addressesRouter: Router = Router();
 
-const addressGuard = [authenticate, loadUser, onboardingGate, requireRole("CONSUMER", "PRODUCER", "ADMIN")];
+const addressGuard = [authenticate, loadUser, demoPolicyGuard, onboardingGate, requireRole("CONSUMER", "PRODUCER", "ADMIN")];
 
 addressesRouter.get("/users/me/addresses", ...addressGuard, addressesController.list);
 addressesRouter.post("/users/me/addresses", ...addressGuard, addressesController.create);

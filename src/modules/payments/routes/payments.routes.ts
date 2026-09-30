@@ -28,6 +28,7 @@
  */
 import { Router } from "express";
 
+import { demoPolicyGuard } from "@/shared/demo-policy";
 import { authenticate } from "@/shared/middleware/authenticate";
 import { loadUser } from "@/shared/middleware/loadUser";
 import { onboardingGate } from "@/shared/middleware/onboardingGate";
@@ -38,7 +39,7 @@ import * as paymentsController from "../controllers/payments.controller";
 export const paymentsRouter: Router = Router();
 
 // Guard chain — matches cart.routes.ts:39 / orders.routes.ts:39 pattern
-const paymentsGuard = [authenticate, loadUser, onboardingGate, requireRole("CONSUMER", "PRODUCER", "ADMIN")];
+const paymentsGuard = [authenticate, loadUser, demoPolicyGuard, onboardingGate, requireRole("CONSUMER", "PRODUCER", "ADMIN")];
 
 // ---------------------------------------------------------------------------
 // Payments routes — WU1

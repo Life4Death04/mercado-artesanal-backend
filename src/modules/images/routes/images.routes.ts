@@ -14,6 +14,7 @@
  */
 import { Router } from "express";
 
+import { demoPolicyGuard } from "@/shared/demo-policy";
 import { authenticate } from "@/shared/middleware/authenticate";
 import { loadUser } from "@/shared/middleware/loadUser";
 import { onboardingGate } from "@/shared/middleware/onboardingGate";
@@ -27,6 +28,7 @@ export const imagesRouter: Router = Router();
 const producerGuard = [
   authenticate,
   loadUser,
+  demoPolicyGuard,
   onboardingGate,
   requireRole("PRODUCER"),
 ];

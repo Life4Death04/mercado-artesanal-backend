@@ -15,6 +15,7 @@
  */
 import { Router } from "express";
 
+import { demoPolicyGuard } from "@/shared/demo-policy";
 import { authenticate } from "@/shared/middleware/authenticate";
 import { loadUser } from "@/shared/middleware/loadUser";
 import { onboardingGate } from "@/shared/middleware/onboardingGate";
@@ -27,6 +28,7 @@ onboardingRouter.post(
   "/users/me/onboarding/consumer",
   authenticate,
   loadUser,
+  demoPolicyGuard,
   onboardingGate,
   consumer,
 );
@@ -35,6 +37,7 @@ onboardingRouter.post(
   "/users/me/onboarding/producer",
   authenticate,
   loadUser,
+  demoPolicyGuard,
   onboardingGate,
   producer,
 );
