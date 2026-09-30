@@ -72,6 +72,344 @@ const PRODUCT_CATEGORIES: Array<{ slug: string; name: string; description: strin
   { slug: "especias-y-condimentos", name: "Especias y condimentos", description: "Especias, hierbas aromáticas y salsas artesanales" },
 ];
 
+/**
+ * Demo/guest-environment world data — WU4.
+ *
+ * Gated by DEMO_PRODUCER_AUTH0_SUB + DEMO_ADMIN_AUTH0_SUB. Without both set,
+ * `db:seed` behaves exactly as it does today (no demo rows at all).
+ *
+ * Scope is deliberately MINIMUM: zero Order/Payment/SubOrder/OrderLine/Incident
+ * rows. Those are hand-created by the repo owner after this seed runs (see
+ * Engram topic_key plan/demo-guest-environment-wu4-seed for the full rationale).
+ *
+ * Idempotency: User upserts on auth0Sub (natural unique key). Producer upserts
+ * on userId (natural unique key). DeliveryMode/Product/Address/Notification
+ * have no natural unique key in the schema, so each row is assigned a fixed
+ * deterministic literal `id` and upserted on `id` — safe to re-run on every
+ * Railway redeploy without creating duplicates.
+ *
+ * IMPORTANT (upsert-key gotcha): DEMO_PRODUCER_AUTH0_SUB / DEMO_ADMIN_AUTH0_SUB
+ * MUST already hold the real Auth0 `user_id` (the JWT `sub`) before this seed
+ * ever runs with intent to serve real traffic. Seeding once with a placeholder
+ * value and later swapping the env var creates an ORPHAN row instead of
+ * updating the existing one, because upsert matches on the OLD auth0Sub.
+ */
+async function seedDemoWorld(): Promise<void> {
+  const demoProducerAuth0Sub = process.env.DEMO_PRODUCER_AUTH0_SUB;
+  const demoAdminAuth0Sub = process.env.DEMO_ADMIN_AUTH0_SUB;
+
+  if (!demoProducerAuth0Sub || !demoAdminAuth0Sub) {
+    console.log("DEMO_PRODUCER_AUTH0_SUB / DEMO_ADMIN_AUTH0_SUB not set — skipping demo world seed.");
+    return;
+  }
+
+  console.log("Seeding demo world (WU4)...");
+
+  // ---------------------------------------------------------------------------
+  // Users — 2 demo (real Auth0 identities) + 2 background (never log in)
+  // ---------------------------------------------------------------------------
+  const demoProducerUser = await prisma.user.upsert({
+    where: { auth0Sub: demoProducerAuth0Sub },
+    update: { role: "PRODUCER", isDemo: true, emailVerified: true },
+    create: {
+      auth0Sub: demoProducerAuth0Sub,
+      email: "demo-producer@mercado-artesanal.demo",
+      emailVerified: true,
+      firstName: "Productor",
+      lastName: "Demo",
+      name: "Productor Demo",
+      role: "PRODUCER",
+      isDemo: true,
+    },
+  });
+
+  await prisma.user.upsert({
+    where: { auth0Sub: demoAdminAuth0Sub },
+    update: { role: "ADMIN", isDemo: true, emailVerified: true },
+    create: {
+      auth0Sub: demoAdminAuth0Sub,
+      email: "demo-admin@mercado-artesanal.demo",
+      emailVerified: true,
+      firstName: "Admin",
+      lastName: "Demo",
+      name: "Admin Demo",
+      role: "ADMIN",
+      isDemo: true,
+    },
+  });
+
+  const backgroundProducerUser = await prisma.user.upsert({
+    where: { auth0Sub: "seed|background-producer-1" },
+    update: { role: "PRODUCER", isDemo: false, emailVerified: true },
+    create: {
+      auth0Sub: "seed|background-producer-1",
+      email: "background-producer@mercado-artesanal.demo",
+      emailVerified: true,
+      firstName: "Productor",
+      lastName: "Fondo",
+      name: "Productor de Fondo",
+      role: "PRODUCER",
+      isDemo: false,
+    },
+  });
+
+  await prisma.user.upsert({
+    where: { auth0Sub: "seed|background-consumer-1" },
+    update: { role: "CONSUMER", isDemo: false, emailVerified: true },
+    create: {
+      auth0Sub: "seed|background-consumer-1",
+      email: "background-consumer@mercado-artesanal.demo",
+      emailVerified: true,
+      firstName: "Consumidor",
+      lastName: "Fondo",
+      name: "Consumidor de Fondo",
+      role: "CONSUMER",
+      isDemo: false,
+    },
+  });
+
+  console.log("Demo world users seeded — 2 demo, 2 background.");
+
+  // ---------------------------------------------------------------------------
+  // Producers — 1 per demo/background producer user, each with 1 business
+  // category assignment (ProducerCategory, O-2 LOCKED slugs).
+  // ---------------------------------------------------------------------------
+  const demoProducer = await prisma.producer.upsert({
+    where: { userId: demoProducerUser.id },
+    update: {},
+    create: {
+      userId: demoProducerUser.id,
+      businessName: "Quesería Demo",
+      nif: "B12345671",
+      description: "Productor de demostración especializado en quesos artesanales.",
+      addressLine1: "Calle Mayor 1",
+      addressCity: "Madrid",
+      addressPostalCode: "28001",
+      addressProvince: "Madrid",
+    },
+  });
+
+  const backgroundProducer = await prisma.producer.upsert({
+    where: { userId: backgroundProducerUser.id },
+    update: {},
+    create: {
+      userId: backgroundProducerUser.id,
+      businessName: "Bodega de Fondo",
+      nif: "B12345672",
+      description: "Productor de fondo para catálogo — no inicia sesión.",
+      addressLine1: "Calle Bodega 2",
+      addressCity: "Logroño",
+      addressPostalCode: "26001",
+      addressProvince: "La Rioja",
+    },
+  });
+
+  const quesoProducerCategory = await prisma.producerCategory.findUniqueOrThrow({ where: { slug: "queso" } });
+  const vinoProducerCategory = await prisma.producerCategory.findUniqueOrThrow({ where: { slug: "vino" } });
+
+  await prisma.producerCategoryOnProducer.upsert({
+    where: { producerId_categoryId: { producerId: demoProducer.id, categoryId: quesoProducerCategory.id } },
+    update: {},
+    create: { producerId: demoProducer.id, categoryId: quesoProducerCategory.id },
+  });
+
+  await prisma.producerCategoryOnProducer.upsert({
+    where: { producerId_categoryId: { producerId: backgroundProducer.id, categoryId: vinoProducerCategory.id } },
+    update: {},
+    create: { producerId: backgroundProducer.id, categoryId: vinoProducerCategory.id },
+  });
+
+  console.log("Demo world producers seeded — 2 producers, 1 category assignment each.");
+
+  // ---------------------------------------------------------------------------
+  // DeliveryMode — 1 per producer. Demo producer uses PICKUP (no destination
+  // address needed, simplifies any manual SubOrder the owner adds later).
+  // ---------------------------------------------------------------------------
+  await prisma.deliveryMode.upsert({
+    where: { id: "seed-demo-producer-delivery-pickup" },
+    update: {},
+    create: {
+      id: "seed-demo-producer-delivery-pickup",
+      producerId: demoProducer.id,
+      type: "PICKUP",
+      cost: 0,
+      pickupLocationName: "Quesería Demo — recogida en tienda",
+      pickupStreet: "Calle Mayor 1",
+      pickupMunicipality: "Madrid",
+      pickupPostalCode: "28001",
+      isActive: true,
+    },
+  });
+
+  await prisma.deliveryMode.upsert({
+    where: { id: "seed-background-producer-delivery-personal" },
+    update: {},
+    create: {
+      id: "seed-background-producer-delivery-personal",
+      producerId: backgroundProducer.id,
+      type: "PERSONAL_DELIVERY",
+      cost: 3.5,
+      coverageZone: "La Rioja",
+      isActive: true,
+    },
+  });
+
+  console.log("Demo world delivery modes seeded — 1 per producer.");
+
+  // ---------------------------------------------------------------------------
+  // Products — 3 per producer, reusing existing Category slugs. One product
+  // on the BACKGROUND producer is pre-flagged REPORTED so the ADMIN demo has
+  // an immediate moderation-queue item.
+  // ---------------------------------------------------------------------------
+  const lacteosCategory = await prisma.category.findUniqueOrThrow({ where: { slug: "lacteos-y-quesos" } });
+  const quesoCategory = await prisma.category.findUniqueOrThrow({ where: { slug: "queso" } });
+  const conservasCategory = await prisma.category.findUniqueOrThrow({ where: { slug: "conservas" } });
+  const vinosCategory = await prisma.category.findUniqueOrThrow({ where: { slug: "vinos-y-bebidas" } });
+  const panaderiaCategory = await prisma.category.findUniqueOrThrow({ where: { slug: "panaderia" } });
+  const especiasCategory = await prisma.category.findUniqueOrThrow({ where: { slug: "especias-y-condimentos" } });
+
+  await prisma.product.upsert({
+    where: { id: "seed-demo-product-1" },
+    update: {},
+    create: {
+      id: "seed-demo-product-1",
+      producerId: demoProducer.id,
+      categoryId: lacteosCategory.id,
+      name: "Queso curado de oveja",
+      description: "Queso curado artesanal elaborado con leche de oveja.",
+      price: 12.5,
+      stock: 25,
+      allergens: ["lacteos"],
+    },
+  });
+
+  await prisma.product.upsert({
+    where: { id: "seed-demo-product-2" },
+    update: {},
+    create: {
+      id: "seed-demo-product-2",
+      producerId: demoProducer.id,
+      categoryId: quesoCategory.id,
+      name: "Queso fresco de cabra",
+      description: "Queso fresco suave elaborado con leche de cabra.",
+      price: 6.9,
+      stock: 40,
+      allergens: ["lacteos"],
+    },
+  });
+
+  await prisma.product.upsert({
+    where: { id: "seed-demo-product-3" },
+    update: {},
+    create: {
+      id: "seed-demo-product-3",
+      producerId: demoProducer.id,
+      categoryId: conservasCategory.id,
+      name: "Miel de encurtido artesano",
+      description: "Encurtido artesanal en conserva.",
+      price: 5.2,
+      stock: 30,
+      allergens: [],
+    },
+  });
+
+  await prisma.product.upsert({
+    where: { id: "seed-background-product-1" },
+    update: {},
+    create: {
+      id: "seed-background-product-1",
+      producerId: backgroundProducer.id,
+      categoryId: vinosCategory.id,
+      name: "Vino tinto crianza",
+      description: "Vino tinto de crianza de la región.",
+      price: 9.75,
+      stock: 60,
+      allergens: ["sulfitos"],
+    },
+  });
+
+  await prisma.product.upsert({
+    where: { id: "seed-background-product-2" },
+    update: {},
+    create: {
+      id: "seed-background-product-2",
+      producerId: backgroundProducer.id,
+      categoryId: panaderiaCategory.id,
+      name: "Pan artesano de masa madre",
+      description: "Pan artesanal elaborado con masa madre natural.",
+      price: 4.1,
+      stock: 20,
+      allergens: ["gluten"],
+    },
+  });
+
+  await prisma.product.upsert({
+    where: { id: "seed-background-product-3" },
+    update: {
+      moderationStatus: "REPORTED",
+      reportedAt: new Date(),
+      reportReason: "Descripción del producto poco clara — pendiente de revisión.",
+    },
+    create: {
+      id: "seed-background-product-3",
+      producerId: backgroundProducer.id,
+      categoryId: especiasCategory.id,
+      name: "Mezcla de especias mediterránea",
+      description: "Mezcla de especias y hierbas para condimentar.",
+      price: 3.4,
+      stock: 15,
+      allergens: [],
+      moderationStatus: "REPORTED",
+      reportedAt: new Date(),
+      reportReason: "Descripción del producto poco clara — pendiente de revisión.",
+    },
+  });
+
+  console.log("Demo world products seeded — 6 products, 1 flagged REPORTED for moderation demo.");
+
+  // ---------------------------------------------------------------------------
+  // Address — default address for the DEMO PRODUCER user only, so a visitor
+  // can try the live checkout flow immediately.
+  // ---------------------------------------------------------------------------
+  await prisma.address.upsert({
+    where: { id: "seed-demo-producer-address" },
+    update: {},
+    create: {
+      id: "seed-demo-producer-address",
+      userId: demoProducerUser.id,
+      line1: "Calle Mayor 1",
+      city: "Madrid",
+      postalCode: "28001",
+      province: "Madrid",
+      isDefault: true,
+    },
+  });
+
+  console.log("Demo world address seeded — 1 default address for demo producer.");
+
+  // ---------------------------------------------------------------------------
+  // Notification — standalone welcome-history notification for the demo
+  // producer. Deliberately no ORDER_CREATED/SUBORDER_STATUS_CHANGED rows
+  // since no real Order/SubOrder exists yet.
+  // ---------------------------------------------------------------------------
+  await prisma.notification.upsert({
+    where: { id: "seed-demo-producer-notification-welcome" },
+    update: {},
+    create: {
+      id: "seed-demo-producer-notification-welcome",
+      userId: demoProducerUser.id,
+      type: "ACCOUNT_ACTIVATED",
+      title: "Cuenta activada",
+      body: "Tu cuenta de productor ha sido activada.",
+      read: true,
+    },
+  });
+
+  console.log("Demo world notification seeded — 1 welcome notification for demo producer.");
+
+  console.log("Demo world seed complete.");
+}
+
 async function main(): Promise<void> {
   // ---------------------------------------------------------------------------
   // Seed ProducerCategory (O-2 LOCKED — do not touch)
@@ -109,6 +447,11 @@ async function main(): Promise<void> {
 
   const productCategoryCount = await prisma.category.count();
   console.log(`Category seed complete — ${productCategoryCount} entries.`);
+
+  // ---------------------------------------------------------------------------
+  // Seed demo/guest-environment world data (WU4) — gated, see seedDemoWorld().
+  // ---------------------------------------------------------------------------
+  await seedDemoWorld();
 }
 
 main()
