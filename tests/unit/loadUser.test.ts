@@ -319,3 +319,163 @@ describe("loadUser — account lifecycle denial (admin-user-management)", () => 
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// demo-guest-environment delta — isDemo projection
+// Spec: demo-guest-environment §"Demo identity flag" (WU1)
+//
+// WU1 only plumbs the flag onto req.user; nothing enforces it yet. Enforcement
+// lands with the demo policy guard, which runs immediately after loadUser.
+// ---------------------------------------------------------------------------
+
+describe("loadUser — demo identity flag (demo-guest-environment)", () => {
+  it("projects isDemo = false onto req.user for an ordinary account", async () => {
+    const req = buildReq("auth0|real1") as Request;
+    const res = buildRes() as Response;
+    const next = buildNext();
+
+    mockedUser["findUnique"].mockResolvedValueOnce({
+      id: "user_real_001",
+      role: "CONSUMER",
+      email: "real@example.com",
+      deletedAt: null,
+      deactivatedAt: null,
+      isDemo: false,
+      producer: null,
+    });
+
+    await loadUser(req, res, next);
+
+    expect(req.user).toEqual({
+      id: "user_real_001",
+      role: "CONSUMER",
+      email: "real@example.com",
+      isDemo: false,
+      producerId: undefined,
+    });
+    expect(next).toHaveBeenCalledWith(); // no error
+  });
+
+  it("projects isDemo = true onto req.user for a seeded demo account", async () => {
+    const req = buildReq("auth0|demo1") as Request;
+    const res = buildRes() as Response;
+    const next = buildNext();
+
+    mockedUser["findUnique"].mockResolvedValueOnce({
+      id: "user_demo_001",
+      role: "PRODUCER",
+      email: "demo-producer@example.com",
+      deletedAt: null,
+      deactivatedAt: null,
+      isDemo: true,
+      producer: { id: "prod_demo_001" },
+    });
+
+    await loadUser(req, res, next);
+
+    expect(req.user).toEqual({
+      id: "user_demo_001",
+      role: "PRODUCER",
+      email: "demo-producer@example.com",
+      isDemo: true,
+      producerId: "prod_demo_001",
+    });
+    expect(next).toHaveBeenCalledWith(); // no error
+  });
+
+  it("keeps the demo account's real role so existing requireRole guards are untouched", async () => {
+    // The flag is orthogonal to role by design — a demo ADMIN stays ADMIN.
+    const req = buildReq("auth0|demo2") as Request;
+    const res = buildRes() as Response;
+    const next = buildNext();
+
+    mockedUser["findUnique"].mockResolvedValueOnce({
+      id: "user_demo_002",
+      role: "ADMIN",
+      email: "demo-admin@example.com",
+      deletedAt: null,
+      deactivatedAt: null,
+      isDemo: true,
+      producer: null,
+    });
+
+    await loadUser(req, res, next);
+
+    expect(req.user).toEqual({
+      id: "user_demo_002",
+      role: "ADMIN",
+      email: "demo-admin@example.com",
+      isDemo: true,
+      producerId: undefined,
+    });
+  });
+
+  it("queries isDemo so the demo policy guard never needs a second round-trip", async () => {
+    const req = buildReq("auth0|demo3") as Request;
+    const res = buildRes() as Response;
+    const next = buildNext();
+
+    mockedUser["findUnique"].mockResolvedValueOnce({
+      id: "user_demo_003",
+      role: "CONSUMER",
+      email: "demo-consumer@example.com",
+      deletedAt: null,
+      deactivatedAt: null,
+      isDemo: true,
+      producer: null,
+    });
+
+    await loadUser(req, res, next);
+
+    expect(mockedUser["findUnique"]).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({ isDemo: true }),
+      }),
+    );
+  });
+
+  it("still resolves req.user = null for a soft-deleted demo account (lifecycle wins)", async () => {
+    const req = buildReq("auth0|demo_deleted1") as Request;
+    const res = buildRes() as Response;
+    const next = buildNext();
+
+    mockedUser["findUnique"].mockResolvedValueOnce({
+      id: "user_demo_del_001",
+      role: "PRODUCER",
+      email: "deleted+user_demo_del_001@tombstone.invalid",
+      deletedAt: new Date("2026-01-01T00:00:00.000Z"),
+      deactivatedAt: null,
+      isDemo: true,
+      producer: { id: "prod_demo_del_001" },
+    });
+
+    await loadUser(req, res, next);
+
+    expect(req.user).toBeNull();
+    expect(next).toHaveBeenCalledWith(); // no error — treated as absent
+  });
+
+  it("still calls next(AccountInactiveError) for a deactivated demo account and leaves req.user unset", async () => {
+    const req = buildReq("auth0|demo_deactivated1") as Request;
+    const res = buildRes() as Response;
+    const next = buildNext();
+
+    mockedUser["findUnique"].mockResolvedValueOnce({
+      id: "user_demo_deact_001",
+      role: "PRODUCER",
+      email: "demo-producer@example.com",
+      deletedAt: null,
+      deactivatedAt: new Date("2026-01-01T00:00:00.000Z"),
+      isDemo: true,
+      producer: { id: "prod_demo_deact_001" },
+    });
+
+    await loadUser(req, res, next);
+
+    expect(next).toHaveBeenCalledWith(expect.any(AccountInactiveError));
+    const errArg = (next as ReturnType<typeof vi.fn>).mock.calls[0]![0] as AccountInactiveError;
+    expect(errArg.status).toBe(403);
+    expect(errArg.code).toBe("ACCOUNT_INACTIVE");
+    expect(req.user).toBeUndefined();
+  });
+});
