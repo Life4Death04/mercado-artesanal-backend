@@ -68,7 +68,7 @@ COPY package.json package-lock.json ./
 COPY --chown=node:node prisma/schema.prisma ./prisma/schema.prisma
 COPY --chown=node:node prisma/migrations ./prisma/migrations
 COPY --from=build /app/dist-seed ./dist-seed
-COPY --chown=node:node prisma/seed-assets ./prisma/seed-assets
+COPY --chown=node:node prisma/seed-assets ./dist-seed/prisma/seed-assets
 
 RUN install -d -o node -g node -m 0700 /var/lib/mercado-artesanal/backups \
     && chown -R node:node /app
