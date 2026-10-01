@@ -27,6 +27,14 @@
  * populates `req.user.producerId`. Every producer-scoped service reads this
  * field instead of issuing a per-request producerId lookup.
  *
+ * demo-guest-environment extension (WU1): the query also selects `isDemo` and
+ * projects it onto `req.user`. The field is orthogonal to `role` — a demo
+ * account keeps its real role and the access that role grants — so it changes
+ * no authorization decision here. It exists so the demo policy guard, which
+ * runs immediately after this middleware, can deny non-allow-listed mutating
+ * requests without a second DB round-trip. It is always populated (default
+ * false), so an ordinary account is simply `isDemo: false`.
+ *
  * Spec reference: rbac §"Middleware composition order" + design §8 (Decision #8).
  * Spec reference: admin-bootstrap §"Soft-deleted users cannot be authorized".
  */
@@ -57,6 +65,8 @@ export async function loadUser(req: Request, _res: Response, next: NextFunction)
         email: true,
         deletedAt: true,
         deactivatedAt: true,
+        // demo-guest-environment: read by the demo policy guard downstream.
+        isDemo: true,
         // Cycle 2: fetch linked Producer row so PRODUCER-scoped services can
         // read req.user.producerId without a second DB round-trip.
         producer: { select: { id: true } },
@@ -93,6 +103,9 @@ export async function loadUser(req: Request, _res: Response, next: NextFunction)
       id: row.id,
       role: row.role,
       email: row.email,
+      // Always present (column defaults to false) — the demo policy guard
+      // reads it directly and never has to treat it as possibly absent.
+      isDemo: row.isDemo,
       // Populate producerId only for PRODUCER role; undefined for all others.
       producerId: row.role === "PRODUCER" ? (row.producer?.id ?? undefined) : undefined,
     };

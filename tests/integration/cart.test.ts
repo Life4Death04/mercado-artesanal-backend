@@ -168,6 +168,7 @@ function makeUser(overrides: Partial<User> = {}): User {
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     deletedAt: null,
     deactivatedAt: null,
+    isDemo: false,
     ...overrides,
   };
 }

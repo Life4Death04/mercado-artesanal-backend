@@ -41,6 +41,10 @@ function isValidProxy(value: string): boolean {
   return bits > 0 && bits <= (version === 4 ? 32 : 128);
 }
 
+function isHopCount(value: string): boolean {
+  return /^[1-9]\d*$/.test(value.trim());
+}
+
 function isValidDatabaseHost(value: string): boolean {
   const host = value.replace(/^\[|\]$/g, "");
   return (
@@ -69,12 +73,31 @@ const EnvSchema = z
       .refine((origins) => origins.length === 1 || !origins.includes("*"), {
         message: "wildcard origin cannot be combined with other origins",
       }),
+    // Accepts either a positive integer hop count (Express's numeric
+    // trust-proxy mode — trust exactly N hops from the client, safe only when
+    // the app is reachable through exactly that many proxies and no other
+    // path, e.g. a single-hop PaaS edge like Railway) or the existing
+    // identity-based allow-list (`loopback`, exact IPs, CIDR ranges — safe
+    // regardless of how many paths reach the app, e.g. the Nginx deployment).
     TRUST_PROXY: z
       .string()
       .default("loopback")
-      .transform(commaSeparatedValues)
-      .refine((proxies) => proxies.every(isValidProxy), {
-        message: "must contain only loopback, exact IP addresses, or CIDR ranges",
+      .transform((value, ctx): string[] | number => {
+        const trimmed = value.trim();
+        if (isHopCount(trimmed)) {
+          return Number(trimmed);
+        }
+        const proxies = commaSeparatedValues(value, ctx);
+        if (proxies === z.NEVER) return z.NEVER;
+        if (!proxies.every(isValidProxy)) {
+          ctx.addIssue({
+            code: "custom",
+            message:
+              "must be a positive hop count, or a comma-separated list of loopback, exact IP addresses, or CIDR ranges",
+          });
+          return z.NEVER;
+        }
+        return proxies;
       }),
     S3_PUBLIC_BASE_URL: z.string().url().min(1),
     // Cycle 5 — payments slice (consumer-purchase-flow 3/3). Server-side Stripe

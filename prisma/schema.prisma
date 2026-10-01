@@ -41,6 +41,16 @@ model User {
   // deletedAt wins over deactivatedAt — see src/shared/account-lifecycle.ts
   // deriveAccountState, the single authority for this precedence.
   deactivatedAt DateTime? @map("deactivated_at")
+  // demo-guest-environment WU1 — demo/guest identity flag. Deliberately a
+  // boolean orthogonal to `role` rather than a new Role enum value: a demo
+  // user keeps its real role (PRODUCER or ADMIN) and therefore keeps the
+  // access that role already grants, so not one `requireRole(...)` call site
+  // changes. A `GUEST` role would have forced edits across ~22 string-literal
+  // call sites with no compiler assistance, since every consumer-facing guard
+  // is spelled requireRole("CONSUMER", "PRODUCER", "ADMIN"). Projected onto
+  // req.user by loadUser and enforced by the demo policy guard. Defaults to
+  // false, so every existing and future real account is unaffected.
+  isDemo        Boolean   @default(false) @map("is_demo")
 
   producer          Producer?
   addresses         Address[]
