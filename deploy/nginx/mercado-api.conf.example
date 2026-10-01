@@ -1,0 +1,60 @@
+# Replace api.example.com with the production API FQDN before enabling this file.
+# Keep the certificate paths aligned with that FQDN after Certbot issues the certificate.
+
+upstream mercado_api {
+    server 127.0.0.1:3100;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name api.example.com;
+    server_tokens off;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name api.example.com;
+    server_tokens off;
+
+    ssl_certificate /etc/letsencrypt/live/api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    client_max_body_size 10m;
+
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Request-Id $request_id;
+    proxy_connect_timeout 5s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_redirect off;
+
+    location = /health/ready {
+        allow 127.0.0.1;
+        allow ::1;
+        deny all;
+        proxy_pass http://mercado_api;
+    }
+
+    location / {
+        proxy_pass http://mercado_api;
+    }
+}
