@@ -20,6 +20,8 @@
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:seed": "tsx prisma/seed.ts",
+    "db:seed:prod": "node dist-seed/prisma/seed.js",
+    "build:seed": "tsc -p tsconfig.seed.json && tsc-alias -p tsconfig.seed.json",
     "db:studio": "prisma studio",
     "create-admin": "tsx scripts/create-admin.ts",
     "validate-ses": "tsx scripts/validate-ses.ts",
