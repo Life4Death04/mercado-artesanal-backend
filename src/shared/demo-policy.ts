@@ -18,7 +18,7 @@
  *      DEMO_MUTATION_ALLOW_LIST (":param" segments match any single
  *      non-empty path segment) — otherwise DemoReadOnlyError (403).
  *
- * Allow-list (WU2, 12 entries — demo-guest-environment plan v2 design):
+ * Allow-list (WU2, 14 entries — demo-guest-environment plan v2 design):
  *   POST   /api/v1/auth/sync                        (MANDATORY — login dies without it)
  *   POST   /api/v1/carrito/items
  *   PATCH  /api/v1/carrito/items/:itemId
@@ -31,6 +31,8 @@
  *   PATCH  /api/v1/admin/products/:id/moderation
  *   PATCH  /api/v1/admin/incidents/:id/resolve
  *   PATCH  /api/v1/admin/users/:id/activate
+ *   POST   /api/v1/producers/me/products/:id/images/presign  (TEMPORARY — demo S3 pipeline smoke test, revert after validation)
+ *   POST   /api/v1/producers/me/products/:id/images/confirm  (TEMPORARY — demo S3 pipeline smoke test, revert after validation)
  *
  * NOT mounted on any route yet — that is WU3 (blocked on a separate mount
  * strategy decision). This module is self-contained and independently
@@ -66,6 +68,8 @@ export const DEMO_MUTATION_ALLOW_LIST: ReadonlyArray<{ method: string; path: str
   { method: "PATCH", path: "/api/v1/admin/products/:id/moderation" },
   { method: "PATCH", path: "/api/v1/admin/incidents/:id/resolve" },
   { method: "PATCH", path: "/api/v1/admin/users/:id/activate" },
+  { method: "POST", path: "/api/v1/producers/me/products/:id/images/presign" },
+  { method: "POST", path: "/api/v1/producers/me/products/:id/images/confirm" },
 ];
 
 const MUTATING_METHODS: ReadonlySet<string> = new Set(["POST", "PUT", "PATCH", "DELETE"]);
