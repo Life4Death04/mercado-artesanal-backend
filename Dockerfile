@@ -31,11 +31,13 @@ RUN npm ci
 
 FROM dependencies AS build
 
-COPY tsconfig.json tsconfig.build.json ./
+COPY tsconfig.json tsconfig.build.json tsconfig.seed.json ./
 COPY prisma/schema.prisma ./prisma/schema.prisma
+COPY prisma/seed.ts ./prisma/seed.ts
 COPY src ./src
 RUN ./node_modules/.bin/prisma generate --schema=prisma/schema.prisma \
-    && npm run build
+    && npm run build \
+    && npm run build:seed
 
 FROM base AS production-dependencies
 
@@ -65,6 +67,8 @@ COPY --from=build /app/dist ./dist
 COPY package.json package-lock.json ./
 COPY --chown=node:node prisma/schema.prisma ./prisma/schema.prisma
 COPY --chown=node:node prisma/migrations ./prisma/migrations
+COPY --from=build /app/dist-seed ./dist-seed
+COPY --chown=node:node prisma/seed-assets ./prisma/seed-assets
 
 RUN install -d -o node -g node -m 0700 /var/lib/mercado-artesanal/backups \
     && chown -R node:node /app
