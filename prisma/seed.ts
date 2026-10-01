@@ -26,9 +26,20 @@
  * or expand this list via a spec update before production launch.
  * ---------------------------------------------------------------------------
  */
+import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { PrismaClient } from "@prisma/client";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
+import { getS3Client } from "@/shared/s3/s3-client";
 
 const prisma = new PrismaClient();
+
+/** S3 bucket name — same env-read pattern as src/modules/images/services/images.service.ts. */
+const S3_BUCKET = process.env["AWS_BUCKET_NAME"] ?? "mercado-artesanal-images";
+
+/** Directory holding the committed seed sample images (prisma/seed-assets/images/). */
+const SEED_IMAGE_ASSETS_DIR = path.join(__dirname, "seed-assets", "images");
 
 /** O-2 LOCKED — 15 slugs, never add/remove/rename without spec update. */
 const PRODUCER_CATEGORIES: Array<{ slug: string; name: string }> = [
@@ -94,6 +105,59 @@ const PRODUCT_CATEGORIES: Array<{ slug: string; name: string; description: strin
  * value and later swapping the env var creates an ORPHAN row instead of
  * updating the existing one, because upsert matches on the OLD auth0Sub.
  */
+/**
+ * Product image seed spec — one real, license-verified JPEG per demo-world
+ * product (see prisma/seed-assets/images/ATTRIBUTION.md for sources/licenses).
+ * `producerOwner` selects which already-created Producer record owns the
+ * upload path; actual producerId is resolved at call time in seedProductImages().
+ */
+const SEED_PRODUCT_IMAGES: ReadonlyArray<{
+  productId: string;
+  producerOwner: "demo" | "background";
+  fileName: string;
+  mimeType: string;
+}> = [
+  { productId: "seed-demo-product-1", producerOwner: "demo", fileName: "seed-demo-product-1.jpg", mimeType: "image/jpeg" },
+  { productId: "seed-demo-product-2", producerOwner: "demo", fileName: "seed-demo-product-2.jpg", mimeType: "image/jpeg" },
+  { productId: "seed-demo-product-3", producerOwner: "demo", fileName: "seed-demo-product-3.jpg", mimeType: "image/jpeg" },
+  { productId: "seed-background-product-1", producerOwner: "background", fileName: "seed-background-product-1.jpg", mimeType: "image/jpeg" },
+  { productId: "seed-background-product-2", producerOwner: "background", fileName: "seed-background-product-2.jpg", mimeType: "image/jpeg" },
+  { productId: "seed-background-product-3", producerOwner: "background", fileName: "seed-background-product-3.jpg", mimeType: "image/jpeg" },
+];
+
+/**
+ * Uploads each seed sample image to the real S3 bucket and upserts the
+ * matching ProductImage row — bypasses the HTTP presign/confirm API
+ * entirely (direct S3 PutObject + Prisma write), since the background
+ * producer has no real Auth0 identity to drive the live route (see
+ * Engram topic_key plan/demo-guest-environment-wu4-seed for rationale).
+ *
+ * Idempotent: deterministic S3 key (no UUID) + upsert on (productId, position)
+ * — safe to re-run, overwrites rather than duplicating.
+ */
+async function seedProductImages(demoProducerId: string, backgroundProducerId: string): Promise<void> {
+  const s3 = getS3Client();
+
+  for (const { productId, producerOwner, fileName, mimeType } of SEED_PRODUCT_IMAGES) {
+    const producerId = producerOwner === "demo" ? demoProducerId : backgroundProducerId;
+    const filePath = path.join(SEED_IMAGE_ASSETS_DIR, fileName);
+    const body = readFileSync(filePath);
+    const s3Key = `producers/${producerId}/products/${productId}/img/seed-0`;
+
+    await s3.send(
+      new PutObjectCommand({ Bucket: S3_BUCKET, Key: s3Key, Body: body, ContentType: mimeType }),
+    );
+
+    await prisma.productImage.upsert({
+      where: { productId_position: { productId, position: 0 } },
+      update: { s3Key, mimeType },
+      create: { productId, s3Key, mimeType, position: 0 },
+    });
+  }
+
+  console.log(`Demo world product images seeded — ${SEED_PRODUCT_IMAGES.length} images uploaded to S3 and confirmed.`);
+}
+
 async function seedDemoWorld(): Promise<void> {
   const demoProducerAuth0Sub = process.env.DEMO_PRODUCER_AUTH0_SUB;
   const demoAdminAuth0Sub = process.env.DEMO_ADMIN_AUTH0_SUB;
@@ -406,6 +470,8 @@ async function seedDemoWorld(): Promise<void> {
   });
 
   console.log("Demo world notification seeded — 1 welcome notification for demo producer.");
+
+  await seedProductImages(demoProducer.id, backgroundProducer.id);
 
   console.log("Demo world seed complete.");
 }
