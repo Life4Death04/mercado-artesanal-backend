@@ -14,6 +14,7 @@
  */
 import { Router } from "express";
 
+import { demoPolicyGuard } from "@/shared/demo-policy";
 import { authenticate } from "@/shared/middleware/authenticate";
 import { loadUser } from "@/shared/middleware/loadUser";
 import { onboardingGate } from "@/shared/middleware/onboardingGate";
@@ -22,5 +23,5 @@ import { getMe, updateMe } from "../controllers/users.controller";
 
 export const usersRouter: Router = Router();
 
-usersRouter.get("/users/me", authenticate, loadUser, onboardingGate, getMe);
-usersRouter.patch("/users/me", authenticate, loadUser, onboardingGate, updateMe);
+usersRouter.get("/users/me", authenticate, loadUser, demoPolicyGuard, onboardingGate, getMe);
+usersRouter.patch("/users/me", authenticate, loadUser, demoPolicyGuard, onboardingGate, updateMe);

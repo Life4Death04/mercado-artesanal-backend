@@ -86,8 +86,29 @@ describe("network boundary config", () => {
     }
   });
 
-  it.each(["true", "1", "nginx", "0.0.0.0/0", "10.0.0.0/33"])(
+  it.each(["true", "nginx", "0.0.0.0/0", "10.0.0.0/33"])(
     "rejects unsafe or malformed proxy trust value %s",
+    (TRUST_PROXY) => {
+      expect(() =>
+        parseEnv({ ...BASE_VALID, S3_PUBLIC_BASE_URL: "https://cdn.example.com", TRUST_PROXY }),
+      ).toThrow();
+    },
+  );
+
+  it.each(["1", "2", "10"])(
+    "parses a positive hop count %s (single-hop PaaS edge, e.g. Railway)",
+    (TRUST_PROXY) => {
+      const result = parseEnv({
+        ...BASE_VALID,
+        S3_PUBLIC_BASE_URL: "https://cdn.example.com",
+        TRUST_PROXY,
+      });
+      expect(result.TRUST_PROXY).toBe(Number(TRUST_PROXY));
+    },
+  );
+
+  it.each(["0", "01", "1.5", "-1"])(
+    "rejects invalid hop count value %s",
     (TRUST_PROXY) => {
       expect(() =>
         parseEnv({ ...BASE_VALID, S3_PUBLIC_BASE_URL: "https://cdn.example.com", TRUST_PROXY }),

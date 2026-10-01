@@ -26,6 +26,7 @@
  */
 import { Router } from "express";
 
+import { demoPolicyGuard } from "@/shared/demo-policy";
 import { authenticate } from "@/shared/middleware/authenticate";
 import { loadUser } from "@/shared/middleware/loadUser";
 import { onboardingGate } from "@/shared/middleware/onboardingGate";
@@ -36,7 +37,7 @@ import * as cartController from "../controllers/cart.controller";
 export const cartRouter: Router = Router();
 
 // Guard chain — matches addresses.routes.ts:33 and products.routes.ts:41-46 pattern
-const cartGuard = [authenticate, loadUser, onboardingGate, requireRole("CONSUMER", "PRODUCER", "ADMIN")];
+const cartGuard = [authenticate, loadUser, demoPolicyGuard, onboardingGate, requireRole("CONSUMER", "PRODUCER", "ADMIN")];
 
 // ---------------------------------------------------------------------------
 // Cart routes

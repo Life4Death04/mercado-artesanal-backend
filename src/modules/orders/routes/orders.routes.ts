@@ -22,6 +22,7 @@
  */
 import { Router } from "express";
 
+import { demoPolicyGuard } from "@/shared/demo-policy";
 import { authenticate } from "@/shared/middleware/authenticate";
 import { loadUser } from "@/shared/middleware/loadUser";
 import { onboardingGate } from "@/shared/middleware/onboardingGate";
@@ -32,7 +33,7 @@ import * as ordersController from "../controllers/orders.controller";
 export const ordersRouter: Router = Router();
 
 // Guard chain — matches cart.routes.ts:39 pattern
-const ordersGuard = [authenticate, loadUser, onboardingGate, requireRole("CONSUMER", "PRODUCER", "ADMIN")];
+const ordersGuard = [authenticate, loadUser, demoPolicyGuard, onboardingGate, requireRole("CONSUMER", "PRODUCER", "ADMIN")];
 
 // ---------------------------------------------------------------------------
 // Orders routes

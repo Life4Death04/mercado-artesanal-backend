@@ -63,7 +63,9 @@ export type ErrorCode =
   | "BACKUP_NOT_RESTORABLE"
   | "BACKUP_OPERATION_CONFLICT"
   | "BACKUP_RUNTIME_UNAVAILABLE"
-  | "BACKUP_OPERATION_FAILED";
+  | "BACKUP_OPERATION_FAILED"
+  // demo-guest-environment WU2 addition
+  | "DEMO_READ_ONLY";
 
 export interface ProblemDetails {
   type: string;

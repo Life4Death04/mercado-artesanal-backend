@@ -48,8 +48,21 @@ declare global {
        * Cycle 2 extension (Decision #8): `producerId` is set when role === 'PRODUCER'
        * and the linked Producer row exists. Producer-scoped services read this field
        * instead of issuing a second DB round-trip per request.
+       *
+       * demo-guest-environment extension (WU1): `isDemo` marks a seeded demo/guest
+       * identity. It is orthogonal to `role` — a demo account keeps its real role and
+       * the access that role grants — and is read by the demo policy guard to deny
+       * non-allow-listed mutating requests. Required, not optional: `loadUser` always
+       * populates it from a NOT NULL DEFAULT false column, so declaring it optional
+       * would misrepresent the contract and let consumers silently skip the check.
        */
-      user?: { id: string; role: string; email: string; producerId?: string } | null;
+      user?: {
+        id: string;
+        role: string;
+        email: string;
+        isDemo: boolean;
+        producerId?: string;
+      } | null;
     }
   }
 }

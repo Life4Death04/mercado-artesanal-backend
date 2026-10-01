@@ -456,3 +456,17 @@ export class BackupOperationFailedError extends AppError {
   readonly status = 500;
   readonly title = "Backup operation failed";
 }
+
+// ---------------------------------------------------------------------------
+// 403 — Demo/guest account attempted a mutation outside the demo allow-list
+// ---------------------------------------------------------------------------
+
+export class DemoReadOnlyError extends AppError {
+  readonly code = "DEMO_READ_ONLY" as const;
+  readonly status = 403;
+  readonly title = "Demo read-only";
+
+  constructor(detail = "This action is not available in the demo environment", cause?: unknown) {
+    super(detail, cause);
+  }
+}
